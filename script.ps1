@@ -9,10 +9,13 @@ param(
     [string]$CookiesFile,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputRoot = "D:\Investigations",
+    [string]$OutputRoot = ".\Investigations",
 
     [Parameter(Mandatory = $false)]
-    [string]$YtDlpPath = "yt-dlp",
+    [string]$YtDlpPath = ".\yt-dlp.exe",
+
+    [Parameter(Mandatory = $false)]
+    [string]$DenoPath,
 
     [Parameter(Mandatory = $false)]
     [string]$FFmpegFolder,
@@ -22,7 +25,23 @@ param(
 
     [switch]$PreferMp4,
 
-    [switch]$UpdateYtDlp
+    [switch]$MetadataOnly,
+
+    [switch]$IncludePlaylist,
+
+    [switch]$WriteInfoJson,
+
+    [switch]$WriteSourceLink,
+
+    [switch]$WriteDescription,
+
+    [switch]$WriteThumbnail,
+
+    [switch]$WriteSubs,
+
+    [switch]$WriteAutoSubs,
+
+    [switch]$WriteComments
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,102 +52,91 @@ function Write-Section {
     Write-Host "========== $Text =========="
 }
 
-function New-SafeName {
+function Resolve-ToolPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PathOrCommand,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ToolName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathOrCommand)) {
+        throw "$ToolName path is blank."
+    }
+
+    if (Test-Path -LiteralPath $PathOrCommand -PathType Leaf) {
+        return (Resolve-Path -LiteralPath $PathOrCommand).Path
+    }
+
+    $cmd = Get-Command $PathOrCommand -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    throw "$ToolName was not found: $PathOrCommand"
+}
+
+function New-SafeCaseName {
     param([string]$Name)
     return ($Name -replace '[\\/:*?"<>|]', '_').Trim()
 }
 
-function Resolve-Executable {
-    param([string]$PathOrCommand)
+function Get-Sha256HashCompat {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    if (Test-Path $PathOrCommand) {
-        return (Resolve-Path $PathOrCommand).Path
+    if (Get-Command Get-FileHash -ErrorAction SilentlyContinue) {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
     }
 
-    $cmd = Get-Command $PathOrCommand -ErrorAction Stop
-    return $cmd.Source
-}
-
-function Get-Sha256HashString {
-    param([string]$Path)
-
-    $stream = $null
-    $sha256 = $null
-
+    $stream = [System.IO.File]::OpenRead($Path)
     try {
-        $sha256 = [System.Security.Cryptography.SHA256]::Create()
-        $stream = [System.IO.File]::OpenRead($Path)
-        $bytes = $sha256.ComputeHash($stream)
-        return (($bytes | ForEach-Object { $_.ToString("x2") }) -join "").ToUpperInvariant()
-    }
-    finally {
-        if ($stream) { $stream.Dispose() }
-        if ($sha256) { $sha256.Dispose() }
-    }
-}
-
-function Export-Sha256Manifest {
-    param(
-        [string]$RootPath,
-        [string]$OutputCsv
-    )
-
-    $outputCsvFull = [System.IO.Path]::GetFullPath($OutputCsv)
-
-    Get-ChildItem $RootPath -Recurse -File |
-        Where-Object {
-            [System.IO.Path]::GetFullPath($_.FullName) -ne $outputCsvFull
-        } |
-        ForEach-Object {
-            try {
-                [pscustomobject]@{
-                    Algorithm = "SHA256"
-                    Hash      = Get-Sha256HashString -Path $_.FullName
-                    Path      = $_.FullName
-                }
-            }
-            catch {
-                [pscustomobject]@{
-                    Algorithm = "SHA256"
-                    Hash      = "ERROR: $($_.Exception.Message)"
-                    Path      = $_.FullName
-                }
-            }
-        } |
-        Export-Csv $OutputCsv -NoTypeInformation
-}
-
-function Invoke-YtDlpLogged {
-    param(
-        [string]$ExePath,
-        [string[]]$Arguments,
-        [string]$RunLog
-    )
-
-    $tempLog = Join-Path $env:TEMP ("yt-dlp-temp-{0}.log" -f ([guid]::NewGuid()))
-    $previousErrorActionPreference = $ErrorActionPreference
-
-    try {
-        # yt-dlp writes normal verbose/debug output to stderr.
-        # Do not let PowerShell treat that output as a terminating script error.
-        $ErrorActionPreference = "Continue"
-
-        & $ExePath @Arguments *> $tempLog
-        $exitCode = $LASTEXITCODE
-
-        if (Test-Path $tempLog) {
-            Get-Content $tempLog | Tee-Object -FilePath $RunLog -Append
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha.ComputeHash($stream)
+            return ([BitConverter]::ToString($hashBytes) -replace '-', '').ToUpperInvariant()
         }
-
-        return $exitCode
+        finally {
+            $sha.Dispose()
+        }
     }
     finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        Remove-Item $tempLog -Force -ErrorAction SilentlyContinue
+        $stream.Dispose()
     }
 }
 
-$SafeCaseName = New-SafeName $CaseName
+$YtDlpPath = Resolve-ToolPath -PathOrCommand $YtDlpPath -ToolName "yt-dlp"
+
+if ([string]::IsNullOrWhiteSpace($DenoPath)) {
+    $CandidateDeno = Join-Path (Split-Path -Parent $YtDlpPath) "deno.exe"
+    if (Test-Path -LiteralPath $CandidateDeno -PathType Leaf) {
+        $DenoPath = $CandidateDeno
+    }
+    else {
+        $DenoPath = "deno"
+    }
+}
+
+$DenoPath = Resolve-ToolPath -PathOrCommand $DenoPath -ToolName "Deno"
+
+if (-not [string]::IsNullOrWhiteSpace($FFmpegFolder)) {
+    if (-not (Test-Path -LiteralPath $FFmpegFolder -PathType Container)) {
+        throw "FFmpeg folder not found: $FFmpegFolder"
+    }
+
+    $ffmpegExe = Join-Path $FFmpegFolder "ffmpeg.exe"
+    $ffprobeExe = Join-Path $FFmpegFolder "ffprobe.exe"
+
+    if (-not (Test-Path -LiteralPath $ffmpegExe -PathType Leaf)) {
+        throw "ffmpeg.exe was not found in FFmpeg folder: $FFmpegFolder"
+    }
+
+    if (-not (Test-Path -LiteralPath $ffprobeExe -PathType Leaf)) {
+        throw "ffprobe.exe was not found in FFmpeg folder: $FFmpegFolder"
+    }
+}
+
+$SafeCaseName = New-SafeCaseName $CaseName
 $CaseDir = Join-Path $OutputRoot $SafeCaseName
 $MediaDir = Join-Path $CaseDir "media"
 $LogDir = Join-Path $CaseDir "logs"
@@ -142,83 +150,56 @@ New-Item -ItemType Directory -Path $CaseDir, $MediaDir, $LogDir, $ManifestDir -F
 
 Write-Section "Preflight checks"
 
-if (-not (Test-Path $InputFile)) {
+if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
     throw "Input file not found: $InputFile"
 }
 
-if ($CookiesFile -and -not (Test-Path $CookiesFile)) {
+if ($CookiesFile -and -not (Test-Path -LiteralPath $CookiesFile -PathType Leaf)) {
     throw "Cookies file not found: $CookiesFile"
 }
 
-$ResolvedYtDlpPath = Resolve-Executable $YtDlpPath
-$ToolsDir = Split-Path -Parent $ResolvedYtDlpPath
+Write-Host "yt-dlp:        $YtDlpPath"
+Write-Host "Deno:          $DenoPath"
+Write-Host "FFmpeg folder: $FFmpegFolder"
+Write-Host "Case:          $CaseDir"
 
-$DenoPath = Join-Path $ToolsDir "deno.exe"
-if (-not (Test-Path $DenoPath)) {
-    throw "deno.exe was not found beside yt-dlp.exe: $ToolsDir"
+Write-Section "Version info"
+
+& $YtDlpPath --version 2>&1 | Tee-Object -FilePath $RunLog -Append
+& $DenoPath --version 2>&1 | Tee-Object -FilePath $RunLog -Append
+
+if (-not [string]::IsNullOrWhiteSpace($FFmpegFolder)) {
+    $ffmpegExe = Join-Path $FFmpegFolder "ffmpeg.exe"
+    & $ffmpegExe -version 2>&1 | Select-Object -First 1 | Tee-Object -FilePath $RunLog -Append
 }
 
-if ($FFmpegFolder) {
-    if (-not (Test-Path $FFmpegFolder -PathType Container)) {
-        throw "FFmpeg folder not found: $FFmpegFolder"
-    }
+Write-Section "Capture options"
 
-    $ResolvedFFmpegFolder = (Resolve-Path $FFmpegFolder).Path
-}
-else {
-    $ResolvedFFmpegFolder = $ToolsDir
-}
+$OptionLines = @(
+    "Prefer MP4:             $PreferMp4",
+    "Metadata only:          $MetadataOnly",
+    "Include playlist:       $IncludePlaylist",
+    "Write metadata JSON:    $WriteInfoJson",
+    "Write source link:      $WriteSourceLink",
+    "Write description:      $WriteDescription",
+    "Write thumbnail:        $WriteThumbnail",
+    "Write subtitles:        $WriteSubs",
+    "Write auto subtitles:   $WriteAutoSubs",
+    "Write comments:         $WriteComments",
+    "Impersonate target:     $ImpersonateTarget"
+)
 
-$FFmpegPath = Join-Path $ResolvedFFmpegFolder "ffmpeg.exe"
-$FFprobePath = Join-Path $ResolvedFFmpegFolder "ffprobe.exe"
-
-if (-not (Test-Path $FFmpegPath)) {
-    throw "ffmpeg.exe was not found in: $ResolvedFFmpegFolder"
-}
-
-if (-not (Test-Path $FFprobePath)) {
-    throw "ffprobe.exe was not found in: $ResolvedFFmpegFolder"
-}
-
-Write-Host "yt-dlp:      $ResolvedYtDlpPath"
-Write-Host "Deno:        $DenoPath"
-Write-Host "FFmpeg dir:  $ResolvedFFmpegFolder"
-Write-Host "Case:        $CaseDir"
-Write-Host "Impersonate: $(if ($ImpersonateTarget) { $ImpersonateTarget } else { 'Not specified' })"
-Write-Host "Prefer MP4:  $PreferMp4"
-
-Add-Content -Path $RunLog -Value "yt-dlp: $ResolvedYtDlpPath"
-Add-Content -Path $RunLog -Value "Deno: $DenoPath"
-Add-Content -Path $RunLog -Value "FFmpeg folder: $ResolvedFFmpegFolder"
-Add-Content -Path $RunLog -Value "ImpersonateTarget: $ImpersonateTarget"
-Add-Content -Path $RunLog -Value "PreferMp4: $PreferMp4"
-
-if ($UpdateYtDlp) {
-    Write-Section "Updating yt-dlp"
-
-    $updateExitCode = Invoke-YtDlpLogged `
-        -ExePath $ResolvedYtDlpPath `
-        -Arguments @("--update-to", "nightly") `
-        -RunLog $RunLog
-
-    Add-Content -Path $RunLog -Value "yt-dlp update exit code: $updateExitCode"
-
-    if ($updateExitCode -ne 0) {
-        Write-Warning "yt-dlp update exited with code $updateExitCode. Continuing with the current binary."
-    }
-}
+$OptionLines | Tee-Object -FilePath $RunLog -Append
 
 Write-Section "Loading URLs"
 
-$Urls = @(
-    Get-Content $InputFile |
-        ForEach-Object { $_.Trim() } |
-        Where-Object {
-            $_ -and
-            -not $_.StartsWith("#") -and
-            ($_ -match '^https?://')
-        }
-)
+$Urls = Get-Content -LiteralPath $InputFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object {
+        $_ -and
+        -not $_.StartsWith("#") -and
+        ($_ -match '^https?://')
+    }
 
 if (-not $Urls -or $Urls.Count -eq 0) {
     throw "No valid URLs found in input file. Use one http/https URL per line."
@@ -226,28 +207,19 @@ if (-not $Urls -or $Urls.Count -eq 0) {
 
 Write-Host "Found $($Urls.Count) URL(s)."
 
-Write-Section "Starting video-only capture"
+Write-Section "Starting capture"
 
 $CommonArgs = @(
     "--ignore-errors",
     "--no-overwrites",
     "--continue",
-    "--no-playlist",
     "--restrict-filenames",
     "--trim-filenames", "180",
 
     "--js-runtimes", "deno:$DenoPath",
 
-    "--ffmpeg-location", $ResolvedFFmpegFolder,
-
     "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "--add-header", "Accept-Language: en-US,en;q=0.9",
-
-    "--no-write-info-json",
-    "--no-write-description",
-    "--no-write-thumbnail",
-    "--no-write-subs",
-    "--no-write-auto-subs",
 
     "--no-embed-metadata",
     "--no-embed-thumbnail",
@@ -270,48 +242,78 @@ $CommonArgs = @(
     "--verbose"
 )
 
-if ($PreferMp4) {
+if (-not $IncludePlaylist) {
+    $CommonArgs += "--no-playlist"
+}
+
+if ($MetadataOnly) {
+    $CommonArgs += "--skip-download"
+}
+
+if ($WriteInfoJson) {
+    $CommonArgs += "--write-info-json"
+}
+
+if ($WriteSourceLink) {
+    $CommonArgs += "--write-link"
+}
+
+if ($WriteDescription) {
+    $CommonArgs += "--write-description"
+}
+
+if ($WriteThumbnail) {
+    $CommonArgs += "--write-thumbnail"
+}
+
+if ($WriteSubs) {
+    $CommonArgs += "--write-subs"
+}
+
+if ($WriteAutoSubs) {
+    $CommonArgs += "--write-auto-subs"
+}
+
+if ($WriteComments) {
+    $CommonArgs += "--write-comments"
+}
+
+if ($PreferMp4 -and -not $MetadataOnly) {
     $CommonArgs += @(
         "--format", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
         "--merge-output-format", "mp4"
     )
 }
 
-if ($ImpersonateTarget) {
-    $CommonArgs += @("--impersonate", $ImpersonateTarget)
-}
-
 if ($CookiesFile) {
     $CommonArgs += @("--cookies", $CookiesFile)
 }
 
+if ($FFmpegFolder) {
+    $CommonArgs += @("--ffmpeg-location", $FFmpegFolder)
+}
+
+if ($ImpersonateTarget) {
+    $CommonArgs += @("--impersonate", $ImpersonateTarget)
+}
+
 for ($i = 0; $i -lt $Urls.Count; $i++) {
     $Url = $Urls[$i]
-    $IsLastUrl = ($i -eq ($Urls.Count - 1))
 
     Write-Host ""
     Write-Host "Capturing: $Url"
 
-    $YtDlpArgs = @()
-    $YtDlpArgs += $CommonArgs
-    $YtDlpArgs += $Url
-
-    $ExitCode = Invoke-YtDlpLogged `
-        -ExePath $ResolvedYtDlpPath `
-        -Arguments $YtDlpArgs `
-        -RunLog $RunLog
-
-    Add-Content -Path $RunLog -Value "yt-dlp exit code for URL [$Url]: $ExitCode"
-
-    if ($ExitCode -eq 0) {
-        Write-Host "yt-dlp completed successfully for this URL."
+    try {
+        & $YtDlpPath @CommonArgs $Url 2>&1 | Tee-Object -FilePath $RunLog -Append
     }
-    else {
-        Write-Warning "yt-dlp exited with code $ExitCode for this URL. Check the run log. Output may still have been created."
+    catch {
+        $msg = "ERROR capturing URL: $Url`r`n$($_.Exception.Message)"
+        Write-Warning $msg
+        Add-Content -Path $RunLog -Value $msg
     }
 
-    if (-not $IsLastUrl) {
-        $PauseSeconds = 30 + (Get-Random -Minimum 0 -Maximum 31)
+    if ($i -lt ($Urls.Count - 1)) {
+        $PauseSeconds = Get-Random -Minimum 20 -Maximum 60
         Write-Host "Pausing $PauseSeconds seconds before next URL..."
         Start-Sleep -Seconds $PauseSeconds
     }
@@ -319,7 +321,19 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
 
 Write-Section "Hashing captured files"
 
-Export-Sha256Manifest -RootPath $CaseDir -OutputCsv $HashManifest
+$manifestRows = foreach ($file in Get-ChildItem $CaseDir -Recurse -File) {
+    if ($file.FullName -eq $HashManifest) {
+        continue
+    }
+
+    [PSCustomObject]@{
+        Algorithm = "SHA256"
+        Hash      = Get-Sha256HashCompat -Path $file.FullName
+        Path      = $file.FullName
+    }
+}
+
+$manifestRows | Export-Csv $HashManifest -NoTypeInformation
 
 Write-Host "Hash manifest written to: $HashManifest"
 

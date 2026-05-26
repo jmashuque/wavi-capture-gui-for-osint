@@ -7,6 +7,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -29,7 +30,15 @@ DEFAULTS = {
     "ffmpeg_folder": ROOT,
     "impersonate_target": "None",
     "prefer_mp4": False,
-    "update_ytdlp": True,
+    "capture_mode": "media",
+    "source_scope": "single",
+    "write_info_json": True,
+    "write_source_link": True,
+    "write_description": False,
+    "write_thumbnail": False,
+    "write_subs": False,
+    "write_auto_subs": False,
+    "write_comments": False,
     "vpn_adapter_name": "",
 }
 
@@ -675,8 +684,32 @@ def build_powershell_command():
     if prefer_mp4_var.get():
         cmd += ["-PreferMp4"]
 
-    if update_ytdlp_var.get():
-        cmd += ["-UpdateYtDlp"]
+    if capture_mode_var.get() == "metadata_only":
+        cmd += ["-MetadataOnly"]
+
+    if source_scope_var.get() == "include_playlist":
+        cmd += ["-IncludePlaylist"]
+
+    if write_info_json_var.get():
+        cmd += ["-WriteInfoJson"]
+
+    if write_source_link_var.get():
+        cmd += ["-WriteSourceLink"]
+
+    if write_description_var.get():
+        cmd += ["-WriteDescription"]
+
+    if write_thumbnail_var.get():
+        cmd += ["-WriteThumbnail"]
+
+    if write_subs_var.get():
+        cmd += ["-WriteSubs"]
+
+    if write_auto_subs_var.get():
+        cmd += ["-WriteAutoSubs"]
+
+    if write_comments_var.get():
+        cmd += ["-WriteComments"]
 
     return cmd
 
@@ -785,7 +818,15 @@ def get_settings_dict():
         "ffmpeg_folder": ffmpeg_folder_var.get(),
         "impersonate_target": impersonate_var.get(),
         "prefer_mp4": prefer_mp4_var.get(),
-        "update_ytdlp": update_ytdlp_var.get(),
+        "capture_mode": capture_mode_var.get(),
+        "source_scope": source_scope_var.get(),
+        "write_info_json": write_info_json_var.get(),
+        "write_source_link": write_source_link_var.get(),
+        "write_description": write_description_var.get(),
+        "write_thumbnail": write_thumbnail_var.get(),
+        "write_subs": write_subs_var.get(),
+        "write_auto_subs": write_auto_subs_var.get(),
+        "write_comments": write_comments_var.get(),
         "vpn_adapter_name": vpn_adapter_var.get(),
     }
 
@@ -800,8 +841,17 @@ def apply_settings_dict(settings):
     ffmpeg_folder_var.set(settings.get("ffmpeg_folder", DEFAULTS["ffmpeg_folder"]))
     impersonate_var.set(settings.get("impersonate_target", DEFAULTS["impersonate_target"]))
     prefer_mp4_var.set(bool(settings.get("prefer_mp4", DEFAULTS["prefer_mp4"])))
-    update_ytdlp_var.set(bool(settings.get("update_ytdlp", DEFAULTS["update_ytdlp"])))
+    capture_mode_var.set(settings.get("capture_mode", DEFAULTS["capture_mode"]))
+    source_scope_var.set(settings.get("source_scope", DEFAULTS["source_scope"]))
+    write_info_json_var.set(bool(settings.get("write_info_json", DEFAULTS["write_info_json"])))
+    write_source_link_var.set(bool(settings.get("write_source_link", DEFAULTS["write_source_link"])))
+    write_description_var.set(bool(settings.get("write_description", DEFAULTS["write_description"])))
+    write_thumbnail_var.set(bool(settings.get("write_thumbnail", DEFAULTS["write_thumbnail"])))
+    write_subs_var.set(bool(settings.get("write_subs", DEFAULTS["write_subs"])))
+    write_auto_subs_var.set(bool(settings.get("write_auto_subs", DEFAULTS["write_auto_subs"])))
+    write_comments_var.set(bool(settings.get("write_comments", DEFAULTS["write_comments"])))
     vpn_adapter_var.set(settings.get("vpn_adapter_name", DEFAULTS["vpn_adapter_name"]))
+    update_capture_options_summary()
 
 
 def make_default_profile_settings():
@@ -1444,6 +1494,392 @@ Get-NetAdapter -ErrorAction SilentlyContinue |
     threading.Thread(target=worker, daemon=True).start()
 
 
+
+def check_ytdlp_version():
+    yt_dlp_path = yt_dlp_path_var.get().strip()
+
+    if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+        yt_dlp_version_status_var.set("yt-dlp: not found")
+        append_log("\nyt-dlp version check failed: yt-dlp path is missing or invalid.\n")
+        return
+
+    yt_dlp_version_status_var.set("yt-dlp: checking version...")
+    append_log(f"\nChecking yt-dlp version: {yt_dlp_path}\n")
+
+    def worker():
+        try:
+            result = subprocess.run(
+                [yt_dlp_path, "--version"],
+                cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            output = (result.stdout or result.stderr or "").strip()
+
+            if result.returncode == 0 and output:
+                root.after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
+                root.after(0, append_log, f"yt-dlp version: {output}\n")
+            else:
+                root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
+                root.after(
+                    0,
+                    append_log,
+                    f"yt-dlp version check failed. Exit code: {result.returncode}\n{output}\n",
+                )
+
+        except Exception as e:
+            root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
+            root.after(0, append_log, f"yt-dlp version check error: {e}\n")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def fetch_ytdlp_nightly_releases(limit=30):
+    url = f"https://api.github.com/repos/yt-dlp/yt-dlp-nightly-builds/releases?per_page={limit}"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ytdlp-gui-for-osint",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        releases = json.loads(response.read().decode("utf-8"))
+
+    results = []
+    for release in releases:
+        tag = release.get("tag_name", "")
+        published = release.get("published_at", "")
+        name = release.get("name", "")
+
+        if tag:
+            results.append(
+                {
+                    "tag": tag,
+                    "published": published,
+                    "name": name,
+                    "display": f"{tag}    {published}",
+                }
+            )
+
+    return results
+
+
+def open_ytdlp_update_dialog():
+    yt_dlp_path = yt_dlp_path_var.get().strip()
+
+    if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+        yt_dlp_version_status_var.set("yt-dlp: not found")
+        messagebox.showerror("yt-dlp not found", "yt-dlp path is missing or invalid.")
+        return
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Update yt-dlp")
+    dialog.geometry("720x560")
+    dialog.minsize(680, 520)
+    dialog.transient(root)
+    dialog.grab_set()
+
+    update_mode_var = tk.StringVar(value="stable")
+    nightly_status_var = tk.StringVar(value="Nightly list not loaded.")
+    selected_nightly_tag_var = tk.StringVar(value="")
+    current_version_var = tk.StringVar(value="Current detected version: checking...")
+    nightly_releases = []
+
+    frame = ttk.Frame(dialog, padding=12)
+    frame.pack(fill="both", expand=True)
+    frame.columnconfigure(1, weight=1)
+    frame.rowconfigure(5, weight=1)
+
+    warning = (
+        "Warning: Organizational ASR or endpoint protection may block very recent nightly builds "
+        "because they are new, low-prevalence executable files. Prefer a known-good pinned nightly "
+        "or an IT-approved staged release for production use."
+    )
+
+    ttk.Label(frame, text=warning, wraplength=670, justify="left").grid(
+        row=0,
+        column=0,
+        columnspan=3,
+        sticky="ew",
+        pady=(0, 10),
+    )
+
+    ttk.Label(
+        frame,
+        textvariable=current_version_var,
+        justify="left",
+    ).grid(
+        row=1,
+        column=0,
+        columnspan=3,
+        sticky="w",
+        pady=(0, 10),
+    )
+
+    ttk.Label(frame, text="Update target").grid(row=2, column=0, sticky="nw", pady=4)
+
+    mode_frame = ttk.Frame(frame)
+    mode_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=4)
+
+    ttk.Radiobutton(
+        mode_frame,
+        text="Latest stable",
+        variable=update_mode_var,
+        value="stable",
+    ).pack(anchor="w")
+
+    ttk.Radiobutton(
+        mode_frame,
+        text="Latest nightly",
+        variable=update_mode_var,
+        value="nightly",
+    ).pack(anchor="w")
+
+    ttk.Radiobutton(
+        mode_frame,
+        text="Selected nightly from list",
+        variable=update_mode_var,
+        value="selected_nightly",
+    ).pack(anchor="w")
+
+    ttk.Button(
+        frame,
+        text="Query Nightlies from GitHub",
+        command=lambda: query_nightlies(),
+    ).grid(row=3, column=0, sticky="w", pady=(8, 4))
+
+    ttk.Label(frame, textvariable=nightly_status_var).grid(
+        row=3,
+        column=1,
+        columnspan=2,
+        sticky="w",
+        pady=(8, 4),
+    )
+
+    ttk.Label(frame, text="Available nightlies").grid(row=4, column=0, sticky="nw", pady=4)
+
+    list_frame = ttk.Frame(frame)
+    list_frame.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=4)
+    list_frame.columnconfigure(0, weight=1)
+    list_frame.rowconfigure(0, weight=1)
+
+    nightly_listbox = tk.Listbox(list_frame, height=12)
+    nightly_listbox.grid(row=0, column=0, sticky="nsew")
+
+    scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=nightly_listbox.yview)
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    nightly_listbox.configure(yscrollcommand=scrollbar.set)
+
+    selected_label = ttk.Label(frame, textvariable=selected_nightly_tag_var)
+    selected_label.grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+    button_frame = ttk.Frame(frame)
+    button_frame.grid(row=7, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+    def refresh_current_version_for_dialog():
+        append_log(f"\nChecking current yt-dlp version for update dialog: {yt_dlp_path}\n")
+
+        def worker():
+            try:
+                result = subprocess.run(
+                    [yt_dlp_path, "--version"],
+                    cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+                output = (result.stdout or result.stderr or "").strip()
+
+                if result.returncode == 0 and output:
+                    root.after(0, current_version_var.set, f"Current detected version: {output}")
+                    root.after(0, yt_dlp_version_status_var.set, f"yt-dlp: {output}")
+                    root.after(0, append_log, f"Current yt-dlp version: {output}\n")
+                else:
+                    root.after(0, current_version_var.set, "Current detected version: unable to detect")
+                    root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check failed")
+                    root.after(
+                        0,
+                        append_log,
+                        f"Unable to detect current yt-dlp version. Exit code: {result.returncode}\n{output}\n",
+                    )
+
+            except Exception as e:
+                root.after(0, current_version_var.set, f"Current detected version: error ({e})")
+                root.after(0, yt_dlp_version_status_var.set, "yt-dlp: version check error")
+                root.after(0, append_log, f"yt-dlp version check error in update dialog: {e}\n")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_nightly_select(event=None):
+        selection = nightly_listbox.curselection()
+        if not selection:
+            selected_nightly_tag_var.set("")
+            return
+
+        index = selection[0]
+        if index >= len(nightly_releases):
+            selected_nightly_tag_var.set("")
+            return
+
+        tag = nightly_releases[index]["tag"]
+        selected_nightly_tag_var.set(f"Selected nightly: {tag}")
+        update_mode_var.set("selected_nightly")
+
+    nightly_listbox.bind("<<ListboxSelect>>", on_nightly_select)
+
+    def query_nightlies():
+        nightly_status_var.set("Querying GitHub for nightly releases...")
+        nightly_listbox.delete(0, "end")
+        append_log("\nQuerying GitHub for yt-dlp nightly release list...\n")
+
+        def worker():
+            nonlocal nightly_releases
+
+            try:
+                releases = fetch_ytdlp_nightly_releases(limit=30)
+
+                def update_ui():
+                    nonlocal nightly_releases
+                    nightly_releases = releases
+                    nightly_listbox.delete(0, "end")
+
+                    for item in nightly_releases:
+                        nightly_listbox.insert("end", item["display"])
+
+                    nightly_status_var.set(f"Loaded {len(nightly_releases)} nightly release(s).")
+                    append_log(f"Loaded {len(nightly_releases)} yt-dlp nightly release(s) from GitHub.\n")
+
+                    if nightly_releases:
+                        nightly_listbox.selection_set(0)
+                        nightly_listbox.activate(0)
+                        on_nightly_select()
+
+                root.after(0, update_ui)
+
+            except Exception as e:
+                root.after(0, nightly_status_var.set, "Failed to query GitHub nightlies.")
+                root.after(0, append_log, f"Failed to query yt-dlp nightly releases from GitHub: {e}\n")
+                root.after(0, messagebox.showerror, "Nightly query failed", str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def get_update_target():
+        mode = update_mode_var.get()
+
+        if mode == "stable":
+            return "stable"
+
+        if mode == "nightly":
+            return "nightly"
+
+        selection = nightly_listbox.curselection()
+        if not selection:
+            raise ValueError("Select a nightly release from the list first.")
+
+        index = selection[0]
+        if index >= len(nightly_releases):
+            raise ValueError("Selected nightly is invalid. Query the nightly list again.")
+
+        return f"nightly@{nightly_releases[index]['tag']}"
+
+    def begin_update():
+        try:
+            target = get_update_target()
+        except Exception as e:
+            messagebox.showerror("Update target missing", str(e))
+            return
+
+        confirm = messagebox.askyesno(
+            "Update yt-dlp?",
+            f"This will run yt-dlp's built-in updater directly:\n\n"
+            f"{yt_dlp_path} --update-to {target}\n\n"
+            f"{current_version_var.get()}\n\n"
+            "Very recent nightlies may be blocked by ASR or endpoint protection.\n\n"
+            "Continue?",
+        )
+
+        if not confirm:
+            return
+
+        dialog.destroy()
+        update_ytdlp_direct(target)
+
+    ttk.Button(button_frame, text="Update yt-dlp", command=begin_update).pack(side="left", padx=6)
+    ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="left", padx=6)
+
+    refresh_current_version_for_dialog()
+
+
+
+def update_ytdlp_direct(update_target):
+    yt_dlp_path = yt_dlp_path_var.get().strip()
+
+    if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+        yt_dlp_version_status_var.set("yt-dlp: not found")
+        messagebox.showerror("yt-dlp not found", "yt-dlp path is missing or invalid.")
+        return
+
+    append_log(
+        "\nStarting direct yt-dlp update...\n"
+        f"yt-dlp path: {yt_dlp_path}\n"
+        f"Update target: {update_target}\n"
+        "Command source: GUI direct subprocess, not the PowerShell capture script.\n\n"
+    )
+
+    yt_dlp_version_status_var.set(f"yt-dlp: updating to {update_target}...")
+    set_status("Updating yt-dlp...")
+
+    def worker():
+        try:
+            result = subprocess.Popen(
+                [yt_dlp_path, "--update-to", update_target],
+                cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            if result.stdout:
+                for line in result.stdout:
+                    root.after(0, append_log, line)
+
+            exit_code = result.wait()
+
+            if exit_code == 0:
+                root.after(0, append_log, f"\nyt-dlp update completed successfully. Exit code: {exit_code}\n")
+                root.after(0, set_status, "yt-dlp update complete")
+                root.after(0, messagebox.showinfo, "yt-dlp updated", "yt-dlp update completed successfully.")
+                root.after(0, check_ytdlp_version)
+            else:
+                root.after(0, append_log, f"\nyt-dlp update failed. Exit code: {exit_code}\n")
+                root.after(0, set_status, f"yt-dlp update failed with exit code {exit_code}")
+                root.after(
+                    0,
+                    messagebox.showwarning,
+                    "yt-dlp update failed",
+                    f"yt-dlp exited with code {exit_code}. Review the output log. "
+                    "If this was a recent nightly, ASR or endpoint protection may have blocked it.",
+                )
+                root.after(0, check_ytdlp_version)
+
+        except Exception as e:
+            root.after(0, set_status, "yt-dlp update error")
+            root.after(0, yt_dlp_version_status_var.set, "yt-dlp: update error")
+            root.after(0, append_log, f"\nyt-dlp update error: {e}\n")
+            root.after(0, messagebox.showerror, "yt-dlp update error", str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+
 def check_impersonate_targets():
     yt_dlp_path = yt_dlp_path_var.get().strip()
 
@@ -1803,6 +2239,63 @@ def export_browser_cookies(browser, output_cookie_file, update_main_cookie_path=
     threading.Thread(target=worker, daemon=True).start()
 
 
+
+def update_capture_options_summary(*args):
+    try:
+        mode = "Metadata only" if capture_mode_var.get() == "metadata_only" else "Media + artifacts"
+        scope = "Include playlist" if source_scope_var.get() == "include_playlist" else "Single item"
+        artifacts = []
+
+        if write_info_json_var.get():
+            artifacts.append("JSON")
+        if write_source_link_var.get():
+            artifacts.append("link")
+        if write_description_var.get():
+            artifacts.append("description")
+        if write_thumbnail_var.get():
+            artifacts.append("thumbnail")
+        if write_subs_var.get():
+            artifacts.append("subs")
+        if write_auto_subs_var.get():
+            artifacts.append("auto-subs")
+        if write_comments_var.get():
+            artifacts.append("comments")
+        if prefer_mp4_var.get():
+            artifacts.append("MP4")
+
+        artifact_text = ", ".join(artifacts) if artifacts else "no sidecars"
+        capture_options_summary_var.set(f"{mode}; {scope}; {artifact_text}")
+    except Exception:
+        pass
+
+
+def toggle_capture_options_panel():
+    if capture_options_panel.winfo_ismapped():
+        capture_options_panel.grid_remove()
+        capture_options_button.config(text="Capture Options ▾")
+        save_settings(show_popup=False)
+    else:
+        update_capture_options_summary()
+        capture_options_panel.grid(
+            row=10,
+            column=0,
+            columnspan=3,
+            rowspan=8,
+            sticky="nsew",
+            padx=0,
+            pady=(8, 0),
+        )
+        capture_options_panel.tkraise()
+        capture_options_button.config(text="Capture Options ▴")
+
+
+def close_capture_options_panel():
+    capture_options_panel.grid_remove()
+    capture_options_button.config(text="Capture Options ▾")
+    update_capture_options_summary()
+    save_settings(show_popup=False)
+
+
 def on_close():
     global temp_url_file
 
@@ -1843,13 +2336,40 @@ output_root_var = tk.StringVar(value=DEFAULTS["output_root"])
 ffmpeg_folder_var = tk.StringVar(value=DEFAULTS["ffmpeg_folder"])
 impersonate_var = tk.StringVar(value=DEFAULTS["impersonate_target"])
 prefer_mp4_var = tk.BooleanVar(value=DEFAULTS["prefer_mp4"])
-update_ytdlp_var = tk.BooleanVar(value=DEFAULTS["update_ytdlp"])
 vpn_adapter_var = tk.StringVar(value=DEFAULTS["vpn_adapter_name"])
 vpn_status_var = tk.StringVar(value="VPN: Not checked")
 target_status_var = tk.StringVar(value="Impersonate targets: Not checked")
 status_var = tk.StringVar(value="Ready")
+yt_dlp_version_status_var = tk.StringVar(value="yt-dlp: not checked")
 preflight_done_var = tk.BooleanVar(value=False)
 selected_profile_var = tk.StringVar(value=DEFAULT_PROFILE_NAME)
+capture_options_summary_var = tk.StringVar(value="")
+capture_mode_var = tk.StringVar(value=DEFAULTS["capture_mode"])
+source_scope_var = tk.StringVar(value=DEFAULTS["source_scope"])
+write_info_json_var = tk.BooleanVar(value=DEFAULTS["write_info_json"])
+write_source_link_var = tk.BooleanVar(value=DEFAULTS["write_source_link"])
+write_description_var = tk.BooleanVar(value=DEFAULTS["write_description"])
+write_thumbnail_var = tk.BooleanVar(value=DEFAULTS["write_thumbnail"])
+write_subs_var = tk.BooleanVar(value=DEFAULTS["write_subs"])
+write_auto_subs_var = tk.BooleanVar(value=DEFAULTS["write_auto_subs"])
+write_comments_var = tk.BooleanVar(value=DEFAULTS["write_comments"])
+
+
+for option_var in [
+    prefer_mp4_var,
+    capture_mode_var,
+    source_scope_var,
+    write_info_json_var,
+    write_source_link_var,
+    write_description_var,
+    write_thumbnail_var,
+    write_subs_var,
+    write_auto_subs_var,
+    write_comments_var,
+]:
+    option_var.trace_add("write", update_capture_options_summary)
+
+update_capture_options_summary()
 
 main = ttk.Frame(root, padding=12)
 main.pack(fill="both", expand=True)
@@ -1920,7 +2440,46 @@ settings_menu.add_separator()
 settings_menu.add_command(label="Save Default Portable Settings", command=lambda: save_settings(show_popup=True))
 
 add_file_row(0, "Script Path", script_path_var)
-add_file_row(1, "yt-dlp Path", yt_dlp_path_var)
+
+ttk.Label(main, text="yt-dlp Path").grid(row=1, column=0, sticky="nw", pady=3)
+yt_dlp_path_frame = ttk.Frame(main)
+yt_dlp_path_frame.grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=3)
+yt_dlp_path_frame.columnconfigure(0, weight=1)
+
+ttk.Entry(yt_dlp_path_frame, textvariable=yt_dlp_path_var).grid(
+    row=0,
+    column=0,
+    sticky="ew",
+    padx=(0, 6),
+    pady=(0, 4),
+)
+ttk.Button(
+    yt_dlp_path_frame,
+    text="Browse...",
+    command=lambda: browse_file(yt_dlp_path_var, "yt-dlp Path"),
+).grid(row=0, column=1, sticky="e", pady=(0, 4))
+
+yt_dlp_tools_frame = ttk.Frame(yt_dlp_path_frame)
+yt_dlp_tools_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+yt_dlp_tools_frame.columnconfigure(2, weight=1)
+
+ttk.Button(
+    yt_dlp_tools_frame,
+    text="Check yt-dlp Version",
+    command=check_ytdlp_version,
+).grid(row=0, column=0, sticky="w", padx=(0, 6))
+
+ttk.Button(
+    yt_dlp_tools_frame,
+    text="Update yt-dlp",
+    command=open_ytdlp_update_dialog,
+).grid(row=0, column=1, sticky="w", padx=(0, 10))
+
+ttk.Label(
+    yt_dlp_tools_frame,
+    textvariable=yt_dlp_version_status_var,
+).grid(row=0, column=2, sticky="w")
+
 add_file_row(2, "Input File", input_file_var)
 
 ttk.Label(main, text="Case Name").grid(row=3, column=0, sticky="w", pady=3)
@@ -1962,10 +2521,20 @@ ttk.Label(
 ).grid(row=8, column=1, columnspan=2, sticky="w", padx=6, pady=(0, 4))
 
 options_frame = ttk.Frame(main)
-options_frame.grid(row=9, column=1, columnspan=2, sticky="w", padx=6, pady=5)
+options_frame.grid(row=9, column=1, columnspan=2, sticky="ew", padx=6, pady=5)
+options_frame.columnconfigure(1, weight=1)
 
-ttk.Checkbutton(options_frame, text="Prefer MP4", variable=prefer_mp4_var).pack(side="left", padx=(0, 24))
-ttk.Checkbutton(options_frame, text="Update yt-dlp", variable=update_ytdlp_var).pack(side="left")
+capture_options_button = ttk.Button(
+    options_frame,
+    text="Capture Options ▾",
+    command=toggle_capture_options_panel,
+)
+capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+ttk.Label(
+    options_frame,
+    textvariable=capture_options_summary_var,
+).grid(row=0, column=1, sticky="w")
 
 vpn_frame = ttk.LabelFrame(main, text="VPN Status", padding=8)
 vpn_frame.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 6))
@@ -2057,6 +2626,104 @@ ttk.Label(main, text="Output Log").grid(row=15, column=0, columnspan=3, sticky="
 
 log_box = scrolledtext.ScrolledText(main, height=14, wrap="word")
 log_box.grid(row=17, column=0, columnspan=3, sticky="nsew")
+
+capture_options_panel = ttk.LabelFrame(main, text="Capture Options", padding=12)
+capture_options_panel.columnconfigure(0, weight=1)
+capture_options_panel.columnconfigure(1, weight=1)
+capture_options_panel.columnconfigure(2, weight=1)
+capture_options_panel.rowconfigure(4, weight=1)
+
+ttk.Label(
+    capture_options_panel,
+    text="These options are passed to the underlying yt-dlp capture script. Defaults prioritize OSINT-friendly sidecar metadata while keeping the workflow simple.",
+    wraplength=980,
+    justify="left",
+).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+mode_frame = ttk.LabelFrame(capture_options_panel, text="Capture Mode", padding=8)
+mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+ttk.Radiobutton(
+    mode_frame,
+    text="Download media and selected artifacts",
+    variable=capture_mode_var,
+    value="media",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    mode_frame,
+    text="Metadata/artifacts only; do not download media",
+    variable=capture_mode_var,
+    value="metadata_only",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+
+scope_frame = ttk.LabelFrame(capture_options_panel, text="Source Scope", padding=8)
+scope_frame.grid(row=1, column=1, sticky="nsew", padx=8, pady=(0, 8))
+ttk.Radiobutton(
+    scope_frame,
+    text="Single item only",
+    variable=source_scope_var,
+    value="single",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    scope_frame,
+    text="Include playlist / multi-item source",
+    variable=source_scope_var,
+    value="include_playlist",
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+
+format_frame = ttk.LabelFrame(capture_options_panel, text="Format", padding=8)
+format_frame.grid(row=1, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
+ttk.Checkbutton(
+    format_frame,
+    text="Prefer MP4-compatible streams and merge to MP4",
+    variable=prefer_mp4_var,
+    command=update_capture_options_summary,
+).pack(anchor="w", pady=2)
+
+artifact_frame = ttk.LabelFrame(capture_options_panel, text="Sidecar Artifacts", padding=8)
+artifact_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+artifact_frame.columnconfigure(0, weight=1)
+artifact_frame.columnconfigure(1, weight=1)
+artifact_frame.columnconfigure(2, weight=1)
+
+artifact_options = [
+    ("Save metadata JSON", write_info_json_var, 0, 0),
+    ("Save source link", write_source_link_var, 0, 1),
+    ("Save description", write_description_var, 0, 2),
+    ("Save thumbnail", write_thumbnail_var, 1, 0),
+    ("Save subtitles", write_subs_var, 1, 1),
+    ("Save automatic subtitles", write_auto_subs_var, 1, 2),
+    ("Save comments when supported", write_comments_var, 2, 0),
+]
+
+for label_text, variable, row_index, column_index in artifact_options:
+    ttk.Checkbutton(
+        artifact_frame,
+        text=label_text,
+        variable=variable,
+        command=update_capture_options_summary,
+    ).grid(row=row_index, column=column_index, sticky="w", padx=4, pady=3)
+
+ttk.Label(
+    capture_options_panel,
+    text="Note: comments, subtitles, thumbnails, and metadata availability depend on the source and yt-dlp extractor support.",
+    wraplength=980,
+    justify="left",
+).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 12))
+
+panel_button_frame = ttk.Frame(capture_options_panel)
+panel_button_frame.grid(row=5, column=0, columnspan=3, sticky="e")
+
+ttk.Button(
+    panel_button_frame,
+    text="Close Capture Options",
+    command=close_capture_options_panel,
+).pack(side="left", padx=6)
+
+capture_options_panel.grid_remove()
 
 root.protocol("WM_DELETE_WINDOW", on_close)
 

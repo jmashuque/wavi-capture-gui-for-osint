@@ -16,7 +16,7 @@ A lightweight, portable Windows GUI for running an approved `yt-dlp` capture wor
 - [Profiles and Settings](#profiles-and-settings)
 - [Cookies Handling](#cookies-handling)
 - [Limitations](#limitations)
-- [Recommended Deployment Approach](#recommended-deployment-approach)
+- [Changelog](#changelog)
 
 ## Overview
 
@@ -136,15 +136,33 @@ The preflight check confirms common prerequisites, but it cannot guarantee that 
 
 The app is only a workflow wrapper. It does not make authorization, policy, or legal decisions.
 
-## Recommended Deployment Approach
+## Changelog
 
-For organizational use, I recommend the following approach:
+### v0.2026.0526 - PowerShell Capture, yt-dlp Updates, and Capture Options
 
-1. IT or an approved administrator stages Python and all required binaries.
-2. The app folder is placed in a local writable directory.
-3. Users run the GUI from that local folder.
-4. Active captures are written to a local case folder.
-5. Completed case folders are moved or archived according to organizational policy.
-6. Raw cookies files are kept local and short-lived, or stored only in encrypted form.
+#### PowerShell Script Changes
 
-This keeps the app portable while avoiding installer behavior, automatic binary downloads, and other activity that may be flagged by ASR or endpoint security tools.
+- Added support for the new GUI capture options.
+- Added switches for MP4 preference, metadata-only capture, playlist inclusion, metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
+- Mapped the new switches to the corresponding `yt-dlp` arguments.
+- Preserved single-item capture by default unless playlist or multi-item capture is explicitly selected.
+- Added FFmpeg folder support through `yt-dlp`'s FFmpeg location option.
+- Kept yt-dlp updating separate from the PowerShell capture process.
+
+#### yt-dlp Update Changes
+
+- Removed yt-dlp updating from the normal capture workflow.
+- Removed the previous update checkbox from the main GUI capture options.
+- Added dedicated controls to check the current yt-dlp version and run updates on request.
+- Added a Python-based update dialog that runs independently of the PowerShell script.
+- Added update choices for latest stable, latest nightly, or a selected nightly build from GitHub.
+- Added a warning that very recent nightlies may be blocked by ASR or endpoint protection.
+
+#### Capture Options Changes
+
+- Replaced the always-visible `Prefer MP4` checkbox with a `Capture Options` button.
+- Moved MP4 preference into the Capture Options panel.
+- Added capture mode options for media capture or metadata/artifacts-only capture.
+- Added source scope options for single-item capture or playlist/multi-item capture.
+- Added sidecar artifact options for metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
+- Added persistent settings and profile support for the new capture options.
