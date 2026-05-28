@@ -3,7 +3,7 @@
 A lightweight, portable Windows GUI for running an approved yt-dlp capture workflow in an organizational environment.
 
 <p align="center">
-  <img src="/screenshots/main.png" alt="yt-dlp GUI for OSINT screenshot" width="850">
+  <img src="/screenshots/main.png" alt="yt-dlp GUI for OSINT screenshot" width="750">
 </p>
 
 ## Table of Contents
@@ -86,6 +86,8 @@ The following components must be present or provided separately:
 - `ffprobe.exe`
 - `deno.exe`
 
+Place `deno.exe` in the same folder as `yt-dlp.exe`. From the source repos/build packages, keep only the required binaries for this app: `yt-dlp.exe`, `deno.exe`, `ffmpeg.exe`, and `ffprobe.exe`. Other bundled files can be omitted or deleted after staging the needed executables.
+
 Python may require administrative privileges to install, depending on the organization's software installation policies. For standard Windows users, I recommend installing Python through the Microsoft Store / Python install manager where permitted by policy:
 
 - Microsoft Store - Python: <https://apps.microsoft.com/detail/9PNRBTZXMB4Z>
@@ -115,10 +117,11 @@ For FFmpeg, use the Gyan.dev **release essentials** build unless you specificall
 5. Enter a case name or template. The default is `Case-%date%`; use **Insert Tag** for tags such as `%date%`, `%time%`, `%datetime%`, `%year%`, `%month%`, `%day%`, `%hour%`, `%minute%`, and `%second%`.
 6. Paste URLs into the URL box or select an input file. The URL box takes priority if both are used.
 7. Select the VPN/network adapter used for the capture, if applicable.
-8. Run **Preflight Check** to confirm required files exist and determine whether the existing yt-dlp, FFmpeg, FFprobe, and Deno binaries are allowed to execute.
-9. Start the capture with **Start Capture**.
-10. Review the output log.
-11. Open the case folder using **Open**, or use **Tools > Open Case Browser** to review case folders, thumbnails, media details, sidecar files, summaries, and manifest verification.
+8. Press **Check VPN** to verify that the selected VPN/network adapter is connected, if VPN checking is enabled.
+9. Run **Preflight Check** to confirm required files exist and determine whether the existing yt-dlp, FFmpeg, FFprobe, and Deno binaries are allowed to execute.
+10. Start the capture with **Start Capture**.
+11. Review the output log.
+12. Open the case folder using **Open**, or use **Tools > Open Case Browser** to review case folders, thumbnails, media details, sidecar files, summaries, and manifest verification.
 
 Case name templates are resolved when capture starts. The resolved case folder is previewed below the Case Name field, and the app warns before using an existing populated folder.
 
