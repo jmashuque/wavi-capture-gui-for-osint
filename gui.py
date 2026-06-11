@@ -21,7 +21,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
-APP_VERSION = "v0.2026.0529"
+APP_VERSION = "v0.2026.0611"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/ytdlp-gui-for-osint/releases/latest"
 SETTINGS_SCHEMA_VERSION = 9
@@ -35,7 +35,7 @@ DEFAULTS = {
     "script_path": os.path.join(ROOT, "script.ps1"),
     "yt_dlp_path": os.path.join(ROOT, "yt-dlp.exe"),
     "input_file": os.path.join(ROOT, "urls.txt"),
-    "case_name": "Case-%date%",
+    "case_name": "Case-%datetime%",
     "cookies_file": os.path.join(ROOT, "cookies.txt"),
     "use_cookies_file": True,
     "output_root": os.path.join(ROOT, "Investigations"),
@@ -103,6 +103,14 @@ case_browser_images = []
 case_browser_file_map = {}
 last_capture_context = {}
 last_successful_case_summary = ""
+job_queue = []
+job_queue_window = None
+job_queue_tree = None
+job_queue_progress_var = None
+job_queue_status_var = None
+job_queue_running = False
+job_queue_pause_after_current = False
+job_queue_current_job_id = None
 
 
 def browse_file(var, title="Select file"):
@@ -250,6 +258,26 @@ def configure_action_buttons_theme(colors):
             bg=colors["button_bg"],
             activebackground=colors["button_active"],
         )
+    except Exception:
+        pass
+
+    try:
+        start_menu_button.configure(
+            fg=colors["start_fg"],
+            activeforeground=colors["start_fg"],
+            bg=colors["button_bg"],
+            activebackground=colors["button_active"],
+        )
+    except Exception:
+        pass
+
+    try:
+        start_capture_split_frame.configure(bg=colors["bg"])
+    except Exception:
+        pass
+
+    try:
+        configure_menu_theme(start_capture_menu, colors)
     except Exception:
         pass
 
@@ -778,6 +806,34 @@ def query_capture_tool_versions_for_log():
     return versions
 
 
+def query_capture_tool_versions_for_job(settings):
+    script_path = settings.get("script_path", "")
+    yt_dlp_path = settings.get("yt_dlp_path", "")
+    ffmpeg_folder = settings.get("ffmpeg_folder", "")
+
+    deno_exe = os.path.join(os.path.dirname(os.path.abspath(yt_dlp_path)), "deno.exe") if yt_dlp_path else "deno"
+    ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+    ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+
+    versions = {
+        "app": APP_VERSION,
+        "powershell_script": script_path,
+        "yt_dlp_path": yt_dlp_path,
+        "yt_dlp": get_tool_first_line(
+            [yt_dlp_path, "--version"],
+            cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) if yt_dlp_path else ROOT,
+        ) if yt_dlp_path else {"version": "not configured", "ok": False},
+        "ffmpeg_path": ffmpeg_exe,
+        "ffmpeg": get_tool_first_line([ffmpeg_exe, "-version"]) if ffmpeg_exe else {"version": "not configured", "ok": False},
+        "ffprobe_path": ffprobe_exe,
+        "ffprobe": get_tool_first_line([ffprobe_exe, "-version"]) if ffprobe_exe else {"version": "not configured", "ok": False},
+        "deno_path": deno_exe,
+        "deno": get_tool_first_line([deno_exe, "--version"]) if deno_exe else {"version": "not configured", "ok": False},
+    }
+
+    return versions
+
+
 def log_capture_tool_versions(versions):
     append_log("Tool and script versions:\n")
     append_log(f"  App: {versions.get('app', APP_VERSION)}\n")
@@ -814,7 +870,7 @@ def count_case_files(case_folder):
         return counts
 
     for root_dir, dir_names, file_names in os.walk(case_folder):
-        dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache", "manifests"}]
+        dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache"}]
 
         for file_name in file_names:
             path = os.path.join(root_dir, file_name)
@@ -833,7 +889,14 @@ def count_case_files(case_folder):
     return counts
 
 
-def build_case_summary_text(exit_code, submitted_url_count, paths, versions, counts):
+def build_case_summary_text(exit_code, submitted_url_count, paths, versions, counts, settings=None):
+    settings = settings if isinstance(settings, dict) else {}
+
+    def setting_value(key, fallback):
+        if key in settings:
+            return settings.get(key)
+        return fallback
+
     lines = [
         "yt-dlp GUI for OSINT - Case Summary",
         "",
@@ -868,17 +931,17 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}",
         "",
         "Capture options:",
-        f"  Profile: {selected_profile_var.get()}",
-        f"  Case name template: {case_name_var.get()}",
+        f"  Profile: {setting_value('_profile_name', selected_profile_var.get())}",
+        f"  Case name template: {setting_value('case_name', case_name_var.get())}",
         f"  Resolved case name: {os.path.basename(paths.get('case_folder', ''))}",
-        f"  Capture mode: {capture_mode_var.get()}",
-        f"  Source scope: {source_scope_var.get()}",
-        f"  Archive mode: {archive_mode_var.get()}",
-        f"  Max resolution: {max_resolution_var.get()}",
-        f"  Failure handling: {failure_handling_var.get()}",
-        f"  Rate limit: {rate_limit_var.get()}",
-        f"  Download speed limit: {download_speed_limit_var.get()}",
-        f"  Impersonate target: {impersonate_var.get()}",
+        f"  Capture mode: {setting_value('capture_mode', capture_mode_var.get())}",
+        f"  Source scope: {setting_value('source_scope', source_scope_var.get())}",
+        f"  Archive mode: {setting_value('archive_mode', archive_mode_var.get())}",
+        f"  Max resolution: {setting_value('max_resolution', max_resolution_var.get())}",
+        f"  Failure handling: {setting_value('failure_handling', failure_handling_var.get())}",
+        f"  Rate limit: {setting_value('rate_limit', rate_limit_var.get())}",
+        f"  Download speed limit: {setting_value('download_speed_limit', download_speed_limit_var.get())}",
+        f"  Impersonate target: {setting_value('impersonate_target', impersonate_var.get())}",
         f"  VPN check: {'enabled' if check_vpn_var.get() else 'disabled'}",
     ]
 
@@ -990,6 +1053,26 @@ def create_url_input_file():
     return path
 
 
+def create_url_input_file_from_lines(lines):
+    clean_lines = [
+        str(line).strip()
+        for line in (lines or [])
+        if str(line).strip() and not str(line).strip().startswith("#")
+    ]
+
+    if not clean_lines:
+        raise ValueError("The queue job does not contain any usable URLs.")
+
+    fd, path = tempfile.mkstemp(prefix="yt-dlp-gui-queue-urls-", suffix=".txt", text=True)
+    os.close(fd)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(clean_lines))
+        f.write("\n")
+
+    return path
+
+
 def count_submitted_urls():
     pasted = urls_text.get("1.0", "end").strip()
 
@@ -1061,24 +1144,30 @@ def save_urls_to_input_file():
         messagebox.showwarning("No URLs", "The URL box is empty.")
         return
 
-    path = input_file_var.get().strip()
+    current_input_file = input_file_var.get().strip()
+    initial_dir = ROOT
+    initial_file = f"{safe_case_name(case_name_var.get().strip() or 'urls')}_urls.txt"
+
+    if current_input_file:
+        try:
+            initial_dir = os.path.dirname(os.path.abspath(current_input_file)) or ROOT
+            initial_file = os.path.basename(current_input_file) or initial_file
+        except Exception:
+            pass
+
+    path = filedialog.asksaveasfilename(
+        title="Save URLs to file",
+        defaultextension=".txt",
+        initialdir=initial_dir,
+        initialfile=initial_file,
+        filetypes=[
+            ("Text files", "*.txt"),
+            ("All files", "*.*"),
+        ],
+    )
 
     if not path:
-        default_name = f"{safe_case_name(case_name_var.get().strip() or 'urls')}_urls.txt"
-        path = filedialog.asksaveasfilename(
-            title="Save URLs to input file",
-            defaultextension=".txt",
-            initialfile=default_name,
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ],
-        )
-
-        if not path:
-            return
-
-        input_file_var.set(path)
+        return
 
     try:
         parent = os.path.dirname(os.path.abspath(path))
@@ -1089,9 +1178,10 @@ def save_urls_to_input_file():
             f.write(content)
             f.write("\n")
 
-        append_log(f"\nSaved URL box contents to input file: {path}\n")
+        input_file_var.set(path)
+        append_log(f"\nSaved URL box contents to file: {path}\n")
     except Exception as e:
-        messagebox.showerror("Save failed", f"Could not save URLs to input file:\n\n{e}")
+        messagebox.showerror("Save failed", f"Could not save URLs to file:\n\n{e}")
 
 
 def save_urls_to_file():
@@ -1618,6 +1708,206 @@ def build_powershell_command():
         cmd += ["-WriteComments"]
 
     return cmd
+
+
+def get_enabled_capture_dates_from_settings(settings):
+    date_after = ""
+    date_before = ""
+
+    if bool(settings.get("date_after_enabled", DEFAULTS["date_after_enabled"])):
+        date_after = normalize_capture_date(
+            settings.get("date_after_year", ""),
+            settings.get("date_after_month", ""),
+            settings.get("date_after_day", ""),
+            "Date after",
+        )
+
+    if bool(settings.get("date_before_enabled", DEFAULTS["date_before_enabled"])):
+        date_before = normalize_capture_date(
+            settings.get("date_before_year", ""),
+            settings.get("date_before_month", ""),
+            settings.get("date_before_day", ""),
+            "Date before",
+        )
+
+    if date_after and date_before and date_after > date_before:
+        raise ValueError("Date after cannot be later than Date before.")
+
+    return date_after, date_before
+
+
+def validate_queue_job_inputs(job):
+    settings = job.get("settings", {})
+    urls = job.get("urls", [])
+
+    script_path = settings.get("script_path", "").strip()
+    yt_dlp_path = settings.get("yt_dlp_path", "").strip()
+    cookies_file = settings.get("cookies_file", "").strip()
+    output_root = settings.get("output_root", "").strip()
+    ffmpeg_folder = settings.get("ffmpeg_folder", "").strip()
+    resolved_case_name = job.get("resolved_case_name", "").strip()
+
+    if not script_path or not os.path.isfile(script_path):
+        raise ValueError("PowerShell script path is missing or invalid.")
+
+    if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+        raise ValueError("yt-dlp path is missing or invalid.")
+
+    if not urls:
+        raise ValueError("The queue job does not contain any URLs.")
+
+    if bool(settings.get("use_cookies_file", DEFAULTS["use_cookies_file"])) and cookies_file and not os.path.isfile(cookies_file):
+        raise ValueError("Cookies file is invalid.")
+
+    if output_root and not os.path.isdir(output_root):
+        os.makedirs(output_root, exist_ok=True)
+
+    if ffmpeg_folder and not os.path.isdir(ffmpeg_folder):
+        raise ValueError("FFmpeg folder is invalid.")
+
+    if not resolved_case_name:
+        raise ValueError("Queue job resolved case name is blank.")
+
+    get_enabled_capture_dates_from_settings(settings)
+
+
+def get_expected_run_paths_for_values(output_root, resolved_case_name):
+    case_folder = os.path.join(output_root, resolved_case_name)
+    return {
+        "case_folder": case_folder,
+        "media_folder": os.path.join(case_folder, "media"),
+        "logs_folder": os.path.join(case_folder, "logs"),
+        "manifests_folder": os.path.join(case_folder, "manifests"),
+        "download_archive": os.path.join(case_folder, "download-archive.txt"),
+    }
+
+
+def build_powershell_command_for_job(job):
+    settings = job.get("settings", {})
+    input_path = create_url_input_file_from_lines(job.get("urls", []))
+    resolved_case_name = job.get("resolved_case_name", "").strip()
+
+    if not resolved_case_name:
+        raise ValueError("Queue job resolved case name is blank.")
+
+    cmd = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        settings.get("script_path", "").strip(),
+        "-YtDlpPath",
+        settings.get("yt_dlp_path", "").strip(),
+        "-InputFile",
+        input_path,
+        "-CaseName",
+        resolved_case_name,
+        "-OutputRoot",
+        settings.get("output_root", "").strip(),
+    ]
+
+    cookies_file = settings.get("cookies_file", "").strip()
+    if bool(settings.get("use_cookies_file", DEFAULTS["use_cookies_file"])) and cookies_file:
+        cmd += ["-CookiesFile", cookies_file]
+
+    ffmpeg_folder = settings.get("ffmpeg_folder", "").strip()
+    if ffmpeg_folder:
+        cmd += ["-FFmpegFolder", ffmpeg_folder]
+
+    impersonate_target = normalize_impersonate_target(settings.get("impersonate_target", ""))
+    if impersonate_target:
+        cmd += ["-ImpersonateTarget", impersonate_target]
+
+    if bool(settings.get("prefer_mp4", DEFAULTS["prefer_mp4"])):
+        cmd += ["-PreferMp4"]
+
+    if settings.get("capture_mode", DEFAULTS["capture_mode"]) == "metadata_only":
+        cmd += ["-MetadataOnly"]
+
+    if settings.get("source_scope", DEFAULTS["source_scope"]) == "include_playlist":
+        cmd += ["-IncludePlaylist"]
+
+    archive_mode = str(settings.get("archive_mode", DEFAULTS["archive_mode"]) or "use").strip()
+    if archive_mode == "ignore":
+        cmd += ["-ArchiveMode", "Ignore"]
+    elif archive_mode == "force":
+        cmd += ["-ArchiveMode", "Force"]
+    else:
+        cmd += ["-ArchiveMode", "Use"]
+
+    max_resolution = str(settings.get("max_resolution", DEFAULTS["max_resolution"]) or "best").strip()
+    if max_resolution != "best":
+        cmd += ["-MaxResolution", max_resolution]
+
+    if bool(settings.get("save_playlist_metadata", DEFAULTS["save_playlist_metadata"])):
+        cmd += ["-SavePlaylistMetadata"]
+
+    if bool(settings.get("generate_url_shortcuts", DEFAULTS["generate_url_shortcuts"])):
+        cmd += ["-GenerateUrlShortcuts"]
+
+    match_keywords = str(settings.get("match_keywords", "") or "").strip()
+    if match_keywords:
+        cmd += ["-MatchKeywords", match_keywords]
+
+    reject_keywords = str(settings.get("reject_keywords", "") or "").strip()
+    if reject_keywords:
+        cmd += ["-RejectKeywords", reject_keywords]
+
+    failure_handling = str(settings.get("failure_handling", DEFAULTS["failure_handling"]) or "continue").strip()
+    if failure_handling == "stop":
+        cmd += ["-FailureHandling", "Stop"]
+    else:
+        cmd += ["-FailureHandling", "Continue"]
+
+    date_after, date_before = get_enabled_capture_dates_from_settings(settings)
+
+    if date_after:
+        cmd += ["-DateAfter", date_after]
+
+    if date_before:
+        cmd += ["-DateBefore", date_before]
+
+    rate_limit = str(settings.get("rate_limit", DEFAULTS["rate_limit"]) or "normal").strip()
+    if rate_limit == "fast":
+        cmd += ["-RateLimit", "Fast"]
+    elif rate_limit == "cautious":
+        cmd += ["-RateLimit", "Cautious"]
+    else:
+        cmd += ["-RateLimit", "Normal"]
+
+    download_speed_limit = normalize_download_speed_limit_value(settings.get("download_speed_limit", DEFAULTS["download_speed_limit"]))
+    if not download_speed_limit:
+        raise ValueError("Download Speed Limit is invalid. Use disabled, 500K, 1M, 50M, or a custom value such as 20M.")
+    if download_speed_limit != "disabled":
+        cmd += ["-DownloadSpeedLimit", download_speed_limit]
+
+    if bool(settings.get("keep_partials", DEFAULTS["keep_partials"])):
+        cmd += ["-KeepPartials"]
+
+    if bool(settings.get("write_info_json", DEFAULTS["write_info_json"])):
+        cmd += ["-WriteInfoJson"]
+
+    if bool(settings.get("write_source_link", DEFAULTS["write_source_link"])):
+        cmd += ["-WriteSourceLink"]
+
+    if bool(settings.get("write_description", DEFAULTS["write_description"])):
+        cmd += ["-WriteDescription"]
+
+    if bool(settings.get("write_thumbnail", DEFAULTS["write_thumbnail"])):
+        cmd += ["-WriteThumbnail"]
+
+    if bool(settings.get("write_subs", DEFAULTS["write_subs"])):
+        cmd += ["-WriteSubs"]
+
+    if bool(settings.get("write_auto_subs", DEFAULTS["write_auto_subs"])):
+        cmd += ["-WriteAutoSubs"]
+
+    if bool(settings.get("write_comments", DEFAULTS["write_comments"])):
+        cmd += ["-WriteComments"]
+
+    return cmd
+
 
 
 def preflight_check(show_success_popup=True):
@@ -2596,6 +2886,8 @@ def start_capture():
     last_capture_context = {
         "tool_versions": tool_versions,
         "submitted_url_count": count_submitted_urls(),
+        "settings": get_settings_dict(),
+        "paths": get_expected_run_paths(),
     }
 
     append_log("Command:\n")
@@ -2603,6 +2895,7 @@ def start_capture():
     append_log("\n\n")
 
     start_button.config(state="disabled")
+    start_menu_button.config(state="disabled")
     stop_button.config(state="normal")
     set_status("Running...")
 
@@ -2643,6 +2936,7 @@ def start_capture():
 
         finally:
             root.after(0, lambda: start_button.config(state="normal"))
+            root.after(0, lambda: start_menu_button.config(state="normal"))
             root.after(0, lambda: stop_button.config(state="disabled"))
 
     threading.Thread(target=worker, daemon=True).start()
@@ -2652,7 +2946,7 @@ def show_run_summary(exit_code, submitted_url_count):
     global last_successful_case_summary
 
     try:
-        paths = get_expected_run_paths()
+        paths = last_capture_context.get("paths") or get_expected_run_paths()
     except Exception:
         paths = {}
 
@@ -2680,18 +2974,682 @@ def show_run_summary(exit_code, submitted_url_count):
 
     if exit_code == 0 and paths:
         versions = last_capture_context.get("tool_versions", {})
+        summary_settings = last_capture_context.get("settings", {})
         last_successful_case_summary = build_case_summary_text(
             exit_code,
             submitted_url_count,
             paths,
             versions,
             counts,
+            settings=summary_settings,
         )
         copy_summary_button.config(state="normal")
         append_log("Case summary is available. Use Copy Case Summary to copy it to the clipboard.\n")
     else:
         last_successful_case_summary = ""
         copy_summary_button.config(state="disabled")
+
+
+def get_current_url_lines_for_queue():
+    pasted = urls_text.get("1.0", "end").strip()
+    lines = []
+
+    if pasted:
+        for line in pasted.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+        return lines
+
+    input_file = input_file_var.get().strip()
+    if not input_file or not os.path.isfile(input_file):
+        return []
+
+    try:
+        with open(input_file, "r", encoding="utf-8-sig") as f:
+            for line in f.read().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    lines.append(line)
+    except UnicodeDecodeError:
+        with open(input_file, "r", encoding="cp1252") as f:
+            for line in f.read().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    lines.append(line)
+
+    return lines
+
+
+def make_job_id():
+    return datetime.now().strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+
+
+def get_job_case_folder(job):
+    settings = job.get("settings", {})
+    output_root = settings.get("output_root", "")
+    resolved_case_name = job.get("resolved_case_name") or settings.get("case_name", "")
+    return os.path.join(output_root, resolved_case_name) if output_root and resolved_case_name else ""
+
+
+def job_queue_window_is_open():
+    try:
+        return job_queue_window is not None and job_queue_window.winfo_exists()
+    except Exception:
+        return False
+
+
+def job_queue_tree_is_available():
+    try:
+        return (
+            job_queue_tree is not None
+            and job_queue_window_is_open()
+            and job_queue_tree.winfo_exists()
+        )
+    except Exception:
+        return False
+
+
+def refresh_job_queue_window():
+    if not job_queue_tree_is_available():
+        update_job_queue_progress()
+        return
+
+    try:
+        selected = job_queue_tree.selection()
+        selected_id = selected[0] if selected else ""
+    except Exception:
+        selected_id = ""
+
+    for item in job_queue_tree.get_children(""):
+        job_queue_tree.delete(item)
+
+    for index, job in enumerate(job_queue, start=1):
+        job_queue_tree.insert(
+            "",
+            "end",
+            iid=job["job_id"],
+            values=(
+                index,
+                job.get("status", "pending"),
+                job.get("resolved_case_name", ""),
+                len(job.get("urls", [])),
+                job.get("output_root", ""),
+                job.get("started", ""),
+                job.get("finished", ""),
+                job.get("exit_code", ""),
+            ),
+        )
+
+    if selected_id and job_queue_tree.exists(selected_id):
+        job_queue_tree.selection_set(selected_id)
+
+    update_job_queue_progress()
+
+
+def update_job_queue_progress():
+    progress_available = False
+    try:
+        progress_available = job_queue_progress_var is not None and job_queue_window_is_open()
+    except Exception:
+        progress_available = False
+
+    total_urls = sum(len(job.get("urls", [])) for job in job_queue)
+    completed_urls = sum(int(job.get("completed_urls", 0) or 0) for job in job_queue)
+
+    if total_urls:
+        value = (completed_urls / total_urls) * 100
+        status_text = f"Queue: {completed_urls}/{total_urls} URL segment(s) complete"
+    else:
+        value = 0
+        status_text = "Queue is empty."
+
+    if progress_available:
+        try:
+            job_queue_progress_var.set(value)
+        except Exception:
+            pass
+
+    if job_queue_status_var and job_queue_window_is_open() and not job_queue_running:
+        try:
+            job_queue_status_var.set(status_text)
+        except Exception:
+            pass
+
+
+def add_current_as_job():
+    try:
+        validate_inputs()
+        urls = get_current_url_lines_for_queue()
+        if not urls:
+            raise ValueError("No URLs are available to add to the queue.")
+
+        now = datetime.now()
+        resolved_case_name = get_resolved_case_name(now=now)
+
+        if not resolved_case_name:
+            raise ValueError("Case Name is blank after resolving the template.")
+
+        settings = get_settings_dict()
+        case_template = settings.get("case_name", "")
+
+        job = {
+            "job_id": make_job_id(),
+            "status": "pending",
+            "case_template": case_template,
+            "resolved_case_name": resolved_case_name,
+            "urls": urls,
+            "settings": settings,
+            "output_root": settings.get("output_root", ""),
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "started": "",
+            "finished": "",
+            "exit_code": "",
+            "completed_urls": 0,
+            "summary": "",
+        }
+
+        job_queue.append(job)
+        refresh_job_queue_window()
+        append_log(f"\nAdded queue job: {resolved_case_name} ({len(urls)} URL(s))\n")
+        return True
+    except Exception as e:
+        messagebox.showerror("Add job failed", str(e))
+        return False
+
+
+def add_current_job_and_open_queue():
+    if not job_queue_window_is_open():
+        open_job_queue()
+
+    add_current_as_job()
+
+
+def get_selected_queue_job():
+    if not job_queue_tree_is_available():
+        return None
+
+    selection = job_queue_tree.selection()
+    if not selection:
+        return None
+
+    job_id = selection[0]
+    for job in job_queue:
+        if job.get("job_id") == job_id:
+            return job
+
+    return None
+
+
+def remove_selected_queue_job():
+    global job_queue
+
+    job = get_selected_queue_job()
+    if not job:
+        messagebox.showinfo("No job selected", "Select a queue job first.")
+        return
+
+    if job.get("job_id") == job_queue_current_job_id and job_queue_running:
+        messagebox.showwarning("Job is running", "The currently running job cannot be removed.")
+        return
+
+    if job.get("status") == "running":
+        messagebox.showwarning("Job is running", "A running job cannot be removed.")
+        return
+
+    job_queue = [item for item in job_queue if item.get("job_id") != job.get("job_id")]
+    refresh_job_queue_window()
+
+
+def clear_completed_queue_jobs():
+    global job_queue
+
+    if job_queue_running:
+        keep_status = {"pending", "running"}
+    else:
+        keep_status = {"pending"}
+
+    job_queue = [job for job in job_queue if job.get("status") in keep_status]
+    refresh_job_queue_window()
+
+
+def clear_all_non_active_queue_jobs():
+    global job_queue
+
+    active_ids = set()
+    if job_queue_current_job_id:
+        active_ids.add(job_queue_current_job_id)
+
+    job_queue = [
+        job for job in job_queue
+        if job.get("status") == "running" or job.get("job_id") in active_ids
+    ]
+
+    refresh_job_queue_window()
+    append_log("\nCleared all non-active queue jobs.\n")
+
+
+def copy_completed_queue_job_summaries():
+    summaries = []
+
+    for index, job in enumerate(job_queue, start=1):
+        if job.get("status") != "completed":
+            continue
+
+        summary = job.get("summary", "").strip()
+        if not summary:
+            continue
+
+        summaries.append(
+            "\n".join([
+                f"========== Queue Job {index}: {job.get('resolved_case_name', '')} ==========",
+                summary,
+            ])
+        )
+
+    if not summaries:
+        messagebox.showinfo("No completed job summaries", "No completed queue job summaries are available.")
+        return
+
+    text = "\n\n".join(summaries).strip() + "\n"
+
+    root.clipboard_clear()
+    root.clipboard_append(text)
+    append_log(f"\nCopied {len(summaries)} completed queue job summary/summaries to clipboard.\n")
+
+
+def open_selected_queue_case():
+    job = get_selected_queue_job()
+    if not job:
+        messagebox.showinfo("No job selected", "Select a queue job first.")
+        return
+
+    case_folder = get_job_case_folder(job)
+    if case_folder and os.path.isdir(case_folder):
+        os.startfile(case_folder)
+    else:
+        messagebox.showwarning("Case folder not found", f"The case folder does not exist yet:\n\n{case_folder}")
+
+
+def pause_queue_after_current():
+    global job_queue_pause_after_current
+
+    if not job_queue_running:
+        messagebox.showinfo("Queue not running", "The queue is not currently running.")
+        return
+
+    job_queue_pause_after_current = True
+    if job_queue_status_var and job_queue_window_is_open():
+        try:
+            job_queue_status_var.set("Queue will pause after the current job.")
+        except Exception:
+            pass
+
+
+def stop_current_queue_job():
+    global job_queue_pause_after_current
+
+    if not job_queue_running:
+        messagebox.showinfo("Queue not running", "The queue is not currently running.")
+        return
+
+    job_queue_pause_after_current = True
+    stop_capture()
+
+    if job_queue_status_var and job_queue_window_is_open():
+        try:
+            job_queue_status_var.set("Stop requested for current queue job.")
+        except Exception:
+            pass
+
+
+def start_job_queue():
+    global job_queue_running, job_queue_pause_after_current
+
+    if running_process is not None and running_process.poll() is None:
+        messagebox.showwarning("Capture already running", "A capture process is already running.")
+        return
+
+    pending = [job for job in job_queue if job.get("status") == "pending"]
+    if not pending:
+        messagebox.showinfo("No pending jobs", "There are no pending queue jobs to run.")
+        return
+
+    if check_vpn_var.get() and last_vpn_status != "connected":
+        proceed = messagebox.askyesno(
+            "VPN not connected",
+            "The VPN does not appear to be connected.\n\n"
+            "Start the queue anyway?",
+        )
+        if not proceed:
+            return
+
+    job_queue_running = True
+    job_queue_pause_after_current = False
+    append_log("\n========== Job Queue ==========\n")
+    append_log(f"Starting queue with {len(pending)} pending job(s).\n")
+    run_next_queue_job()
+
+
+def run_next_queue_job():
+    global job_queue_running, job_queue_current_job_id
+
+    next_job = None
+    for job in job_queue:
+        if job.get("status") == "pending":
+            next_job = job
+            break
+
+    if not next_job:
+        job_queue_running = False
+        job_queue_current_job_id = None
+        refresh_job_queue_window()
+        if job_queue_status_var and job_queue_window_is_open():
+            try:
+                job_queue_status_var.set("Queue complete.")
+            except Exception:
+                pass
+        append_log("\nJob queue complete.\n")
+        set_status("Queue complete")
+        return
+
+    job_queue_current_job_id = next_job["job_id"]
+    run_queue_job(next_job)
+
+
+def mark_queue_job_url_complete(job_id, url_index=None):
+    job = None
+    for item in job_queue:
+        if item.get("job_id") == job_id:
+            job = item
+            break
+
+    if not job:
+        return
+
+    current = int(job.get("completed_urls", 0) or 0)
+    total = len(job.get("urls", []))
+
+    if url_index is not None:
+        try:
+            current = max(current, int(url_index))
+        except Exception:
+            current += 1
+    else:
+        current += 1
+
+    if total:
+        current = min(current, total)
+
+    job["completed_urls"] = current
+    update_job_queue_progress()
+
+    if job_queue_status_var:
+        total_urls = sum(len(queue_job.get("urls", [])) for queue_job in job_queue)
+        completed_urls = sum(int(queue_job.get("completed_urls", 0) or 0) for queue_job in job_queue)
+        job_queue_status_var.set(f"Queue running: {completed_urls}/{total_urls} URL segment(s) complete")
+
+
+def handle_queue_output_line(job_id, line):
+    if line.startswith("GUI_QUEUE_URL_COMPLETE\t"):
+        parts = line.strip().split("\t", 3)
+        url_index = None
+        if len(parts) >= 2:
+            try:
+                url_index = int(parts[1])
+            except Exception:
+                url_index = None
+        mark_queue_job_url_complete(job_id, url_index=url_index)
+
+
+def run_queue_job(job):
+    global running_process, last_capture_context
+
+    try:
+        validate_queue_job_inputs(job)
+
+        job_case_folder = get_job_case_folder(job)
+        if case_folder_is_populated(job_case_folder):
+            proceed = messagebox.askyesno(
+                "Existing populated case folder",
+                "The resolved queue job case folder already exists and contains files or folders:\n\n"
+                f"{job_case_folder}\n\n"
+                "Starting this queue job may add files to the existing case and reuse its archive/history.\n\n"
+                "Continue?",
+            )
+
+            if not proceed:
+                job["status"] = "cancelled"
+                job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                job["exit_code"] = "cancelled"
+                refresh_job_queue_window()
+                root.after(0, run_next_queue_job)
+                return
+
+        cmd = build_powershell_command_for_job(job)
+        submitted_url_count = len(job.get("urls", []))
+        tool_versions = query_capture_tool_versions_for_job(job.get("settings", {}))
+
+        last_capture_context = {
+            "tool_versions": tool_versions,
+            "submitted_url_count": submitted_url_count,
+            "settings": job.get("settings", {}),
+            "paths": get_expected_run_paths_for_values(
+                job.get("settings", {}).get("output_root", ""),
+                job.get("resolved_case_name", ""),
+            ),
+        }
+
+        job["status"] = "running"
+        job["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job["finished"] = ""
+        job["exit_code"] = ""
+        job["completed_urls"] = 0
+
+        refresh_job_queue_window()
+        if job_queue_status_var and job_queue_window_is_open():
+            try:
+                job_queue_status_var.set(f"Running queue job: {job.get('resolved_case_name', '')}")
+            except Exception:
+                pass
+
+        append_log("\n========== Queue Job Started ==========\n")
+        append_log(f"Job ID: {job['job_id']}\n")
+        append_log(f"Case: {job.get('resolved_case_name', '')}\n")
+        append_log(f"URLs: {submitted_url_count}\n\n")
+        log_capture_tool_versions(tool_versions)
+        append_log("Command:\n")
+        append_log(" ".join(f'"{part}"' if " " in part else part for part in cmd))
+        append_log("\n\n")
+
+        start_button.config(state="disabled")
+        stop_button.config(state="normal")
+        copy_summary_button.config(state="disabled")
+        set_status(f"Queue running: {job.get('resolved_case_name', '')}")
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job["exit_code"] = "setup error"
+        append_log(f"\nQueue job setup failed: {e}\n")
+        refresh_job_queue_window()
+        root.after(0, run_next_queue_job)
+        return
+
+    def worker():
+        global running_process
+
+        exit_code = 1
+
+        try:
+            running_process = subprocess.Popen(
+                cmd,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            if running_process.stdout:
+                for line in running_process.stdout:
+                    root.after(0, append_log, line)
+                    if line.startswith("GUI_QUEUE_URL_COMPLETE\t"):
+                        root.after(0, handle_queue_output_line, job["job_id"], line)
+
+            exit_code = running_process.wait()
+
+        except Exception as e:
+            root.after(0, append_log, f"\nERROR: {e}\n")
+            exit_code = 1
+
+        root.after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def finish_queue_job(job_id, exit_code, submitted_url_count):
+    global job_queue_running, job_queue_current_job_id
+
+    job = None
+    for item in job_queue:
+        if item.get("job_id") == job_id:
+            job = item
+            break
+
+    if not job:
+        return
+
+    job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job["exit_code"] = exit_code
+
+    if exit_code == 0:
+        job["status"] = "completed"
+        append_log(f"\nQueue job completed successfully: {job.get('resolved_case_name', '')}\n")
+        set_status("Queue job completed")
+    else:
+        job["status"] = "failed"
+        append_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
+        set_status(f"Queue job failed: {exit_code}")
+
+    show_run_summary(exit_code, submitted_url_count)
+
+    if job.get("status") == "completed":
+        job["summary"] = last_successful_case_summary
+    else:
+        job["summary"] = ""
+
+    refresh_job_queue_window()
+
+    start_button.config(state="normal")
+    start_menu_button.config(state="normal")
+    stop_button.config(state="disabled")
+
+    if job_queue_pause_after_current:
+        job_queue_running = False
+        job_queue_current_job_id = None
+        if job_queue_status_var and job_queue_window_is_open():
+            try:
+                job_queue_status_var.set("Queue paused after current job.")
+            except Exception:
+                pass
+        append_log("\nJob queue paused after current job.\n")
+        return
+
+    root.after(250, run_next_queue_job)
+
+
+def open_job_queue():
+    global job_queue_window, job_queue_tree, job_queue_progress_var, job_queue_status_var
+
+    if job_queue_window_is_open():
+        job_queue_window.lift()
+        return
+
+    job_queue_window = tk.Toplevel(root)
+    job_queue_window.title("Job Queue")
+    job_queue_window.geometry("1100x520")
+    job_queue_window.minsize(900, 420)
+    top_bar = ttk.Frame(job_queue_window, padding=8)
+    top_bar.pack(fill="x")
+
+    ttk.Button(top_bar, text="Add Current as Job", command=add_current_as_job).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Start Queue", command=start_job_queue).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Pause After Current", command=pause_queue_after_current).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Stop Current", command=stop_current_queue_job).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Remove Selected", command=remove_selected_queue_job).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Clear Completed", command=clear_completed_queue_jobs).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Clear All", command=clear_all_non_active_queue_jobs).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Copy Jobs Summary", command=copy_completed_queue_job_summaries).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Open Case", command=open_selected_queue_case).pack(side="left", padx=(0, 6))
+
+    table_frame = ttk.Frame(job_queue_window, padding=(8, 0, 8, 8))
+    table_frame.pack(fill="both", expand=True)
+    table_frame.columnconfigure(0, weight=1)
+    table_frame.rowconfigure(0, weight=1)
+
+    columns = ("#", "status", "case", "urls", "output_root", "started", "finished", "exit")
+    job_queue_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+    job_queue_tree.grid(row=0, column=0, sticky="nsew")
+
+    headings = {
+        "#": "#",
+        "status": "Status",
+        "case": "Case",
+        "urls": "URLs",
+        "output_root": "Output Root",
+        "started": "Started",
+        "finished": "Finished",
+        "exit": "Exit",
+    }
+
+    widths = {
+        "#": 45,
+        "status": 110,
+        "case": 210,
+        "urls": 60,
+        "output_root": 300,
+        "started": 145,
+        "finished": 145,
+        "exit": 75,
+    }
+
+    for column in columns:
+        job_queue_tree.heading(column, text=headings[column])
+        job_queue_tree.column(column, width=widths[column], anchor="w", stretch=True)
+
+    table_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=job_queue_tree.yview)
+    table_scroll_y.grid(row=0, column=1, sticky="ns")
+    job_queue_tree.configure(yscrollcommand=table_scroll_y.set)
+
+    bottom = ttk.Frame(job_queue_window, padding=(8, 0, 8, 8))
+    bottom.pack(fill="x")
+
+    job_queue_progress_var = tk.DoubleVar(value=0)
+    progress = ttk.Progressbar(bottom, variable=job_queue_progress_var, maximum=100, mode="determinate")
+    progress.pack(fill="x", side="top", pady=(0, 6))
+
+    job_queue_status_var = tk.StringVar(value="Queue is empty.")
+    ttk.Label(bottom, textvariable=job_queue_status_var).pack(fill="x", side="top")
+
+    def on_queue_close():
+        global job_queue_window, job_queue_tree, job_queue_progress_var, job_queue_status_var
+
+        try:
+            job_queue_window.destroy()
+        except Exception:
+            pass
+
+        job_queue_window = None
+        job_queue_tree = None
+        job_queue_progress_var = None
+        job_queue_status_var = None
+
+    job_queue_window.protocol("WM_DELETE_WINDOW", on_queue_close)
+    apply_app_theme()
+    refresh_job_queue_window()
+
 
 def stop_capture():
     global running_process
@@ -5315,6 +6273,15 @@ def open_case_browser():
 def on_close():
     global temp_url_file
 
+    if job_queue_running:
+        if not messagebox.askyesno(
+            "Job queue running",
+            "The job queue is still running. Stop the current job and exit?",
+        ):
+            return
+
+        stop_capture()
+
     try:
         save_settings(show_popup=False)
     except Exception:
@@ -5500,6 +6467,7 @@ cookies_menu.add_command(label="Decrypt Cookies from Storage", command=decrypt_c
 tools_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Tools", menu=tools_menu)
 tools_menu.add_command(label="Open Case Browser", command=open_case_browser)
+tools_menu.add_command(label="Open Job Queue", command=open_job_queue)
 tools_menu.add_separator()
 tools_menu.add_command(label="Check Impersonate Targets", command=check_impersonate_targets)
 tools_menu.add_separator()
@@ -5780,6 +6748,19 @@ for index, (label, command) in enumerate((
         width=8,
     ).grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 6, 0))
 
+def show_start_capture_menu():
+    try:
+        start_capture_menu.tk_popup(
+            start_menu_button.winfo_rootx(),
+            start_menu_button.winfo_rooty() + start_menu_button.winfo_height(),
+        )
+    finally:
+        try:
+            start_capture_menu.grab_release()
+        except Exception:
+            pass
+
+
 workflow_frame = ttk.Frame(main)
 workflow_frame.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(8, 12))
 workflow_frame.columnconfigure(0, weight=1)
@@ -5814,14 +6795,35 @@ preflight_check_box = ttk.Checkbutton(
 )
 preflight_check_box.grid(row=0, column=1, sticky="w", padx=(0, 8))
 
+start_capture_split_frame = tk.Frame(workflow_frame, borderwidth=0, highlightthickness=0)
+start_capture_split_frame.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+start_capture_split_frame.columnconfigure(0, weight=1)
+start_capture_split_frame.columnconfigure(1, weight=0)
+
 start_button = tk.Button(
-    workflow_frame,
+    start_capture_split_frame,
     text="▶ Start Capture",
     command=start_capture,
     fg="green",
     **main_action_button_style,
 )
-start_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+start_button.grid(row=0, column=0, sticky="ew")
+
+start_menu_button = tk.Button(
+    start_capture_split_frame,
+    text="▼",
+    command=show_start_capture_menu,
+    fg="green",
+    font=("Segoe UI", 9, "bold"),
+    padx=6,
+    pady=5,
+    relief="raised",
+    borderwidth=2,
+)
+start_menu_button.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+
+start_capture_menu = tk.Menu(root, tearoff=0)
+start_capture_menu.add_command(label="Add Job to Queue", command=add_current_job_and_open_queue)
 
 stop_button = tk.Button(
     workflow_frame,

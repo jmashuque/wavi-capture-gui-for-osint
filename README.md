@@ -48,6 +48,7 @@ The app provides a guided interface for:
 - verifying case files against the latest SHA256 manifest
 - copying a successful case summary with relevant tool and script version information
 - saving settings and reusable profiles
+- using a sequential job queue to run snapshotted capture jobs one after another
 
 The goal is to reduce mistakes, make captures more repeatable, and keep the workflow understandable for users who are not comfortable building commands manually.
 
@@ -114,14 +115,15 @@ For FFmpeg, use the Gyan.dev **release essentials** build unless you specificall
    - If `python` is not available from that terminal, try `py gui.py`.
 3. Confirm the paths for the PowerShell script, yt-dlp, optional cookies file, Output Root, and FFmpeg folder.
 4. Set the Output Root to a local non-synced folder so captures, logs, manifests, and GUI cache files are not actively synchronized while captures are running.
-5. Enter a case name or template. The default is `Case-%date%`; use **Insert Tag** for tags such as `%date%`, `%time%`, `%datetime%`, `%year%`, `%month%`, `%day%`, `%hour%`, `%minute%`, and `%second%`.
-6. Paste URLs into the URL box or select an input file. The URL box takes priority if both are used.
+5. Enter a case name or template. The default is `Case-%datetime%`; use **Insert Tag** for tags such as `%date%`, `%time%`, `%datetime%`, `%year%`, `%month%`, `%day%`, `%hour%`, `%minute%`, and `%second%`.
+6. Paste URLs into the URL box or select an input file. The URL box takes priority if both are used. The URL box Save button opens a file selection dialog and does not silently overwrite the current Input File path.
 7. Select the VPN/network adapter used for the capture, if applicable.
 8. Press **Check VPN** to verify that the selected VPN/network adapter is connected, if VPN checking is enabled.
 9. Run **Preflight Check** to confirm required files exist and determine whether the existing yt-dlp, FFmpeg, FFprobe, and Deno binaries are allowed to execute.
 10. Start the capture with **Start Capture**.
 11. Review the output log.
 12. Open the case folder using **Open**, or use **Tools > Open Case Browser** to review case folders, thumbnails, media details, sidecar files, summaries, and manifest verification.
+13. To stage multiple captures, use **Tools > Open Job Queue**, then add the current GUI configuration as a job and run the queue sequentially. The Start Capture split-menu also includes **Add Job to Queue**, which adds the current configuration and opens the queue window.
 
 Case name templates are resolved when capture starts. The resolved case folder is previewed below the Case Name field, and the app warns before using an existing populated folder.
 
@@ -155,7 +157,7 @@ The preflight check confirms common prerequisites, including whether yt-dlp, FFm
 
 The VPN check only confirms whether the selected adapter is up. It does not prove that traffic is routed through the VPN.
 
-The Case Browser uses FFmpeg for thumbnails and FFprobe for cached media details. If either tool is unavailable, fallback placeholders or unavailable media details are shown. Case file verification runs only for a selected case folder or one of its subfolders; the Output Root itself cannot be verified. The GUI cache and manifests folders are excluded from SHA256 verification scope: `.gui-cache` contains regenerated display/cache data, and `manifests` contains verification records rather than captured evidence.
+The Case Browser uses FFmpeg for thumbnails and FFprobe for cached media details. If either tool is unavailable, fallback placeholders or unavailable media details are shown. Case file verification runs only for a selected case folder or one of its subfolders; the Output Root itself cannot be verified. The GUI cache and manifests folders are excluded from SHA256 verification scope: `.gui-cache` contains regenerated display/cache data, and `manifests` contains verification records rather than captured evidence. Case summaries count manifest files even though manifests remain outside verification scope.
 
 The update checker only queries GitHub for the latest app release and opens the release page for manual download. It does not download, extract, replace, or run files.
 
@@ -163,9 +165,20 @@ The optional **Strip** button in the URL box controls decodes common HTML ampers
 
 Download speed limiting is disabled by default. When enabled in Advanced Options, the app passes yt-dlp's `--limit-rate` option with the selected preset or a custom value such as `750K`, `20M`, or `1.5M`.
 
+The Job Queue is sequential. It snapshots the current GUI configuration and URL list when a job is added, then runs queued jobs one at a time. Queued jobs run from their saved job object without rewriting the visible Case Name field. Its progress bar is divided by total queued URLs, so each URL becomes one segment. A segment completes after the script reports that the URL capture finished successfully and GUI thumbnail/media information processing completed. Clear All removes all non-active queue jobs. Copy Jobs Summary copies summaries for all completed jobs in the order they appear in the queue. The Job Queue window can be closed and reopened without clearing queued jobs.
+
 The app is only a workflow wrapper. It does not make authorization, policy, or legal decisions.
 
 ## Changelog
+
+### v0.2026.0611 - Job Queue and Summary Refinements
+
+- Added a sequential Job Queue window with queued job controls, URL-based progress, completed-job summary copying, and non-active job clearing.
+- Added a Start Capture split-menu action to add the current configuration to the queue.
+- Changed queued jobs to run from snapshotted job settings without rewriting the visible main GUI fields.
+- Changed the default case name template to `Case-%datetime%`.
+- Updated URL box saving to always prompt with a Save As dialog.
+- Refined case summaries and verification so manifest files are counted in summaries while `.gui-cache` and `manifests` remain outside verification scope.
 
 ### v0.2026.0529 - URL Controls, Cookie Scope, Download Limits, and Verification Scope
 

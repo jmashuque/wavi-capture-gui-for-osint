@@ -190,12 +190,14 @@ function New-VideoThumbnailsForRecentCaptures {
     if ([string]::IsNullOrWhiteSpace($FFmpegExe) -or -not (Test-Path -LiteralPath $FFmpegExe -PathType Leaf)) {
         Write-Warning "FFmpeg was not found. Skipping GUI thumbnail generation."
         Add-Content -Path $RunLog -Value "FFmpeg was not found. Skipping GUI thumbnail generation."
-        return
+        return $false
     }
 
     if (-not (Test-Path -LiteralPath $MediaRoot -PathType Container)) {
-        return
+        return $true
     }
+
+    $allOk = $true
 
     New-Item -ItemType Directory -Path $ThumbnailRoot -Force | Out-Null
 
@@ -239,6 +241,7 @@ function New-VideoThumbnailsForRecentCaptures {
                 }
 
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $thumbPath -PathType Leaf)) {
+                $allOk = $false
                 $msg = "FFmpeg could not generate thumbnail for: $($file.FullName)"
                 Write-Warning $msg
                 Add-Content -Path $RunLog -Value $msg
@@ -248,11 +251,14 @@ function New-VideoThumbnailsForRecentCaptures {
             }
         }
         catch {
+            $allOk = $false
             $msg = "Thumbnail generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
             Add-Content -Path $RunLog -Value $msg
         }
     }
+
+    return $allOk
 }
 
 
@@ -298,12 +304,14 @@ function New-MediaInfoForRecentCaptures {
     if ([string]::IsNullOrWhiteSpace($FFprobeExe) -or -not (Test-Path -LiteralPath $FFprobeExe -PathType Leaf)) {
         Write-Warning "FFprobe was not found. Skipping GUI media information generation."
         Add-Content -Path $RunLog -Value "FFprobe was not found. Skipping GUI media information generation."
-        return
+        return $false
     }
 
     if (-not (Test-Path -LiteralPath $MediaRoot -PathType Container)) {
-        return
+        return $true
     }
+
+    $allOk = $true
 
     New-Item -ItemType Directory -Path $MetadataRoot -Force | Out-Null
 
@@ -340,17 +348,21 @@ function New-MediaInfoForRecentCaptures {
                 Set-Content -LiteralPath $metadataPath -Value $json -Encoding UTF8
             }
             else {
+                $allOk = $false
                 $msg = "FFprobe could not generate media info for: $($file.FullName)"
                 Write-Warning $msg
                 Add-Content -Path $RunLog -Value $msg
             }
         }
         catch {
+            $allOk = $false
             $msg = "Media info generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
             Add-Content -Path $RunLog -Value $msg
         }
     }
+
+    return $allOk
 }
 
 function Normalize-YtDlpDate {
@@ -736,8 +748,15 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
         $ErrorActionPreference = $PreviousErrorActionPreference
     }
 
-    New-VideoThumbnailsForRecentCaptures -MediaRoot $MediaDir -ThumbnailRoot $GuiThumbnailDir -Since $CaptureStartTime -FFmpegExe $FFmpegForThumbnails
-    New-MediaInfoForRecentCaptures -MediaRoot $MediaDir -MetadataRoot $GuiMetadataDir -Since $CaptureStartTime -FFprobeExe $FFprobeForMediaInfo
+    $ThumbnailGenerationOk = New-VideoThumbnailsForRecentCaptures -MediaRoot $MediaDir -ThumbnailRoot $GuiThumbnailDir -Since $CaptureStartTime -FFmpegExe $FFmpegForThumbnails
+    $MediaInfoGenerationOk = New-MediaInfoForRecentCaptures -MediaRoot $MediaDir -MetadataRoot $GuiMetadataDir -Since $CaptureStartTime -FFprobeExe $FFprobeForMediaInfo
+
+    if ($YtDlpExitCode -eq 0 -and $ThumbnailGenerationOk -and $MediaInfoGenerationOk) {
+        Write-Host ("GUI_QUEUE_URL_COMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
+    }
+    else {
+        Write-Host ("GUI_QUEUE_URL_INCOMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
+    }
 
     if ($YtDlpExitCode -ne 0) {
         $msg = "yt-dlp exited with code $YtDlpExitCode for URL: $Url"

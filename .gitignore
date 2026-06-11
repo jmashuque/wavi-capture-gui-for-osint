@@ -1,8 +1,8 @@
-urls.txt
-yt-dlp.exe
-ffprobe.exe
-ffmpeg.exe
-deno.exe
-cookies.txt
-gui-settings.json
-Investigations/
+*
+
+!gui.py
+!script.ps1
+!README.md
+!LICENSE
+!.gitignore
+!screenshots/main.png
