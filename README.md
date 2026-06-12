@@ -2,19 +2,17 @@
 
 A lightweight, portable Windows GUI for running an approved yt-dlp capture workflow in an organizational environment.
 
-<p align="center">
-  <img src="/screenshots/main.png" alt="yt-dlp GUI for OSINT screenshot" width="750">
-</p>
-
 ## Table of Contents
 
 - [Overview](#overview)
+- [Screenshots](#screenshots)
 - [Intended Users](#intended-users)
 - [What the App Does](#what-the-app-does)
 - [What the App Does Not Do](#what-the-app-does-not-do)
 - [Organizational Compatibility](#organizational-compatibility)
 - [Required Components](#required-components)
 - [Basic Usage](#basic-usage)
+- [Advanced Usage](#advanced-usage)
 - [Profiles and Settings](#profiles-and-settings)
 - [Cookies Handling](#cookies-handling)
 - [Limitations](#limitations)
@@ -25,6 +23,20 @@ A lightweight, portable Windows GUI for running an approved yt-dlp capture workf
 `yt-dlp GUI for OSINT` is a portable Windows interface I created to make yt-dlp capture workflows easier, more consistent, and more approachable for OSINT users working inside managed organizations.
 
 The app is intentionally narrow in scope. It wraps an approved local PowerShell and yt-dlp workflow, adds case organization and review helpers, and avoids acting as a downloader, installer, scraper, browser automation tool, or evidence analysis suite.
+
+## Screenshots
+
+<p align="center">
+  <img src="/screenshots/main1.png" alt="yt-dlp GUI for OSINT main screenshot" width="750">
+</p>
+
+<p align="center">
+  <img src="/screenshots/main2.png" alt="yt-dlp GUI for OSINT advanced options screenshot" width="750">
+</p>
+
+<p align="center">
+  <img src="/screenshots/main3.png" alt="yt-dlp GUI for OSINT job queue screenshot" width="750">
+</p>
 
 ## Intended Users
 
@@ -37,18 +49,20 @@ It assumes the user is working under their organization's policies and has autho
 The app provides a guided interface for:
 
 - selecting required local tools and paths, including `script.ps1`, `yt-dlp.exe`, optional cookies, FFmpeg, and the Output Root
-- entering or templating case names with tags such as `%date%` and `%time%`
-- pasting URLs directly, using an input URL file, and optionally stripping parameter-like ampersand tags from pasted URLs
+- entering or templating case names with tags such as `%date%`, `%time%`, `%datetime%`, and `%utcdatetime%`
+- pasting URLs directly, loading URLs from a file, appending URLs from a file, saving URL box contents, and cleaning pasted URL lists
+- validating URL lists, removing duplicates, grouping URLs by domain, viewing URL statistics, and toggling failed/all URL views
 - selecting VPN/network adapter checks when required
 - running preflight checks before capture
-- choosing capture behavior such as source scope, archive mode, date filters, max resolution, sidecar artifacts, title keyword filters, failure handling, request pacing, and optional download speed limiting
+- choosing capture behavior such as source scope, archive mode, date filters, max resolution, sidecar artifacts, title keyword filters, failure handling, request pacing, concurrent captures, concurrent fragments, and optional download speed limiting
 - using supported browser impersonation targets, with an option to view all targets returned by yt-dlp
 - opening, browsing, sorting, filtering, and reviewing case folders through the Case Browser
 - generating GUI thumbnails and cached media details when FFmpeg and FFprobe are available
 - verifying case files against the latest SHA256 manifest
-- copying a successful case summary with relevant tool and script version information
+- tracking failed and captured URLs across runs
+- copying successful case summaries and completed queue job summaries
 - saving settings and reusable profiles
-- using a sequential job queue to run snapshotted capture jobs one after another
+- using the Job Queue to run snapshotted capture jobs with optional concurrency and domain-collision checks
 
 The goal is to reduce mistakes, make captures more repeatable, and keep the workflow understandable for users who are not comfortable building commands manually.
 
@@ -114,18 +128,134 @@ For FFmpeg, use the Gyan.dev **release essentials** build unless you specificall
    - Otherwise, open the app folder in File Explorer, click the address bar, type `cmd`, press Enter, then run `python gui.py`.
    - If `python` is not available from that terminal, try `py gui.py`.
 3. Confirm the paths for the PowerShell script, yt-dlp, optional cookies file, Output Root, and FFmpeg folder.
-4. Set the Output Root to a local non-synced folder so captures, logs, manifests, and GUI cache files are not actively synchronized while captures are running.
-5. Enter a case name or template. The default is `Case-%datetime%`; use **Insert Tag** for tags such as `%date%`, `%time%`, `%datetime%`, `%year%`, `%month%`, `%day%`, `%hour%`, `%minute%`, and `%second%`.
-6. Paste URLs into the URL box or select an input file. The URL box takes priority if both are used. The URL box Save button opens a file selection dialog and does not silently overwrite the current Input File path.
-7. Select the VPN/network adapter used for the capture, if applicable.
-8. Press **Check VPN** to verify that the selected VPN/network adapter is connected, if VPN checking is enabled.
-9. Run **Preflight Check** to confirm required files exist and determine whether the existing yt-dlp, FFmpeg, FFprobe, and Deno binaries are allowed to execute.
-10. Start the capture with **Start Capture**.
-11. Review the output log.
-12. Open the case folder using **Open**, or use **Tools > Open Case Browser** to review case folders, thumbnails, media details, sidecar files, summaries, and manifest verification.
-13. To stage multiple captures, use **Tools > Open Job Queue**, then add the current GUI configuration as a job and run the queue sequentially. The Start Capture split-menu also includes **Add Job to Queue**, which adds the current configuration and opens the queue window.
+4. Set the Output Root to a local non-synced folder so captures, logs, manifests, GUI cache files, failed URL records, and captured URL records are not actively synchronized while captures are running.
+5. Enter a case name or template. The default is `Case-%datetime%`; use **Insert Tag** for tags such as `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%year%`, `%month%`, `%day%`, `%hour%`, `%minute%`, and `%second%`.
+6. Paste URLs into the URL box or select an input file. The URL box takes priority if both are used.
+7. Use **Load** to replace the URL box contents with the input file, or **Append** to add the input file contents to the existing URL box.
+8. Select the VPN/network adapter used for the capture, if applicable.
+9. Press **Check VPN** to verify that the selected VPN/network adapter is connected, if VPN checking is enabled.
+10. Run **Preflight Check** to confirm required files exist and determine whether the existing yt-dlp, FFmpeg, FFprobe, and Deno binaries are allowed to execute.
+11. Start the capture with **Start Capture**.
+12. Review the output log.
+13. Open the case folder using **Open**, or use **Tools > Open Case Browser** to review case folders, thumbnails, media details, sidecar files, summaries, and manifest verification.
+14. To stage multiple captures, use **Tools > Open Job Queue**, or use the **Start Capture** split-menu to add the current capture to the queue.
 
-Case name templates are resolved when capture starts. The resolved case folder is previewed below the Case Name field, and the app warns before using an existing populated folder.
+Case name templates are resolved when capture starts or when a job is added to the queue. The resolved case folder is previewed below the Case Name field, and the app warns before using an existing populated folder.
+
+## Advanced Usage
+
+### Case Name Templates
+
+Case names support reusable tags. The default case name is `Case-%datetime%`.
+
+Useful tags include:
+
+- `%date%` for the local date, such as `2026-06-11`
+- `%time%` for the local time as six digits, such as `143005`
+- `%datetime%` for local date and time, such as `2026-06-11_143005`
+- `%utcdatetime%` for UTC date and time ending in `Z`, such as `20260611_183005Z`
+
+### URL Box Tools
+
+The URL box includes two columns of quick actions.
+
+The first column provides:
+
+- **Load** to replace the URL box contents with the selected Input File
+- **Append** to append the selected Input File contents to the URL box
+- **Save** to save the URL box contents using a file selection dialog
+- **Clear** to empty the URL box
+- **Strip** to decode common HTML ampersands such as `&amp;` and remove trailing parameter-like segments that match `&name=`
+
+The second column provides:
+
+- **Failed** / **All** to toggle between failed URLs and the original URL list
+- **Group** to group URLs by detected domain
+- **Statistics** to show total URLs, unique URLs, domain count, and totals by domain
+- **Duplicates** to remove duplicate URLs
+- **Validate** to extract URLs from messy pasted text, remove blank/comment lines, check URL shape, warn about duplicate URLs, and warn about URLs previously captured under the current Output Root
+
+Validation does not remove duplicates; use **Duplicates** when duplicate removal is desired.
+
+### Failed and Captured URL Tracking
+
+The capture script writes URL tracking files under the Output Root:
+
+- `gui-failed-urls.txt`
+- `gui-captured-urls.txt`
+
+Failed URL records include the case name, URL, UTC timestamp, status, and failure detail. Captured URL records allow the URL validator to warn when a URL appears to have been captured in a previous run.
+
+The **Add Failed to Queue** Start Capture menu option adds only failed URLs from the current URL context.
+
+### Capture Options and Advanced Options
+
+Capture and Advanced Options allow the user to control:
+
+- media capture versus metadata/artifacts-only capture
+- single-item capture versus playlist/multi-item capture
+- archive mode
+- date filters
+- max resolution
+- playlist metadata
+- Windows URL shortcuts
+- title match and reject keyword filters
+- failure handling
+- request pacing, including None, Fast, Normal, and Cautious presets
+- optional download speed limiting through yt-dlp `--limit-rate`
+- concurrent capture count from 1 to 4
+- concurrent fragment workers per URL
+- partial-file retention
+- sidecar artifacts such as metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments
+
+Request Rate Limit includes None, Fast, Normal, and Cautious presets. None uses a 0-second baseline with jitter up to 5 seconds between URLs and does not pass a yt-dlp request sleep value. Fast, Normal, and Cautious add progressively longer URL pacing.
+
+Download speed limiting is disabled by default. When enabled, the app passes yt-dlp's `--limit-rate` option with the selected preset or a custom value such as `750K`, `20M`, or `1.5M`.
+
+Concurrent Fragments controls yt-dlp's per-URL fragment worker count. Values above 1 may speed up some fragmented media downloads, but they can also increase rate-limit or connection pressure and may interact poorly with download speed limits. Leave this at 1 unless there is a specific reason to raise it.
+
+### Job Queue
+
+The Job Queue snapshots the current GUI configuration and URL list when a job is added, then runs jobs through the queue. By default, it runs one job at a time. When **Concurrent Captures** is set above 1 in Advanced Options, the queue can run multiple non-colliding jobs at once.
+
+The queue includes controls to add jobs, start the queue, pause after the current active work, stop active jobs, remove selected jobs, clear completed jobs, clear non-active jobs, open a case, and copy summaries for completed jobs.
+
+The queue table supports horizontal scrolling so longer case names, domains, and Output Root paths can be reviewed without shrinking columns.
+
+The Start Capture split-menu includes:
+
+- **Add Job to Queue**
+- **Add Job to Queue and Start**
+- **Add Jobs to Queue by Domain**
+- **Add Failed to Queue**
+
+When concurrency is enabled, the queue checks queued and running jobs for matching URL domains and can warn before same-domain jobs run concurrently. The user can continue, queue after colliding jobs finish, or cancel the action.
+
+Queued jobs run from their saved job object without rewriting the visible Case Name field. The progress bar is divided by total queued URLs, so each URL becomes one segment. A segment completes after the script reports that the URL capture finished successfully and GUI thumbnail/media information processing completed.
+
+If the queue is active or contains pending/running jobs, pressing **Start Capture** adds the current capture to the queue instead of starting a separate direct capture. If the scheduler has available capacity and the domain rules allow it, the new job can start immediately.
+
+### Case Browser and Verification
+
+The Case Browser can open, browse, sort, filter, and review case folders from the selected Output Root. It supports:
+
+- media and sidecar file cards
+- folder tree navigation
+- current-folder-only view
+- icon scale options
+- horizontal scrolling
+- right-click actions for file cards
+- FFmpeg-generated thumbnails stored in `.gui-cache\thumbnails`
+- FFprobe-generated media details stored in `.gui-cache\metadata`
+- SHA256 manifest verification
+
+Case file verification runs only for a selected case folder or one of its subfolders. The Output Root itself cannot be verified. The GUI cache and manifests folders are excluded from SHA256 verification scope: `.gui-cache` contains regenerated display/cache data, and `manifests` contains verification records rather than captured evidence. Case summaries count manifest files even though manifests remain outside verification scope.
+
+### App Update Checks
+
+The update checker queries GitHub for the latest app release and opens the release page for manual download. It does not download, extract, replace, or run files.
+
+yt-dlp updates are separate from normal capture runs and are controlled from the app's yt-dlp update workflow.
 
 ## Profiles and Settings
 
@@ -157,19 +287,19 @@ The preflight check confirms common prerequisites, including whether yt-dlp, FFm
 
 The VPN check only confirms whether the selected adapter is up. It does not prove that traffic is routed through the VPN.
 
-The Case Browser uses FFmpeg for thumbnails and FFprobe for cached media details. If either tool is unavailable, fallback placeholders or unavailable media details are shown. Case file verification runs only for a selected case folder or one of its subfolders; the Output Root itself cannot be verified. The GUI cache and manifests folders are excluded from SHA256 verification scope: `.gui-cache` contains regenerated display/cache data, and `manifests` contains verification records rather than captured evidence. Case summaries count manifest files even though manifests remain outside verification scope.
-
-The update checker only queries GitHub for the latest app release and opens the release page for manual download. It does not download, extract, replace, or run files.
-
-The optional **Strip** button in the URL box controls decodes common HTML ampersands such as `&amp;` and removes trailing parameter-like segments that match `&name=`.
-
-Download speed limiting is disabled by default. When enabled in Advanced Options, the app passes yt-dlp's `--limit-rate` option with the selected preset or a custom value such as `750K`, `20M`, or `1.5M`.
-
-The Job Queue is sequential. It snapshots the current GUI configuration and URL list when a job is added, then runs queued jobs one at a time. Queued jobs run from their saved job object without rewriting the visible Case Name field. Its progress bar is divided by total queued URLs, so each URL becomes one segment. A segment completes after the script reports that the URL capture finished successfully and GUI thumbnail/media information processing completed. Clear All removes all non-active queue jobs. Copy Jobs Summary copies summaries for all completed jobs in the order they appear in the queue. The Job Queue window can be closed and reopened without clearing queued jobs.
+The Case Browser depends on FFmpeg for thumbnails and FFprobe for cached media details. If either tool is unavailable, fallback placeholders or unavailable media details are shown.
 
 The app is only a workflow wrapper. It does not make authorization, policy, or legal decisions.
 
 ## Changelog
+
+### v0.2026.0612 - Queue, URL Workflow, and Advanced Controls
+
+- Added concurrent queue execution with domain-collision checks and queue-aware Start Capture behavior.
+- Added failed/captured URL tracking, URL validation/statistics/grouping tools, and failed URL queueing.
+- Added concurrent fragments, expanded request pacing options, and refined Advanced Options layout.
+- Added Load versus Append URL behavior, duplicate removal, queue horizontal scrolling, and updated case name time tags.
+- Reorganized README usage sections and expanded screenshot references.
 
 ### v0.2026.0611 - Job Queue and Summary Refinements
 

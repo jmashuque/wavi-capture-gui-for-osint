@@ -16,15 +16,23 @@ from urllib.parse import urlsplit, urlunsplit
 import webbrowser
 import threading
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
-APP_VERSION = "v0.2026.0611"
+APP_VERSION = "v0.2026.0612"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
+APP_WINDOW_WIDTH = 1180
+APP_WINDOW_HEIGHT_BASE = 900
+APP_WINDOW_HEIGHT_WITH_VPN = 960
+APP_WINDOW_MIN_WIDTH = 1050
+APP_WINDOW_MIN_HEIGHT_BASE = 780
+APP_WINDOW_MIN_HEIGHT_WITH_VPN = 840
+URL_ROW_MIN_HEIGHT = 170
+
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/ytdlp-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 9
+SETTINGS_SCHEMA_VERSION = 11
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +70,8 @@ DEFAULTS = {
     "date_before_day": "",
     "rate_limit": "normal",
     "download_speed_limit": "disabled",
+    "concurrent_captures": "1",
+    "concurrent_fragments": "1",
     "keep_partials": False,
     "write_info_json": True,
     "write_source_link": True,
@@ -111,6 +121,9 @@ job_queue_status_var = None
 job_queue_running = False
 job_queue_pause_after_current = False
 job_queue_current_job_id = None
+job_queue_running_processes = {}
+url_view_mode = "all"
+url_all_view_cache = []
 
 
 def browse_file(var, title="Select file"):
@@ -627,11 +640,13 @@ def safe_case_name(name):
 
 def get_case_template_values(now=None):
     now = now or datetime.now()
+    utc_now = now.astimezone(timezone.utc) if getattr(now, "tzinfo", None) else datetime.now(timezone.utc)
 
     return {
         "%date%": now.strftime("%Y-%m-%d"),
-        "%time%": now.strftime("%H-%M-%S"),
-        "%datetime%": now.strftime("%Y-%m-%d_%H-%M-%S"),
+        "%time%": now.strftime("%H%M%S"),
+        "%datetime%": now.strftime("%Y-%m-%d_%H%M%S"),
+        "%utcdatetime%": utc_now.strftime("%Y%m%d_%H%M%SZ"),
         "%year%": now.strftime("%Y"),
         "%month%": now.strftime("%m"),
         "%day%": now.strftime("%d"),
@@ -941,6 +956,8 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Failure handling: {setting_value('failure_handling', failure_handling_var.get())}",
         f"  Rate limit: {setting_value('rate_limit', rate_limit_var.get())}",
         f"  Download speed limit: {setting_value('download_speed_limit', download_speed_limit_var.get())}",
+        f"  Concurrent captures: {setting_value('concurrent_captures', concurrent_captures_var.get())}",
+        f"  Concurrent fragments: {setting_value('concurrent_fragments', concurrent_fragments_var.get())}",
         f"  Impersonate target: {setting_value('impersonate_target', impersonate_var.get())}",
         f"  VPN check: {'enabled' if check_vpn_var.get() else 'disabled'}",
     ]
@@ -1111,30 +1128,52 @@ def append_text_to_urls_box(content):
         urls_text.insert("1.0", content)
 
 
-def load_urls_from_input_file():
+def read_input_file_for_url_box():
     path = input_file_var.get().strip()
 
     if not path or not os.path.isfile(path):
         messagebox.showerror("Input file not found", "Input File is missing or invalid.")
-        return
+        return None, None
 
     try:
         with open(path, "r", encoding="utf-8-sig") as f:
-            content = f.read()
-
-        append_text_to_urls_box(content)
-        append_log(f"\nLoaded URLs from input file and appended them to the URL box: {path}\n")
+            return f.read(), "utf-8-sig"
     except UnicodeDecodeError:
         try:
             with open(path, "r", encoding="cp1252") as f:
-                content = f.read()
-
-            append_text_to_urls_box(content)
-            append_log(f"\nLoaded URLs from input file using cp1252 fallback and appended them to the URL box: {path}\n")
+                return f.read(), "cp1252"
         except Exception as e:
             messagebox.showerror("Read error", f"Could not read input file:\n\n{e}")
+            return None, None
     except Exception as e:
         messagebox.showerror("Read error", f"Could not read input file:\n\n{e}")
+        return None, None
+
+
+def load_urls_from_input_file():
+    path = input_file_var.get().strip()
+    content, encoding_name = read_input_file_for_url_box()
+
+    if content is None:
+        return
+
+    urls_text.delete("1.0", "end")
+    urls_text.insert("1.0", str(content).strip() + "\n")
+    append_log(f"\nLoaded URLs from input file and replaced the URL box contents: {path}\n")
+
+
+def append_urls_from_input_file():
+    path = input_file_var.get().strip()
+    content, encoding_name = read_input_file_for_url_box()
+
+    if content is None:
+        return
+
+    append_text_to_urls_box(content)
+    if encoding_name == "cp1252":
+        append_log(f"\nLoaded URLs from input file using cp1252 fallback and appended them to the URL box: {path}\n")
+    else:
+        append_log(f"\nLoaded URLs from input file and appended them to the URL box: {path}\n")
 
 
 def save_urls_to_input_file():
@@ -1228,6 +1267,393 @@ def strip_url_extra_ampersand_tags():
     urls_text.delete("1.0", "end")
     urls_text.insert("1.0", "\n".join(output_lines).strip() + "\n")
     append_log(f"\nStripped parameter-like ampersand tags from {changed} URL(s) in the URL box.\n")
+
+
+def clean_extracted_url(url):
+    cleaned = html.unescape(str(url or "").strip())
+    cleaned = cleaned.strip(" \t\r\n<>'\"")
+    cleaned = cleaned.rstrip(".,;)]}")
+    return cleaned
+
+
+def extract_urls_from_text(text_value):
+    text_value = str(text_value or "")
+    starts = [match.start() for match in re.finditer(r"https?://", text_value, flags=re.IGNORECASE)]
+    urls = []
+
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text_value)
+        segment = text_value[start:end]
+        delimiter_match = re.search(r"[\s,;|<>'\"]", segment)
+        if delimiter_match:
+            segment = segment[:delimiter_match.start()]
+        url = clean_extracted_url(segment)
+        if url:
+            urls.append(url)
+
+    return urls
+
+
+def normalize_url_for_compare(url):
+    url = clean_extracted_url(url)
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return url.strip().lower()
+
+    scheme = (parsed.scheme or "").lower()
+    netloc = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    query = parsed.query or ""
+    fragment = ""
+
+    normalized = urlunsplit((scheme, netloc, path, query, fragment))
+    if normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def url_shape_is_valid(url):
+    try:
+        parsed = urlsplit(clean_extracted_url(url))
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and "." in parsed.netloc
+    except Exception:
+        return False
+
+
+def read_text_file_best_effort(path):
+    try:
+        return Path(path).read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        return Path(path).read_text(encoding="cp1252")
+    except Exception:
+        return ""
+
+
+def get_current_url_source_text():
+    pasted = urls_text.get("1.0", "end").strip()
+    if pasted:
+        return pasted
+
+    input_file = input_file_var.get().strip()
+    if input_file and os.path.isfile(input_file):
+        return read_text_file_best_effort(input_file)
+
+    return ""
+
+
+def get_current_url_list_for_tools(use_all_cache=True):
+    if use_all_cache and url_view_mode == "failed" and url_all_view_cache:
+        return list(url_all_view_cache)
+
+    return extract_urls_from_text(get_current_url_source_text())
+
+
+def set_url_box_urls(urls, include_group_headers=False):
+    urls_text.delete("1.0", "end")
+    if not urls:
+        return
+
+    urls_text.insert("1.0", "\n".join(urls).strip() + "\n")
+
+
+def get_gui_failed_urls_path(output_root=None):
+    root_path = output_root or output_root_var.get().strip()
+    return os.path.join(root_path, "gui-failed-urls.txt") if root_path else ""
+
+
+def get_gui_captured_urls_path(output_root=None):
+    root_path = output_root or output_root_var.get().strip()
+    return os.path.join(root_path, "gui-captured-urls.txt") if root_path else ""
+
+
+def parse_gui_url_record_line(line):
+    line = str(line or "").strip()
+    if not line:
+        return None
+
+    parts = line.split("\t")
+    url = ""
+    case_name = ""
+    status = ""
+    detail = ""
+
+    if len(parts) >= 4 and parts[3].lower().startswith(("http://", "https://")):
+        status = parts[1] if len(parts) > 1 else ""
+        case_name = parts[2] if len(parts) > 2 else ""
+        url = parts[3]
+        detail = parts[4] if len(parts) > 4 else ""
+    else:
+        found = extract_urls_from_text(line)
+        if found:
+            url = found[0]
+            case_name = parts[2] if len(parts) > 2 else ""
+
+    if not url:
+        return None
+
+    return {
+        "case": case_name,
+        "status": status,
+        "url": clean_extracted_url(url),
+        "detail": detail,
+        "normalized": normalize_url_for_compare(url),
+    }
+
+
+def read_gui_url_records(path):
+    records = []
+    if not path or not os.path.isfile(path):
+        return records
+
+    for line in read_text_file_best_effort(path).splitlines():
+        record = parse_gui_url_record_line(line)
+        if record:
+            records.append(record)
+
+    return records
+
+
+def get_failed_url_records():
+    return read_gui_url_records(get_gui_failed_urls_path())
+
+
+def get_captured_url_records():
+    records = read_gui_url_records(get_gui_captured_urls_path())
+
+    output_root = output_root_var.get().strip()
+    if output_root and os.path.isdir(output_root):
+        try:
+            for log_path in Path(output_root).rglob("*.log"):
+                text_value = read_text_file_best_effort(log_path)
+                for line in text_value.splitlines():
+                    if line.startswith("GUI_QUEUE_URL_COMPLETE\t"):
+                        found = extract_urls_from_text(line)
+                        for url in found:
+                            records.append({
+                                "case": log_path.parent.parent.name if log_path.parent else "",
+                                "status": "captured",
+                                "url": clean_extracted_url(url),
+                                "detail": "run log",
+                                "normalized": normalize_url_for_compare(url),
+                            })
+        except Exception:
+            pass
+
+    return records
+
+
+def toggle_failed_url_view():
+    global url_view_mode, url_all_view_cache
+
+    if url_view_mode == "all":
+        url_all_view_cache = get_current_url_list_for_tools(use_all_cache=False)
+        base_set = {normalize_url_for_compare(url) for url in url_all_view_cache}
+        failed_records = get_failed_url_records()
+
+        failed_urls = []
+        seen = set()
+
+        for record in failed_records:
+            normalized = record.get("normalized", "")
+            if base_set and normalized not in base_set:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            failed_urls.append(record["url"])
+
+        if not failed_urls:
+            messagebox.showinfo("No failed URLs", "No failed URLs were found for the current Output Root/current URL set.")
+            return
+
+        set_url_box_urls(failed_urls)
+        url_view_mode = "failed"
+        try:
+            failed_url_toggle_button.config(text="All")
+        except Exception:
+            pass
+        append_log(f"\nShowing {len(failed_urls)} failed URL(s) in the URL box.\n")
+        return
+
+    set_url_box_urls(url_all_view_cache)
+    url_view_mode = "all"
+    try:
+        failed_url_toggle_button.config(text="Failed")
+    except Exception:
+        pass
+    append_log("\nRestored all URLs in the URL box.\n")
+
+
+def group_urls_by_tld():
+    urls = get_current_url_list_for_tools(use_all_cache=False)
+    if not urls:
+        messagebox.showwarning("No URLs", "No URLs are available to group.")
+        return
+
+    groups = {}
+    order = []
+
+    for url in urls:
+        domain = get_url_domain_key(url) or "unknown"
+        if domain not in groups:
+            groups[domain] = []
+            order.append(domain)
+        groups[domain].append(url)
+
+    output_lines = []
+    for domain in sorted(order):
+        output_lines.append(f"# {domain}")
+        output_lines.extend(groups[domain])
+        output_lines.append("")
+
+    urls_text.delete("1.0", "end")
+    urls_text.insert("1.0", "\n".join(output_lines).strip() + "\n")
+    append_log(f"\nGrouped {len(urls)} URL(s) by {len(groups)} domain(s).\n")
+
+
+def show_url_statistics():
+    urls = get_current_url_list_for_tools(use_all_cache=False)
+    if not urls:
+        messagebox.showinfo("URL Statistics", "No URLs found.")
+        return
+
+    counts = {}
+    for url in urls:
+        domain = get_url_domain_key(url) or "unknown"
+        counts[domain] = counts.get(domain, 0) + 1
+
+    lines = [
+        f"Total URLs: {len(urls)}",
+        f"Unique URLs: {len({normalize_url_for_compare(url) for url in urls})}",
+        f"Domains: {len(counts)}",
+        "",
+        "Total by domain:",
+    ]
+    for domain, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        lines.append(f"  {domain}: {count}")
+
+    dialog = tk.Toplevel(root)
+    dialog.title("URL Statistics")
+    dialog.geometry("560x420")
+    dialog.minsize(460, 320)
+
+    box = scrolledtext.ScrolledText(dialog, wrap="word")
+    box.pack(fill="both", expand=True, padx=12, pady=12)
+    box.insert("1.0", "\n".join(lines))
+    box.configure(state="disabled")
+
+    ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(0, 12))
+
+
+def remove_duplicate_urls_from_box():
+    source_text = get_current_url_source_text()
+    if not source_text.strip():
+        messagebox.showwarning("No URLs", "No URL text or input file contents were found.")
+        return
+
+    extracted = extract_urls_from_text(source_text)
+    output_urls = []
+    seen = set()
+    duplicate_count = 0
+
+    for url in extracted:
+        cleaned = clean_extracted_url(url)
+        normalized = normalize_url_for_compare(cleaned)
+        if normalized in seen:
+            duplicate_count += 1
+            continue
+        seen.add(normalized)
+        output_urls.append(cleaned)
+
+    set_url_box_urls(output_urls)
+    messagebox.showinfo(
+        "Duplicates Removed",
+        f"Unique URLs kept: {len(output_urls)}\nDuplicates removed: {duplicate_count}",
+    )
+    append_log(f"\nRemoved {duplicate_count} duplicate URL(s); kept {len(output_urls)} unique URL(s).\n")
+
+
+def validate_urls_in_box():
+    source_text = get_current_url_source_text()
+    if not source_text.strip():
+        messagebox.showwarning("No URLs", "No URL text or input file contents were found.")
+        return
+
+    extracted = extract_urls_from_text(source_text)
+    invalid_lines = []
+    for line in source_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not extract_urls_from_text(stripped):
+            invalid_lines.append(stripped)
+
+    seen = set()
+    valid_urls = []
+    duplicate_count = 0
+    invalid_url_shapes = []
+
+    for url in extracted:
+        normalized = normalize_url_for_compare(url)
+        if normalized in seen:
+            duplicate_count += 1
+        else:
+            seen.add(normalized)
+
+        if not url_shape_is_valid(url):
+            invalid_url_shapes.append(url)
+            continue
+
+        valid_urls.append(clean_extracted_url(url))
+
+    captured_records = get_captured_url_records()
+    captured_by_url = {}
+    for record in captured_records:
+        captured_by_url.setdefault(record.get("normalized", ""), []).append(record)
+
+    already_captured = [
+        url for url in valid_urls
+        if normalize_url_for_compare(url) in captured_by_url
+    ]
+
+    set_url_box_urls(valid_urls)
+
+    messages = [
+        f"Validated URLs: {len(valid_urls)}",
+        f"Duplicate URLs detected: {duplicate_count}",
+        f"Comments/blank lines removed: yes",
+    ]
+
+    if duplicate_count:
+        messages.append("Use the Duplicates button to remove duplicate URLs.")
+
+    if invalid_lines:
+        messages.append("")
+        messages.append(f"Lines without valid URL starts: {len(invalid_lines)}")
+        messages.extend(f"  {item[:160]}" for item in invalid_lines[:10])
+        if len(invalid_lines) > 10:
+            messages.append(f"  ...and {len(invalid_lines) - 10} more")
+
+    if invalid_url_shapes:
+        messages.append("")
+        messages.append(f"Invalid URL shapes removed: {len(invalid_url_shapes)}")
+        messages.extend(f"  {item[:160]}" for item in invalid_url_shapes[:10])
+        if len(invalid_url_shapes) > 10:
+            messages.append(f"  ...and {len(invalid_url_shapes) - 10} more")
+
+    if already_captured:
+        messages.append("")
+        messages.append(f"Previously captured URL warning: {len(already_captured)}")
+        for url in already_captured[:10]:
+            record = captured_by_url.get(normalize_url_for_compare(url), [{}])[0]
+            case_name = record.get("case", "")
+            messages.append(f"  {url}" + (f"  [{case_name}]" if case_name else ""))
+        if len(already_captured) > 10:
+            messages.append(f"  ...and {len(already_captured) - 10} more")
+
+    messagebox.showinfo("URL Validation", "\n".join(messages))
+    append_log(f"\nValidated URL box: {len(valid_urls)} URL(s), {duplicate_count} duplicate(s) detected.\n")
 
 
 def derive_cookie_keys(password, salt):
@@ -1670,7 +2096,9 @@ def build_powershell_command():
         cmd += ["-DateBefore", date_before]
 
     rate_limit = rate_limit_var.get().strip() or "normal"
-    if rate_limit == "fast":
+    if rate_limit == "none":
+        cmd += ["-RateLimit", "None"]
+    elif rate_limit == "fast":
         cmd += ["-RateLimit", "Fast"]
     elif rate_limit == "cautious":
         cmd += ["-RateLimit", "Cautious"]
@@ -1682,6 +2110,10 @@ def build_powershell_command():
         raise ValueError("Download Speed Limit is invalid. Use disabled, 500K, 1M, 50M, or a custom value such as 20M.")
     if download_speed_limit != "disabled":
         cmd += ["-DownloadSpeedLimit", download_speed_limit]
+
+    concurrent_fragments = get_concurrent_fragment_limit()
+    if concurrent_fragments > 1:
+        cmd += ["-ConcurrentFragments", str(concurrent_fragments)]
 
     if keep_partials_var.get():
         cmd += ["-KeepPartials"]
@@ -1869,7 +2301,9 @@ def build_powershell_command_for_job(job):
         cmd += ["-DateBefore", date_before]
 
     rate_limit = str(settings.get("rate_limit", DEFAULTS["rate_limit"]) or "normal").strip()
-    if rate_limit == "fast":
+    if rate_limit == "none":
+        cmd += ["-RateLimit", "None"]
+    elif rate_limit == "fast":
         cmd += ["-RateLimit", "Fast"]
     elif rate_limit == "cautious":
         cmd += ["-RateLimit", "Cautious"]
@@ -1881,6 +2315,10 @@ def build_powershell_command_for_job(job):
         raise ValueError("Download Speed Limit is invalid. Use disabled, 500K, 1M, 50M, or a custom value such as 20M.")
     if download_speed_limit != "disabled":
         cmd += ["-DownloadSpeedLimit", download_speed_limit]
+
+    concurrent_fragments = get_concurrent_fragment_limit(settings)
+    if concurrent_fragments > 1:
+        cmd += ["-ConcurrentFragments", str(concurrent_fragments)]
 
     if bool(settings.get("keep_partials", DEFAULTS["keep_partials"])):
         cmd += ["-KeepPartials"]
@@ -2066,6 +2504,8 @@ def get_settings_dict():
         "date_before_day": date_before_day_var.get(),
         "rate_limit": rate_limit_var.get(),
         "download_speed_limit": download_speed_limit_var.get(),
+        "concurrent_captures": concurrent_captures_var.get(),
+        "concurrent_fragments": concurrent_fragments_var.get(),
         "keep_partials": keep_partials_var.get(),
         "write_info_json": write_info_json_var.get(),
         "write_source_link": write_source_link_var.get(),
@@ -2111,6 +2551,14 @@ def apply_settings_dict(settings):
     rate_limit_var.set(settings.get("rate_limit", DEFAULTS["rate_limit"]))
     saved_download_speed_limit = normalize_download_speed_limit_value(settings.get("download_speed_limit", DEFAULTS["download_speed_limit"]))
     download_speed_limit_var.set(saved_download_speed_limit or DEFAULTS["download_speed_limit"])
+    concurrent_captures_var.set(str(settings.get("concurrent_captures", DEFAULTS["concurrent_captures"]) or DEFAULTS["concurrent_captures"]))
+    if concurrent_captures_var.get() not in {"1", "2", "3", "4"}:
+        concurrent_captures_var.set(DEFAULTS["concurrent_captures"])
+
+    concurrent_fragments_var.set(str(settings.get("concurrent_fragments", DEFAULTS["concurrent_fragments"]) or DEFAULTS["concurrent_fragments"]))
+    if concurrent_fragments_var.get() not in {"1", "2", "4", "8"}:
+        concurrent_fragments_var.set(DEFAULTS["concurrent_fragments"])
+
     keep_partials_var.set(bool(settings.get("keep_partials", DEFAULTS["keep_partials"])))
     write_info_json_var.set(bool(settings.get("write_info_json", DEFAULTS["write_info_json"])))
     write_source_link_var.set(bool(settings.get("write_source_link", DEFAULTS["write_source_link"])))
@@ -2310,6 +2758,26 @@ def update_vpn_tools_menu_state():
         pass
 
 
+def adjust_window_for_vpn_visibility():
+    try:
+        vpn_enabled = check_vpn_var.get()
+        target_min_height = APP_WINDOW_MIN_HEIGHT_WITH_VPN if vpn_enabled else APP_WINDOW_MIN_HEIGHT_BASE
+        target_height = APP_WINDOW_HEIGHT_WITH_VPN if vpn_enabled else APP_WINDOW_HEIGHT_BASE
+
+        root.minsize(APP_WINDOW_MIN_WIDTH, target_min_height)
+        root.update_idletasks()
+
+        current_width = max(root.winfo_width(), APP_WINDOW_WIDTH)
+        current_height = root.winfo_height()
+
+        if vpn_enabled and current_height < target_height:
+            root.geometry(f"{current_width}x{target_height}")
+        elif not vpn_enabled and current_height <= APP_WINDOW_HEIGHT_WITH_VPN + 20:
+            root.geometry(f"{current_width}x{APP_WINDOW_HEIGHT_BASE}")
+    except Exception:
+        pass
+
+
 def update_vpn_section_visibility():
     try:
         if check_vpn_var.get():
@@ -2317,6 +2785,8 @@ def update_vpn_section_visibility():
         else:
             vpn_frame.grid_remove()
             vpn_status_var.set("VPN: Check disabled")
+
+        adjust_window_for_vpn_visibility()
     except Exception:
         # The app setting can be loaded before the VPN frame exists during startup.
         pass
@@ -2851,6 +3321,37 @@ def reset_defaults():
 def start_capture():
     global running_process
 
+    queue_has_active_or_pending_jobs = False
+    try:
+        queue_has_active_or_pending_jobs = (
+            job_queue_running
+            or bool(get_pending_queue_jobs())
+            or bool(get_running_queue_jobs())
+        )
+    except Exception:
+        queue_has_active_or_pending_jobs = bool(job_queue_running)
+
+    if queue_has_active_or_pending_jobs:
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        added = add_current_as_job()
+        if added:
+            append_log("\nStart Capture added the current capture to the existing queue.\n")
+            if job_queue_running:
+                run_next_queue_job()
+            else:
+                start_job_queue()
+        return
+
+    if get_concurrent_capture_limit() >= 2:
+        if not job_queue_window_is_open():
+            open_job_queue()
+        added = add_current_as_job()
+        if added:
+            start_job_queue()
+        return
+
     if running_process is not None and running_process.poll() is None:
         messagebox.showwarning("Already running", "A capture process is already running.")
         return
@@ -2990,35 +3491,197 @@ def show_run_summary(exit_code, submitted_url_count):
         copy_summary_button.config(state="disabled")
 
 
-def get_current_url_lines_for_queue():
-    pasted = urls_text.get("1.0", "end").strip()
-    lines = []
 
-    if pasted:
-        for line in pasted.splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                lines.append(line)
-        return lines
+def get_concurrent_capture_limit(settings=None):
+    try:
+        if isinstance(settings, dict):
+            value = settings.get("concurrent_captures", DEFAULTS["concurrent_captures"])
+        else:
+            value = concurrent_captures_var.get()
+        return max(1, min(4, int(str(value).strip())))
+    except Exception:
+        return 1
 
-    input_file = input_file_var.get().strip()
-    if not input_file or not os.path.isfile(input_file):
-        return []
+
+def get_concurrent_fragment_limit(settings=None):
+    try:
+        if isinstance(settings, dict):
+            value = settings.get("concurrent_fragments", DEFAULTS["concurrent_fragments"])
+        else:
+            value = concurrent_fragments_var.get()
+        value = int(str(value).strip())
+        if value not in {1, 2, 4, 8}:
+            return 1
+        return value
+    except Exception:
+        return 1
+
+
+def get_url_domain_key(url):
+    value = str(url or "").strip()
+    if not value:
+        return ""
+
+    parse_value = value if "://" in value else f"https://{value}"
 
     try:
-        with open(input_file, "r", encoding="utf-8-sig") as f:
-            for line in f.read().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    lines.append(line)
-    except UnicodeDecodeError:
-        with open(input_file, "r", encoding="cp1252") as f:
-            for line in f.read().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    lines.append(line)
+        host = urlsplit(parse_value).hostname or ""
+    except Exception:
+        host = ""
 
-    return lines
+    host = host.lower().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+
+    if not host:
+        return ""
+
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+
+    common_second_level = {"co", "com", "org", "net", "ac", "gov", "edu"}
+    if len(parts[-1]) == 2 and parts[-2] in common_second_level and len(parts) >= 3:
+        return ".".join(parts[-3:])
+
+    return ".".join(parts[-2:])
+
+
+def get_job_domain_keys(job):
+    return sorted({
+        domain
+        for domain in (get_url_domain_key(url) for url in job.get("urls", []))
+        if domain
+    })
+
+
+def find_domain_collisions_for_job(candidate_job, statuses=("pending", "running")):
+    candidate_domains = set(get_job_domain_keys(candidate_job))
+    collisions = []
+
+    if not candidate_domains:
+        return collisions
+
+    for existing in job_queue:
+        if existing is candidate_job:
+            continue
+        if existing.get("status") not in statuses:
+            continue
+
+        existing_domains = set(existing.get("domains") or get_job_domain_keys(existing))
+        overlap = sorted(candidate_domains & existing_domains)
+
+        if overlap:
+            collisions.append({
+                "candidate": candidate_job,
+                "existing": existing,
+                "domains": overlap,
+            })
+
+    return collisions
+
+
+def find_pending_pair_domain_collisions():
+    pending = [job for job in job_queue if job.get("status") == "pending"]
+    collisions = []
+
+    for index, left in enumerate(pending):
+        left_domains = set(left.get("domains") or get_job_domain_keys(left))
+        if not left_domains:
+            continue
+
+        for right in pending[index + 1:]:
+            right_domains = set(right.get("domains") or get_job_domain_keys(right))
+            overlap = sorted(left_domains & right_domains)
+
+            if overlap:
+                collisions.append({
+                    "candidate": right,
+                    "existing": left,
+                    "domains": overlap,
+                })
+
+    return collisions
+
+
+def summarize_domain_collisions(collisions, max_lines=10):
+    lines = []
+
+    for item in collisions[:max_lines]:
+        candidate = item.get("candidate", {})
+        existing = item.get("existing", {})
+        domains = ", ".join(item.get("domains", []))
+        lines.append(
+            f"- {candidate.get('resolved_case_name', 'new job')} conflicts with "
+            f"{existing.get('resolved_case_name', 'existing job')} on: {domains}"
+        )
+
+    if len(collisions) > max_lines:
+        lines.append(f"- ...and {len(collisions) - max_lines} more collision(s).")
+
+    return "\n".join(lines) if lines else "- No collision details available."
+
+
+def show_domain_collision_dialog(collisions):
+    result = {"choice": "cancel"}
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Concurrent Domain Collision")
+    dialog.geometry("720x420")
+    dialog.minsize(620, 340)
+    dialog.grab_set()
+    dialog.transient(root)
+
+    ttk.Label(
+        dialog,
+        text=(
+            "One or more queued/running jobs use the same URL domain while concurrent captures are enabled.\n\n"
+            "Running matching domains at the same time may increase rate-limit or temporary-block risk."
+        ),
+        wraplength=680,
+        justify="left",
+    ).pack(fill="x", padx=12, pady=(12, 8))
+
+    text_box = scrolledtext.ScrolledText(dialog, height=10, wrap="word")
+    text_box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+    text_box.insert("1.0", summarize_domain_collisions(collisions))
+    text_box.configure(state="disabled")
+
+    ttk.Label(
+        dialog,
+        text=(
+            "Continue allows same-domain concurrent jobs. "
+            "Queue After Collisions keeps the new/current jobs pending until colliding running jobs finish. "
+            "Cancel stops this start/add action."
+        ),
+        wraplength=680,
+        justify="left",
+    ).pack(fill="x", padx=12, pady=(0, 8))
+
+    button_frame = ttk.Frame(dialog)
+    button_frame.pack(fill="x", padx=12, pady=(0, 12))
+
+    def choose(value):
+        result["choice"] = value
+        dialog.destroy()
+
+    ttk.Button(button_frame, text="Continue", command=lambda: choose("continue")).pack(side="left", padx=(0, 8))
+    ttk.Button(button_frame, text="Queue After Collisions", command=lambda: choose("wait")).pack(side="left", padx=(0, 8))
+    ttk.Button(button_frame, text="Cancel", command=lambda: choose("cancel")).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    dialog.wait_window()
+    return result["choice"]
+
+
+def mark_job_domain_policy(job, choice):
+    if choice == "continue":
+        job["allow_domain_collision"] = True
+    else:
+        job["allow_domain_collision"] = False
+
+def get_current_url_lines_for_queue():
+    return get_current_url_list_for_tools(use_all_cache=True)
 
 
 def make_job_id():
@@ -3074,6 +3737,7 @@ def refresh_job_queue_window():
                 job.get("status", "pending"),
                 job.get("resolved_case_name", ""),
                 len(job.get("urls", [])),
+                ", ".join(job.get("domains", []) or get_job_domain_keys(job)),
                 job.get("output_root", ""),
                 job.get("started", ""),
                 job.get("finished", ""),
@@ -3117,28 +3781,36 @@ def update_job_queue_progress():
             pass
 
 
-def add_current_as_job():
+def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_template=None):
     try:
-        validate_inputs()
-        urls = get_current_url_lines_for_queue()
-        if not urls:
+        clean_urls = []
+        seen = set()
+        for url in urls or []:
+            url = clean_extracted_url(url)
+            if not url:
+                continue
+            normalized = normalize_url_for_compare(url)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            clean_urls.append(url)
+
+        if not clean_urls:
             raise ValueError("No URLs are available to add to the queue.")
 
-        now = datetime.now()
-        resolved_case_name = get_resolved_case_name(now=now)
+        settings = settings.copy() if isinstance(settings, dict) else get_settings_dict()
+        case_template = case_template if case_template is not None else settings.get("case_name", "")
+        resolved_case_name = resolved_case_name or get_resolved_case_name(now=datetime.now())
 
         if not resolved_case_name:
             raise ValueError("Case Name is blank after resolving the template.")
-
-        settings = get_settings_dict()
-        case_template = settings.get("case_name", "")
 
         job = {
             "job_id": make_job_id(),
             "status": "pending",
             "case_template": case_template,
             "resolved_case_name": resolved_case_name,
-            "urls": urls,
+            "urls": clean_urls,
             "settings": settings,
             "output_root": settings.get("output_root", ""),
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3148,11 +3820,31 @@ def add_current_as_job():
             "completed_urls": 0,
             "summary": "",
         }
+        job["domains"] = get_job_domain_keys(job)
+        job["allow_domain_collision"] = False
+
+        if get_concurrent_capture_limit() >= 2:
+            collisions = find_domain_collisions_for_job(job)
+            if collisions:
+                choice = show_domain_collision_dialog(collisions)
+                if choice == "cancel":
+                    return False
+                mark_job_domain_policy(job, choice)
 
         job_queue.append(job)
         refresh_job_queue_window()
-        append_log(f"\nAdded queue job: {resolved_case_name} ({len(urls)} URL(s))\n")
+        append_log(f"\nAdded queue job: {resolved_case_name} ({len(clean_urls)} URL(s))\n")
         return True
+    except Exception as e:
+        messagebox.showerror("Add job failed", str(e))
+        return False
+
+
+def add_current_as_job():
+    try:
+        validate_inputs()
+        urls = get_current_url_lines_for_queue()
+        return add_urls_to_queue_as_job(urls)
     except Exception as e:
         messagebox.showerror("Add job failed", str(e))
         return False
@@ -3163,6 +3855,90 @@ def add_current_job_and_open_queue():
         open_job_queue()
 
     add_current_as_job()
+
+
+def add_current_job_to_queue_and_start():
+    if not job_queue_window_is_open():
+        open_job_queue()
+
+    added = add_current_as_job()
+    if added:
+        start_job_queue()
+
+
+def add_jobs_to_queue_by_domain():
+    try:
+        validate_inputs()
+        urls = get_current_url_lines_for_queue()
+        if not urls:
+            raise ValueError("No URLs are available to split by domain.")
+
+        settings = get_settings_dict()
+        base_case_name = get_resolved_case_name(now=datetime.now())
+        groups = {}
+        order = []
+
+        for url in urls:
+            domain = get_url_domain_key(url) or "unknown"
+            if domain not in groups:
+                groups[domain] = []
+                order.append(domain)
+            groups[domain].append(url)
+
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        added_count = 0
+        for domain in sorted(order):
+            domain_suffix = safe_case_name(domain)
+            resolved_name = safe_case_name(f"{base_case_name}-{domain_suffix}")
+            if add_urls_to_queue_as_job(
+                groups[domain],
+                resolved_case_name=resolved_name,
+                settings=settings,
+                case_template=settings.get("case_name", ""),
+            ):
+                added_count += 1
+
+        append_log(f"\nAdded {added_count} domain-grouped job(s) to the queue.\n")
+    except Exception as e:
+        messagebox.showerror("Add jobs by domain failed", str(e))
+
+
+def get_failed_urls_for_current_context():
+    base_urls = get_current_url_list_for_tools(use_all_cache=True)
+    base_set = {normalize_url_for_compare(url) for url in base_urls}
+    failed_records = get_failed_url_records()
+
+    failed_urls = []
+    seen = set()
+
+    for record in failed_records:
+        normalized = record.get("normalized", "")
+        if base_set and normalized not in base_set:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        failed_urls.append(record["url"])
+
+    return failed_urls
+
+
+def add_failed_to_queue():
+    try:
+        failed_urls = get_failed_urls_for_current_context()
+        if not failed_urls:
+            messagebox.showinfo("No failed URLs", "No failed URLs were found for the current Output Root/current URL set.")
+            return False
+
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        return add_urls_to_queue_as_job(failed_urls)
+    except Exception as e:
+        messagebox.showerror("Add failed URLs failed", str(e))
+        return False
 
 
 def get_selected_queue_job():
@@ -3306,7 +4082,7 @@ def stop_current_queue_job():
 def start_job_queue():
     global job_queue_running, job_queue_pause_after_current
 
-    if running_process is not None and running_process.poll() is None:
+    if running_process is not None and running_process.poll() is None and not job_queue_running_processes:
         messagebox.showwarning("Capture already running", "A capture process is already running.")
         return
 
@@ -3324,6 +4100,17 @@ def start_job_queue():
         if not proceed:
             return
 
+    if get_concurrent_capture_limit() >= 2:
+        collisions = find_pending_pair_domain_collisions()
+        if collisions:
+            choice = show_domain_collision_dialog(collisions)
+            if choice == "cancel":
+                return
+            if choice == "continue":
+                for item in collisions:
+                    item.get("candidate", {})["allow_domain_collision"] = True
+                    item.get("existing", {})["allow_domain_collision"] = True
+
     job_queue_running = True
     job_queue_pause_after_current = False
     append_log("\n========== Job Queue ==========\n")
@@ -3331,16 +4118,81 @@ def start_job_queue():
     run_next_queue_job()
 
 
+def get_running_queue_jobs():
+    return [job for job in job_queue if job.get("status") == "running"]
+
+
+def get_pending_queue_jobs():
+    return [job for job in job_queue if job.get("status") == "pending"]
+
+
+def job_collides_with_running_jobs(job):
+    if job.get("allow_domain_collision"):
+        return False
+
+    job_domains = set(job.get("domains") or get_job_domain_keys(job))
+    if not job_domains:
+        return False
+
+    for running_job in get_running_queue_jobs():
+        running_domains = set(running_job.get("domains") or get_job_domain_keys(running_job))
+        if job_domains & running_domains:
+            return True
+
+    return False
+
+
+def update_queue_running_status():
+    running_count = len(get_running_queue_jobs())
+    pending_count = len(get_pending_queue_jobs())
+    total_urls = sum(len(queue_job.get("urls", [])) for queue_job in job_queue)
+    completed_urls = sum(int(queue_job.get("completed_urls", 0) or 0) for queue_job in job_queue)
+
+    text = (
+        f"Queue running: {running_count} active, {pending_count} pending, "
+        f"{completed_urls}/{total_urls} URL segment(s) complete"
+    )
+
+    if job_queue_status_var and job_queue_window_is_open():
+        try:
+            job_queue_status_var.set(text)
+        except Exception:
+            pass
+
+    set_status(text)
+
+
 def run_next_queue_job():
     global job_queue_running, job_queue_current_job_id
 
-    next_job = None
-    for job in job_queue:
-        if job.get("status") == "pending":
+    if not job_queue_running:
+        return
+
+    limit = get_concurrent_capture_limit()
+    started_any = False
+
+    while len(get_running_queue_jobs()) < limit:
+        next_job = None
+
+        for job in job_queue:
+            if job.get("status") != "pending":
+                continue
+            if job_collides_with_running_jobs(job):
+                continue
             next_job = job
             break
 
-    if not next_job:
+        if not next_job:
+            break
+
+        job_queue_current_job_id = next_job["job_id"]
+        run_queue_job(next_job)
+        started_any = True
+
+    running_jobs = get_running_queue_jobs()
+    pending_jobs = get_pending_queue_jobs()
+
+    if not running_jobs and not pending_jobs:
         job_queue_running = False
         job_queue_current_job_id = None
         refresh_job_queue_window()
@@ -3351,10 +4203,16 @@ def run_next_queue_job():
                 pass
         append_log("\nJob queue complete.\n")
         set_status("Queue complete")
+        start_button.config(state="normal")
+        start_menu_button.config(state="normal")
+        stop_button.config(state="disabled")
         return
 
-    job_queue_current_job_id = next_job["job_id"]
-    run_queue_job(next_job)
+    if not started_any and pending_jobs and running_jobs:
+        update_queue_running_status()
+        append_log("\nPending queue jobs are waiting for colliding running domain(s) to finish.\n")
+    else:
+        update_queue_running_status()
 
 
 def mark_queue_job_url_complete(job_id, url_index=None):
@@ -3384,10 +4242,13 @@ def mark_queue_job_url_complete(job_id, url_index=None):
     job["completed_urls"] = current
     update_job_queue_progress()
 
-    if job_queue_status_var:
+    if job_queue_status_var and job_queue_window_is_open():
         total_urls = sum(len(queue_job.get("urls", [])) for queue_job in job_queue)
         completed_urls = sum(int(queue_job.get("completed_urls", 0) or 0) for queue_job in job_queue)
-        job_queue_status_var.set(f"Queue running: {completed_urls}/{total_urls} URL segment(s) complete")
+        try:
+            job_queue_status_var.set(f"Queue running: {completed_urls}/{total_urls} URL segment(s) complete")
+        except Exception:
+            pass
 
 
 def handle_queue_output_line(job_id, line):
@@ -3403,7 +4264,7 @@ def handle_queue_output_line(job_id, line):
 
 
 def run_queue_job(job):
-    global running_process, last_capture_context
+    global running_process, last_capture_context, job_queue_running_processes
 
     try:
         validate_queue_job_inputs(job)
@@ -3430,14 +4291,18 @@ def run_queue_job(job):
         submitted_url_count = len(job.get("urls", []))
         tool_versions = query_capture_tool_versions_for_job(job.get("settings", {}))
 
+        job_paths = get_expected_run_paths_for_values(
+            job.get("settings", {}).get("output_root", ""),
+            job.get("resolved_case_name", ""),
+        )
+        job["paths"] = job_paths
+        job["tool_versions"] = tool_versions
+
         last_capture_context = {
             "tool_versions": tool_versions,
             "submitted_url_count": submitted_url_count,
             "settings": job.get("settings", {}),
-            "paths": get_expected_run_paths_for_values(
-                job.get("settings", {}).get("output_root", ""),
-                job.get("resolved_case_name", ""),
-            ),
+            "paths": job_paths,
         }
 
         job["status"] = "running"
@@ -3462,7 +4327,8 @@ def run_queue_job(job):
         append_log(" ".join(f'"{part}"' if " " in part else part for part in cmd))
         append_log("\n\n")
 
-        start_button.config(state="disabled")
+        start_button.config(state="normal")
+        start_menu_button.config(state="normal")
         stop_button.config(state="normal")
         copy_summary_button.config(state="disabled")
         set_status(f"Queue running: {job.get('resolved_case_name', '')}")
@@ -3482,7 +4348,7 @@ def run_queue_job(job):
         exit_code = 1
 
         try:
-            running_process = subprocess.Popen(
+            process = subprocess.Popen(
                 cmd,
                 cwd=ROOT,
                 stdout=subprocess.PIPE,
@@ -3492,13 +4358,16 @@ def run_queue_job(job):
                 universal_newlines=True,
             )
 
-            if running_process.stdout:
-                for line in running_process.stdout:
+            job_queue_running_processes[job["job_id"]] = process
+            running_process = process
+
+            if process.stdout:
+                for line in process.stdout:
                     root.after(0, append_log, line)
                     if line.startswith("GUI_QUEUE_URL_COMPLETE\t"):
                         root.after(0, handle_queue_output_line, job["job_id"], line)
 
-            exit_code = running_process.wait()
+            exit_code = process.wait()
 
         except Exception as e:
             root.after(0, append_log, f"\nERROR: {e}\n")
@@ -3510,7 +4379,7 @@ def run_queue_job(job):
 
 
 def finish_queue_job(job_id, exit_code, submitted_url_count):
-    global job_queue_running, job_queue_current_job_id
+    global job_queue_running, job_queue_current_job_id, job_queue_running_processes, last_successful_case_summary
 
     job = None
     for item in job_queue:
@@ -3520,6 +4389,8 @@ def finish_queue_job(job_id, exit_code, submitted_url_count):
 
     if not job:
         return
+
+    job_queue_running_processes.pop(job_id, None)
 
     job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     job["exit_code"] = exit_code
@@ -3533,20 +4404,45 @@ def finish_queue_job(job_id, exit_code, submitted_url_count):
         append_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
         set_status(f"Queue job failed: {exit_code}")
 
-    show_run_summary(exit_code, submitted_url_count)
+    paths = job.get("paths") or get_expected_run_paths_for_values(
+        job.get("settings", {}).get("output_root", ""),
+        job.get("resolved_case_name", ""),
+    )
+    counts = count_case_files(paths.get("case_folder", ""))
+    versions = job.get("tool_versions", {})
+    summary_settings = job.get("settings", {})
+
+    append_log("\n========== Queue Job Summary ==========")
+    append_log(f"\nExit code: {exit_code}\n")
+    append_log(f"Submitted URLs: {submitted_url_count}\n")
+    append_log(f"Case folder: {paths.get('case_folder', '')}\n")
+    append_log(f"Total files found: {counts.get('files', 0)}\n")
+    append_log(f"Media files found: {counts.get('media', 0)}\n")
+    append_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
+    append_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
+    append_log("=====================================\n")
 
     if job.get("status") == "completed":
-        job["summary"] = last_successful_case_summary
+        job["summary"] = build_case_summary_text(
+            exit_code,
+            submitted_url_count,
+            paths,
+            versions,
+            counts,
+            settings=summary_settings,
+        )
+        last_successful_case_summary = job["summary"]
     else:
         job["summary"] = ""
 
     refresh_job_queue_window()
 
-    start_button.config(state="normal")
-    start_menu_button.config(state="normal")
-    stop_button.config(state="disabled")
+    if not get_running_queue_jobs():
+        start_button.config(state="normal")
+        start_menu_button.config(state="normal")
+        stop_button.config(state="disabled")
 
-    if job_queue_pause_after_current:
+    if job_queue_pause_after_current and not get_running_queue_jobs():
         job_queue_running = False
         job_queue_current_job_id = None
         if job_queue_status_var and job_queue_window_is_open():
@@ -3589,7 +4485,7 @@ def open_job_queue():
     table_frame.columnconfigure(0, weight=1)
     table_frame.rowconfigure(0, weight=1)
 
-    columns = ("#", "status", "case", "urls", "output_root", "started", "finished", "exit")
+    columns = ("#", "status", "case", "urls", "domains", "output_root", "started", "finished", "exit")
     job_queue_tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
     job_queue_tree.grid(row=0, column=0, sticky="nsew")
 
@@ -3598,6 +4494,7 @@ def open_job_queue():
         "status": "Status",
         "case": "Case",
         "urls": "URLs",
+        "domains": "Domains",
         "output_root": "Output Root",
         "started": "Started",
         "finished": "Finished",
@@ -3607,9 +4504,10 @@ def open_job_queue():
     widths = {
         "#": 45,
         "status": 110,
-        "case": 210,
+        "case": 260,
         "urls": 60,
-        "output_root": 300,
+        "domains": 220,
+        "output_root": 420,
         "started": 145,
         "finished": 145,
         "exit": 75,
@@ -3617,11 +4515,18 @@ def open_job_queue():
 
     for column in columns:
         job_queue_tree.heading(column, text=headings[column])
-        job_queue_tree.column(column, width=widths[column], anchor="w", stretch=True)
+        job_queue_tree.column(column, width=widths[column], minwidth=widths[column], anchor="w", stretch=False)
 
     table_scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=job_queue_tree.yview)
     table_scroll_y.grid(row=0, column=1, sticky="ns")
-    job_queue_tree.configure(yscrollcommand=table_scroll_y.set)
+
+    table_scroll_x = ttk.Scrollbar(table_frame, orient="horizontal", command=job_queue_tree.xview)
+    table_scroll_x.grid(row=1, column=0, sticky="ew")
+
+    job_queue_tree.configure(
+        yscrollcommand=table_scroll_y.set,
+        xscrollcommand=table_scroll_x.set,
+    )
 
     bottom = ttk.Frame(job_queue_window, padding=(8, 0, 8, 8))
     bottom.pack(fill="x")
@@ -3652,7 +4557,19 @@ def open_job_queue():
 
 
 def stop_capture():
-    global running_process
+    global running_process, job_queue_pause_after_current
+
+    if job_queue_running_processes:
+        job_queue_pause_after_current = True
+        try:
+            for process in list(job_queue_running_processes.values()):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+            append_log("\nStop requested. Active queue process(es) terminated. Queue will pause after active job(s) stop.\n")
+            set_status("Stopping queue...")
+        except Exception as e:
+            messagebox.showerror("Stop error", str(e))
+        return
 
     if running_process is not None and running_process.poll() is None:
         try:
@@ -5048,6 +5965,7 @@ def update_capture_options_summary(*args):
         archive_text = archive_names.get(archive_mode_var.get(), "case archive")
 
         rate_names = {
+            "none": "none",
             "fast": "fast",
             "normal": "normal",
             "cautious": "cautious",
@@ -5055,6 +5973,10 @@ def update_capture_options_summary(*args):
         rate_text = rate_names.get(rate_limit_var.get(), "normal")
         speed_limit = normalize_download_speed_limit_value(download_speed_limit_var.get())
         speed_text = "speed unlimited" if speed_limit == "disabled" else f"speed {speed_limit or 'invalid'}"
+        concurrency_text = f"{get_concurrent_capture_limit()} queue concurrent"
+        fragments_text = f"{get_concurrent_fragment_limit()} fragment worker"
+        if get_concurrent_fragment_limit() != 1:
+            fragments_text += "s"
         resolution_text = "best" if max_resolution_var.get() == "best" else f"max {max_resolution_var.get()}p"
         failure_text = "stop on fail" if failure_handling_var.get() == "stop" else "continue on fail"
 
@@ -5093,7 +6015,7 @@ def update_capture_options_summary(*args):
             artifacts.append("date " + "/".join(date_filters))
 
         artifact_text = ", ".join(artifacts) if artifacts else "no sidecars"
-        capture_options_summary_var.set(f"{mode}; {scope}; {archive_text}; {resolution_text}; {rate_text}; {speed_text}; {failure_text}; {artifact_text}")
+        capture_options_summary_var.set(f"{mode}; {scope}; {archive_text}; {resolution_text}; {rate_text}; {speed_text}; {concurrency_text}; {fragments_text}; {failure_text}; {artifact_text}")
     except Exception:
         pass
 
@@ -6313,8 +7235,8 @@ try:
 except Exception:
     ORIGINAL_TTK_THEME = ""
 root.title(f"{APP_TITLE} - Profile: {DEFAULT_PROFILE_NAME}")
-root.geometry("1180x900")
-root.minsize(1050, 780)
+root.geometry(f"{APP_WINDOW_WIDTH}x{APP_WINDOW_HEIGHT_BASE}")
+root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT_BASE)
 
 script_path_var = tk.StringVar(value=DEFAULTS["script_path"])
 yt_dlp_path_var = tk.StringVar(value=DEFAULTS["yt_dlp_path"])
@@ -6362,6 +7284,8 @@ date_before_month_var = tk.StringVar(value=DEFAULTS["date_before_month"])
 date_before_day_var = tk.StringVar(value=DEFAULTS["date_before_day"])
 rate_limit_var = tk.StringVar(value=DEFAULTS["rate_limit"])
 download_speed_limit_var = tk.StringVar(value=DEFAULTS["download_speed_limit"])
+concurrent_captures_var = tk.StringVar(value=DEFAULTS["concurrent_captures"])
+concurrent_fragments_var = tk.StringVar(value=DEFAULTS["concurrent_fragments"])
 keep_partials_var = tk.BooleanVar(value=DEFAULTS["keep_partials"])
 write_info_json_var = tk.BooleanVar(value=DEFAULTS["write_info_json"])
 write_source_link_var = tk.BooleanVar(value=DEFAULTS["write_source_link"])
@@ -6394,6 +7318,8 @@ for option_var in [
     date_before_day_var,
     rate_limit_var,
     download_speed_limit_var,
+    concurrent_captures_var,
+    concurrent_fragments_var,
     keep_partials_var,
     write_info_json_var,
     write_source_link_var,
@@ -6413,7 +7339,7 @@ main.pack(fill="both", expand=True)
 
 main.columnconfigure(1, weight=1)
 main.columnconfigure(3, weight=0)
-main.rowconfigure(12, weight=1)
+main.rowconfigure(12, weight=1, minsize=URL_ROW_MIN_HEIGHT)
 main.rowconfigure(17, weight=2)
 
 
@@ -6578,8 +7504,9 @@ case_tag_menu_button["menu"] = case_tag_menu
 
 case_name_tag_items = [
     ("%date%", "Date, e.g. 2026-05-27"),
-    ("%time%", "Time, e.g. 14-30-05"),
-    ("%datetime%", "Date and time, e.g. 2026-05-27_14-30-05"),
+    ("%time%", "Time, e.g. 143005"),
+    ("%datetime%", "Date and time, e.g. 2026-05-27_143005"),
+    ("%utcdatetime%", "UTC date/time, e.g. 20260527_183005Z"),
     ("%year%", "Year"),
     ("%month%", "Month"),
     ("%day%", "Day"),
@@ -6688,7 +7615,7 @@ ttk.Label(
 ).grid(row=0, column=2, sticky="w")
 
 vpn_frame = ttk.LabelFrame(main, text="VPN Status", padding=8)
-vpn_frame.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(8, 6))
+vpn_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(8, 6))
 vpn_frame.columnconfigure(1, weight=1)
 
 ttk.Label(vpn_frame, text="VPN Adapter").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -6729,14 +7656,15 @@ ttk.Label(
     text="Paste URLs below, one per line. If this box is used, it overrides the Input File field.",
 ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(10, 3))
 
-urls_text = scrolledtext.ScrolledText(main, height=7, wrap="word")
+urls_text = scrolledtext.ScrolledText(main, height=6, wrap="word")
 urls_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(0, 8))
 
 url_button_frame = ttk.Frame(main)
-url_button_frame.grid(row=12, column=3, sticky="ns", padx=(8, 0), pady=(0, 8))
+url_button_frame.grid(row=12, column=3, sticky="n", padx=(8, 0), pady=(0, 8))
 
 for index, (label, command) in enumerate((
     ("Load", load_urls_from_input_file),
+    ("Append", append_urls_from_input_file),
     ("Save", save_urls_to_input_file),
     ("Clear", clear_urls),
     ("Strip", strip_url_extra_ampersand_tags),
@@ -6746,7 +7674,28 @@ for index, (label, command) in enumerate((
         text=label,
         command=command,
         width=8,
-    ).grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 6, 0))
+    ).grid(row=index, column=0, sticky="ew", pady=(0 if index == 0 else 6, 0), padx=(0, 6))
+
+failed_url_toggle_button = ttk.Button(
+    url_button_frame,
+    text="Failed",
+    command=toggle_failed_url_view,
+    width=10,
+)
+failed_url_toggle_button.grid(row=0, column=1, sticky="ew")
+
+for index, (label, command) in enumerate((
+    ("Group", group_urls_by_tld),
+    ("Statistics", show_url_statistics),
+    ("Duplicates", remove_duplicate_urls_from_box),
+    ("Validate", validate_urls_in_box),
+), start=1):
+    ttk.Button(
+        url_button_frame,
+        text=label,
+        command=command,
+        width=10,
+    ).grid(row=index, column=1, sticky="ew", pady=(6, 0))
 
 def show_start_capture_menu():
     try:
@@ -6824,6 +7773,9 @@ start_menu_button.grid(row=0, column=1, sticky="ns", padx=(2, 0))
 
 start_capture_menu = tk.Menu(root, tearoff=0)
 start_capture_menu.add_command(label="Add Job to Queue", command=add_current_job_and_open_queue)
+start_capture_menu.add_command(label="Add Job to Queue and Start", command=add_current_job_to_queue_and_start)
+start_capture_menu.add_command(label="Add Jobs to Queue by Domain", command=add_jobs_to_queue_by_domain)
+start_capture_menu.add_command(label="Add Failed to Queue", command=add_failed_to_queue)
 
 stop_button = tk.Button(
     workflow_frame,
@@ -7128,8 +8080,13 @@ ttk.Label(
     justify="left",
 ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-failure_frame = ttk.LabelFrame(advanced_options_panel, text="Failure Handling", padding=8)
-failure_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
+failure_rate_options_row = ttk.Frame(advanced_options_panel)
+failure_rate_options_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+failure_rate_options_row.columnconfigure(0, weight=1)
+failure_rate_options_row.columnconfigure(1, weight=1)
+
+failure_frame = ttk.LabelFrame(failure_rate_options_row, text="Failure Handling", padding=8)
+failure_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 ttk.Radiobutton(
     failure_frame,
     text="Continue after failed URL",
@@ -7145,29 +8102,26 @@ ttk.Radiobutton(
     command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 
-rate_frame = ttk.LabelFrame(advanced_options_panel, text="Request Rate Limit", padding=8)
-rate_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
-ttk.Radiobutton(
-    rate_frame,
-    text="Fast - 15 sec baseline, jitter up to 30 sec",
-    variable=rate_limit_var,
-    value="fast",
-    command=update_capture_options_summary,
-).pack(anchor="w", pady=2)
-ttk.Radiobutton(
-    rate_frame,
-    text="Normal - 30 sec baseline, jitter up to 60 sec",
-    variable=rate_limit_var,
-    value="normal",
-    command=update_capture_options_summary,
-).pack(anchor="w", pady=2)
-ttk.Radiobutton(
-    rate_frame,
-    text="Cautious - 60 sec baseline, jitter up to 120 sec",
-    variable=rate_limit_var,
-    value="cautious",
-    command=update_capture_options_summary,
-).pack(anchor="w", pady=2)
+rate_frame = ttk.LabelFrame(failure_rate_options_row, text="Request Rate Limit", padding=8)
+rate_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+rate_frame.columnconfigure(0, weight=1)
+rate_frame.columnconfigure(1, weight=1)
+
+rate_options = [
+    ("None - 0 sec baseline, jitter up to 5 sec", "none", 0, 0),
+    ("Fast - 15 sec baseline, jitter up to 30 sec", "fast", 0, 1),
+    ("Normal - 30 sec baseline, jitter up to 60 sec", "normal", 1, 0),
+    ("Cautious - 60 sec baseline, jitter up to 120 sec", "cautious", 1, 1),
+]
+
+for label_text, value, row_index, column_index in rate_options:
+    ttk.Radiobutton(
+        rate_frame,
+        text=label_text,
+        variable=rate_limit_var,
+        value=value,
+        command=update_capture_options_summary,
+    ).grid(row=row_index, column=column_index, sticky="w", padx=(0, 8), pady=2)
 
 download_speed_frame = ttk.LabelFrame(advanced_options_panel, text="Download Speed Limit", padding=8)
 download_speed_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -7190,8 +8144,57 @@ download_speed_menu.bind("<<ComboboxSelected>>", on_download_speed_limit_selecte
 download_speed_menu.bind("<FocusOut>", on_download_speed_limit_focus_out)
 download_speed_menu.bind("<Return>", lambda event: normalize_download_speed_limit_selection(prompt_for_custom=False))
 
+concurrency_options_row = ttk.Frame(advanced_options_panel)
+concurrency_options_row.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+concurrency_options_row.columnconfigure(0, weight=1)
+concurrency_options_row.columnconfigure(1, weight=1)
+
+concurrency_frame = ttk.LabelFrame(concurrency_options_row, text="Concurrent Captures", padding=8)
+concurrency_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+concurrency_frame.columnconfigure(1, weight=1)
+
+ttk.Label(concurrency_frame, text="Maximum active queue jobs").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+concurrency_menu = ttk.Combobox(
+    concurrency_frame,
+    textvariable=concurrent_captures_var,
+    values=["1", "2", "3", "4"],
+    state="readonly",
+    width=8,
+)
+concurrency_menu.grid(row=0, column=1, sticky="w", pady=3)
+concurrency_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
+
+ttk.Label(
+    concurrency_frame,
+    text="Values above 1 use the Job Queue and check for matching URL domains before concurrent runs.",
+    wraplength=430,
+    justify="left",
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+fragments_frame = ttk.LabelFrame(concurrency_options_row, text="Concurrent Fragments", padding=8)
+fragments_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+fragments_frame.columnconfigure(1, weight=1)
+
+ttk.Label(fragments_frame, text="Fragment workers per URL").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+fragments_menu = ttk.Combobox(
+    fragments_frame,
+    textvariable=concurrent_fragments_var,
+    values=["1", "2", "4", "8"],
+    state="readonly",
+    width=8,
+)
+fragments_menu.grid(row=0, column=1, sticky="w", pady=3)
+fragments_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
+
+ttk.Label(
+    fragments_frame,
+    text="Values above 1 can increase rate-limit or connection pressure and may interact poorly with speed limits. Leave at 1 unless needed.",
+    wraplength=430,
+    justify="left",
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
 advanced_button_frame = ttk.Frame(advanced_options_panel)
-advanced_button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(8, 0))
+advanced_button_frame.grid(row=5, column=0, columnspan=3, sticky="e", pady=(8, 0))
 
 ttk.Button(
     advanced_button_frame,

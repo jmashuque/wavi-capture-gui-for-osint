@@ -54,11 +54,15 @@ param(
     [string]$DateBefore,
 
     [Parameter(Mandatory = $false)]
-    [ValidateSet("Fast", "Normal", "Cautious")]
+    [ValidateSet("None", "Fast", "Normal", "Cautious")]
     [string]$RateLimit = "Normal",
 
     [Parameter(Mandatory = $false)]
     [string]$DownloadSpeedLimit = "Disabled",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 8)]
+    [int]$ConcurrentFragments = 1,
 
     [switch]$KeepPartials,
 
@@ -451,10 +455,28 @@ $GuiThumbnailDir = Join-Path $GuiCacheDir "thumbnails"
 $GuiMetadataDir = Join-Path $GuiCacheDir "metadata"
 
 $ArchiveFile = Join-Path $CaseDir "download-archive.txt"
+$GlobalFailedUrlsFile = Join-Path $OutputRoot "gui-failed-urls.txt"
+$GlobalCapturedUrlsFile = Join-Path $OutputRoot "gui-captured-urls.txt"
 $RunLog = Join-Path $LogDir ("yt-dlp-run_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $HashManifest = Join-Path $ManifestDir ("sha256-manifest_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 New-Item -ItemType Directory -Path $CaseDir, $MediaDir, $LogDir, $ManifestDir, $GuiThumbnailDir, $GuiMetadataDir -Force | Out-Null
+
+function Add-GuiUrlRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][string]$CaseName,
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $false)][string]$Detail = ""
+    )
+
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $safeDetail = $Detail -replace "`t", " "
+    $safeDetail = $safeDetail -replace "`r?`n", " "
+    $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $timestamp, $Status, $CaseName, $Url, $safeDetail
+    Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+}
 
 $FFmpegForThumbnails = Resolve-FFmpegForThumbnail -Folder $FFmpegFolder
 $FFprobeForMediaInfo = Resolve-FFprobeForMediaInfo -Folder $FFmpegFolder
@@ -467,21 +489,27 @@ if ($DateAfterClean -and $DateBeforeClean -and $DateAfterClean -gt $DateBeforeCl
 }
 
 switch ($RateLimit) {
+    "None" {
+        $SleepBaselineSeconds = 0
+        $SleepMaxSeconds = 5
+        $SleepRequestSeconds = 0
+    }
     "Fast" {
         $SleepBaselineSeconds = 15
+        $SleepMaxSeconds = 30
         $SleepRequestSeconds = 2
     }
     "Cautious" {
         $SleepBaselineSeconds = 60
+        $SleepMaxSeconds = 120
         $SleepRequestSeconds = 10
     }
     default {
         $SleepBaselineSeconds = 30
+        $SleepMaxSeconds = 60
         $SleepRequestSeconds = 5
     }
 }
-
-$SleepMaxSeconds = $SleepBaselineSeconds * 2
 
 $DownloadSpeedLimitClean = $DownloadSpeedLimit.Trim()
 
@@ -491,6 +519,10 @@ if ([string]::IsNullOrWhiteSpace($DownloadSpeedLimitClean)) {
 
 if ($DownloadSpeedLimitClean -ne "Disabled" -and $DownloadSpeedLimitClean -notmatch '^\d+(\.\d+)?[KMGTP]?$') {
     throw "DownloadSpeedLimit must be Disabled or a yt-dlp --limit-rate value such as 750K, 2M, 20M, or 1.5M."
+}
+
+if ($ConcurrentFragments -notin @(1, 2, 4, 8)) {
+    throw "ConcurrentFragments must be 1, 2, 4, or 8."
 }
 
 Write-Section "Preflight checks"
@@ -542,6 +574,7 @@ $OptionLines = @(
     "Date before:            $DateBeforeClean",
     "Rate limit:             $RateLimit ($SleepBaselineSeconds-$SleepMaxSeconds sec between URLs; $SleepRequestSeconds sec yt-dlp request sleep)",
     "Download speed limit:   $DownloadSpeedLimitClean",
+    "Concurrent fragments:   $ConcurrentFragments",
     "Keep partials:          $KeepPartials",
     "Max resolution:         $MaxResolution",
     "Save playlist metadata: $SavePlaylistMetadata",
@@ -588,8 +621,6 @@ $CommonArgs = @(
     "--no-embed-thumbnail",
     "--no-embed-subs",
 
-    "--sleep-requests", "$SleepRequestSeconds",
-
     "--retries", "5",
     "--fragment-retries", "5",
     "--retry-sleep", "exp=10:120",
@@ -600,6 +631,10 @@ $CommonArgs = @(
 
     "--verbose"
 )
+
+if ($SleepRequestSeconds -gt 0) {
+    $CommonArgs += @("--sleep-requests", "$SleepRequestSeconds")
+}
 
 if ($FailureHandling -eq "Continue") {
     $CommonArgs += "--ignore-errors"
@@ -705,6 +740,10 @@ if ($DownloadSpeedLimitClean -ne "Disabled") {
     $CommonArgs += @("--limit-rate", $DownloadSpeedLimitClean)
 }
 
+if ($ConcurrentFragments -gt 1) {
+    $CommonArgs += @("--concurrent-fragments", "$ConcurrentFragments")
+}
+
 if ($CookiesFile) {
     $CommonArgs += @("--cookies", $CookiesFile)
 }
@@ -752,9 +791,12 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     $MediaInfoGenerationOk = New-MediaInfoForRecentCaptures -MediaRoot $MediaDir -MetadataRoot $GuiMetadataDir -Since $CaptureStartTime -FFprobeExe $FFprobeForMediaInfo
 
     if ($YtDlpExitCode -eq 0 -and $ThumbnailGenerationOk -and $MediaInfoGenerationOk) {
+        Add-GuiUrlRecord -Path $GlobalCapturedUrlsFile -Status "captured" -CaseName $SafeCaseName -Url $Url -Detail "exit=0"
         Write-Host ("GUI_QUEUE_URL_COMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
     }
     else {
+        $failureDetail = "exit=$YtDlpExitCode; thumbnail=$ThumbnailGenerationOk; metadata=$MediaInfoGenerationOk"
+        Add-GuiUrlRecord -Path $GlobalFailedUrlsFile -Status "failed" -CaseName $SafeCaseName -Url $Url -Detail $failureDetail
         Write-Host ("GUI_QUEUE_URL_INCOMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
     }
 
@@ -807,4 +849,6 @@ Write-Section "Done"
 Write-Host "Case folder:      $CaseDir"
 Write-Host "Run log:          $RunLog"
 Write-Host "Download archive: $ArchiveFile"
+Write-Host "Failed URLs:      $GlobalFailedUrlsFile"
+Write-Host "Captured URLs:    $GlobalCapturedUrlsFile"
 Write-Host "SHA256 manifest:  $HashManifest"
