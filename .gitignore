@@ -1,12 +1,13 @@
 *
 
-!*/
-
 !gui.py
 !script.ps1
 !README.md
 !LICENSE
+!.gitattributes
 !.gitignore
+
+!screenshots/
 !screenshots/main1.png
 !screenshots/main2.png
 !screenshots/main3.png

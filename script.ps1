@@ -25,7 +25,13 @@ param(
 
     [switch]$PreferMp4,
 
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Best", "PreferMp4", "StrictMp4", "AudioOnly", "LowBandwidth")]
+    [string]$FormatStrategy = "Best",
+
     [switch]$MetadataOnly,
+
+    [switch]$MediaOnly,
 
     [switch]$IncludePlaylist,
 
@@ -61,6 +67,16 @@ param(
     [string]$DownloadSpeedLimit = "Disabled",
 
     [Parameter(Mandatory = $false)]
+    [ValidateSet("Light", "Normal", "Aggressive")]
+    [string]$RetryBehavior = "Normal",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ThrottledRate = "Disabled",
+
+    [Parameter(Mandatory = $false)]
+    [string]$HttpChunkSize = "Disabled",
+
+    [Parameter(Mandatory = $false)]
     [ValidateRange(1, 8)]
     [int]$ConcurrentFragments = 1,
 
@@ -82,15 +98,128 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("Continue", "Stop")]
-    [string]$FailureHandling = "Continue"
+    [string]$FailureHandling = "Continue",
+
+    [Parameter(Mandatory = $false)]
+    [string]$ProxyUrl,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Off", "AfterEachUrl", "AfterRun")]
+    [string]$GuiCacheMode = "AfterRun",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Full", "RunOnly")]
+    [string]$ManifestMode = "Full"
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($MetadataOnly -and $MediaOnly) {
+    throw "MetadataOnly and MediaOnly cannot both be enabled."
+}
+
+if ($MetadataOnly -and $FormatStrategy -eq "AudioOnly") {
+    throw "AudioOnly format cannot be used with MetadataOnly."
+}
+
+if ($SavePlaylistMetadata -and -not $IncludePlaylist) {
+    throw "SavePlaylistMetadata requires IncludePlaylist."
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
+    if ($ProxyUrl -notmatch '^(https?|socks4|socks5)://') {
+        throw "ProxyUrl must start with http://, https://, socks4://, or socks5://."
+    }
+
+    try {
+        $null = [System.Uri]$ProxyUrl
+    }
+    catch {
+        throw "ProxyUrl is not a valid URL."
+    }
+}
+
+$script:RunLog = ""
 
 function Write-Section {
     param([string]$Text)
     Write-Host ""
     Write-Host "========== $Text =========="
+}
+
+function Write-RunLog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Host $Message
+
+    if (-not [string]::IsNullOrWhiteSpace($script:RunLog)) {
+        Add-Content -LiteralPath $script:RunLog -Value $Message -Encoding UTF8
+    }
+}
+
+function Write-RunWarning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    Write-Warning $Message
+
+    if (-not [string]::IsNullOrWhiteSpace($script:RunLog)) {
+        Add-Content -LiteralPath $script:RunLog -Value $Message -Encoding UTF8
+    }
+}
+
+function Get-GuiCacheFileNameForPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $fingerprint = "{0}|{1}|{2}" -f $item.FullName.ToLowerInvariant(), $item.Length, $item.LastWriteTimeUtc.Ticks
+    }
+    catch {
+        $fingerprint = [System.IO.Path]::GetFullPath($Path).ToLowerInvariant()
+    }
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($fingerprint)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        return (([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToUpperInvariant()) + ".png"
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-MaskedProxyUrl {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return "disabled"
+    }
+
+    try {
+        $uri = [System.Uri]$Value
+        $hostAndPort = $uri.Host
+
+        if (-not $uri.IsDefaultPort -and $uri.Port -gt 0) {
+            $hostAndPort = "{0}:{1}" -f $uri.Host, $uri.Port
+        }
+
+        $credentialMarker = ""
+        if (-not [string]::IsNullOrWhiteSpace($uri.UserInfo)) {
+            $credentialMarker = "***@"
+        }
+
+        return "{0}://{1}{2}/" -f $uri.Scheme, $credentialMarker, $hostAndPort
+    }
+    catch {
+        return "[proxy configured]"
+    }
 }
 
 function Resolve-ToolPath {
@@ -149,8 +278,7 @@ function Get-Sha256HashCompat {
 function Get-ThumbnailFileNameForPath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    $hash = Get-Sha256HashCompat -Path $Path
-    return "$hash.png"
+    return Get-GuiCacheFileNameForPath -Path $Path
 }
 
 function Resolve-FFmpegForThumbnail {
@@ -193,7 +321,7 @@ function New-VideoThumbnailsForRecentCaptures {
 
     if ([string]::IsNullOrWhiteSpace($FFmpegExe) -or -not (Test-Path -LiteralPath $FFmpegExe -PathType Leaf)) {
         Write-Warning "FFmpeg was not found. Skipping GUI thumbnail generation."
-        Add-Content -Path $RunLog -Value "FFmpeg was not found. Skipping GUI thumbnail generation."
+        Add-Content -LiteralPath $RunLog -Value "FFmpeg was not found. Skipping GUI thumbnail generation." -Encoding UTF8
         return $false
     }
 
@@ -240,7 +368,7 @@ function New-VideoThumbnailsForRecentCaptures {
                     $line = $_.ToString()
                     if ($line) {
                         Write-Host $line
-                        Add-Content -Path $RunLog -Value $line
+                        Add-Content -LiteralPath $RunLog -Value $line -Encoding UTF8
                     }
                 }
 
@@ -248,7 +376,7 @@ function New-VideoThumbnailsForRecentCaptures {
                 $allOk = $false
                 $msg = "FFmpeg could not generate thumbnail for: $($file.FullName)"
                 Write-Warning $msg
-                Add-Content -Path $RunLog -Value $msg
+                Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
                 if (Test-Path -LiteralPath $thumbPath -PathType Leaf) {
                     Remove-Item -LiteralPath $thumbPath -Force -ErrorAction SilentlyContinue
                 }
@@ -258,7 +386,7 @@ function New-VideoThumbnailsForRecentCaptures {
             $allOk = $false
             $msg = "Thumbnail generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
-            Add-Content -Path $RunLog -Value $msg
+            Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
         }
     }
 
@@ -307,7 +435,7 @@ function New-MediaInfoForRecentCaptures {
 
     if ([string]::IsNullOrWhiteSpace($FFprobeExe) -or -not (Test-Path -LiteralPath $FFprobeExe -PathType Leaf)) {
         Write-Warning "FFprobe was not found. Skipping GUI media information generation."
-        Add-Content -Path $RunLog -Value "FFprobe was not found. Skipping GUI media information generation."
+        Add-Content -LiteralPath $RunLog -Value "FFprobe was not found. Skipping GUI media information generation." -Encoding UTF8
         return $false
     }
 
@@ -355,14 +483,14 @@ function New-MediaInfoForRecentCaptures {
                 $allOk = $false
                 $msg = "FFprobe could not generate media info for: $($file.FullName)"
                 Write-Warning $msg
-                Add-Content -Path $RunLog -Value $msg
+                Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
             }
         }
         catch {
             $allOk = $false
             $msg = "Media info generation failed for $($file.FullName): $($_.Exception.Message)"
             Write-Warning $msg
-            Add-Content -Path $RunLog -Value $msg
+            Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
         }
     }
 
@@ -458,6 +586,7 @@ $ArchiveFile = Join-Path $CaseDir "download-archive.txt"
 $GlobalFailedUrlsFile = Join-Path $OutputRoot "gui-failed-urls.txt"
 $GlobalCapturedUrlsFile = Join-Path $OutputRoot "gui-captured-urls.txt"
 $RunLog = Join-Path $LogDir ("yt-dlp-run_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$script:RunLog = $RunLog
 $HashManifest = Join-Path $ManifestDir ("sha256-manifest_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 New-Item -ItemType Directory -Path $CaseDir, $MediaDir, $LogDir, $ManifestDir, $GuiThumbnailDir, $GuiMetadataDir -Force | Out-Null
@@ -517,8 +646,26 @@ if ([string]::IsNullOrWhiteSpace($DownloadSpeedLimitClean)) {
     $DownloadSpeedLimitClean = "Disabled"
 }
 
-if ($DownloadSpeedLimitClean -ne "Disabled" -and $DownloadSpeedLimitClean -notmatch '^\d+(\.\d+)?[KMGTP]?$') {
-    throw "DownloadSpeedLimit must be Disabled or a yt-dlp --limit-rate value such as 750K, 2M, 20M, or 1.5M."
+if ($DownloadSpeedLimitClean -ne "Disabled" -and $DownloadSpeedLimitClean -notmatch '^\d+$') {
+    throw "DownloadSpeedLimit must be Disabled or an integer byte-per-second value generated by the GUI."
+}
+
+$ThrottledRateClean = $ThrottledRate.Trim()
+if ([string]::IsNullOrWhiteSpace($ThrottledRateClean)) {
+    $ThrottledRateClean = "Disabled"
+}
+
+if ($ThrottledRateClean -ne "Disabled" -and $ThrottledRateClean -notmatch '^\d+$') {
+    throw "ThrottledRate must be Disabled or an integer byte-per-second value generated by the GUI."
+}
+
+$HttpChunkSizeClean = $HttpChunkSize.Trim()
+if ([string]::IsNullOrWhiteSpace($HttpChunkSizeClean)) {
+    $HttpChunkSizeClean = "Disabled"
+}
+
+if ($HttpChunkSizeClean -ne "Disabled" -and $HttpChunkSizeClean -notmatch '^\d+$') {
+    throw "HttpChunkSize must be Disabled or an integer byte value generated by the GUI."
 }
 
 if ($ConcurrentFragments -notin @(1, 2, 4, 8)) {
@@ -560,7 +707,9 @@ Write-Section "Capture options"
 
 $OptionLines = @(
     "Prefer MP4:             $PreferMp4",
+    "Format strategy:        $FormatStrategy",
     "Metadata only:          $MetadataOnly",
+    "Media only:             $MediaOnly",
     "Include playlist:       $IncludePlaylist",
     "Write metadata JSON:    $WriteInfoJson",
     "Write source link:      $WriteSourceLink",
@@ -574,6 +723,9 @@ $OptionLines = @(
     "Date before:            $DateBeforeClean",
     "Rate limit:             $RateLimit ($SleepBaselineSeconds-$SleepMaxSeconds sec between URLs; $SleepRequestSeconds sec yt-dlp request sleep)",
     "Download speed limit:   $DownloadSpeedLimitClean",
+    "Retry behavior:         $RetryBehavior",
+    "Throttled rate:         $ThrottledRateClean",
+    "HTTP chunk size:        $HttpChunkSizeClean",
     "Concurrent fragments:   $ConcurrentFragments",
     "Keep partials:          $KeepPartials",
     "Max resolution:         $MaxResolution",
@@ -582,7 +734,10 @@ $OptionLines = @(
     "Match keywords:         $MatchKeywords",
     "Reject keywords:        $RejectKeywords",
     "Failure handling:       $FailureHandling",
-    "Impersonate target:     $ImpersonateTarget"
+    "Impersonate target:     $ImpersonateTarget",
+    "GUI display cache:      $GuiCacheMode",
+    "File manifest:          $ManifestMode",
+    "Proxy:                  $(Get-MaskedProxyUrl -Value $ProxyUrl)"
 )
 
 $OptionLines | Tee-Object -FilePath $RunLog -Append
@@ -607,6 +762,24 @@ Write-Host "Found $($Urls.Count) URL(s)."
 
 Write-Section "Starting capture"
 
+switch ($RetryBehavior) {
+    "Light" {
+        $RetryCount = "3"
+        $FragmentRetryCount = "3"
+        $RetrySleep = "exp=5:60"
+    }
+    "Aggressive" {
+        $RetryCount = "10"
+        $FragmentRetryCount = "10"
+        $RetrySleep = "exp=10:300"
+    }
+    default {
+        $RetryCount = "5"
+        $FragmentRetryCount = "5"
+        $RetrySleep = "exp=10:120"
+    }
+}
+
 $CommonArgs = @(
     "--continue",
     "--restrict-filenames",
@@ -621,9 +794,9 @@ $CommonArgs = @(
     "--no-embed-thumbnail",
     "--no-embed-subs",
 
-    "--retries", "5",
-    "--fragment-retries", "5",
-    "--retry-sleep", "exp=10:120",
+    "--retries", $RetryCount,
+    "--fragment-retries", $FragmentRetryCount,
+    "--retry-sleep", $RetrySleep,
 
     "--paths", $MediaDir,
 
@@ -634,6 +807,14 @@ $CommonArgs = @(
 
 if ($SleepRequestSeconds -gt 0) {
     $CommonArgs += @("--sleep-requests", "$SleepRequestSeconds")
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
+    $CommonArgs += @("--proxy", $ProxyUrl)
+    Write-RunLog ("Proxy: {0}" -f (Get-MaskedProxyUrl -Value $ProxyUrl))
+}
+else {
+    Write-RunLog "Proxy: disabled"
 }
 
 if ($FailureHandling -eq "Continue") {
@@ -683,61 +864,101 @@ if ($RejectTitleRegex) {
     $CommonArgs += @("--reject-title", $RejectTitleRegex)
 }
 
-if ($WriteInfoJson) {
-    $CommonArgs += "--write-info-json"
-}
-
-if ($WriteSourceLink) {
-    $CommonArgs += "--write-link"
-}
-
-if ($WriteDescription) {
-    $CommonArgs += "--write-description"
-}
-
-if ($WriteThumbnail) {
-    $CommonArgs += "--write-thumbnail"
-}
-
-if ($WriteSubs) {
-    $CommonArgs += "--write-subs"
-}
-
-if ($WriteAutoSubs) {
-    $CommonArgs += "--write-auto-subs"
-}
-
-if ($WriteComments) {
-    $CommonArgs += "--write-comments"
-}
-
-if ($SavePlaylistMetadata -and $IncludePlaylist) {
-    $CommonArgs += "--write-playlist-metafiles"
-}
-
-if ($GenerateUrlShortcuts) {
-    $CommonArgs += "--write-url-link"
-}
-
-if ($MaxResolution -ne "best" -and -not $MetadataOnly) {
-    if ($PreferMp4) {
-        $FormatSelector = "bv*[ext=mp4][height<=$MaxResolution]+ba[ext=m4a]/b[ext=mp4][height<=$MaxResolution]/bv*[height<=$MaxResolution]+ba/b[height<=$MaxResolution]/best[height<=$MaxResolution]/best"
-    }
-    else {
-        $FormatSelector = "bv*[height<=$MaxResolution]+ba/b[height<=$MaxResolution]/best[height<=$MaxResolution]/best"
+if (-not $MediaOnly) {
+    if ($WriteInfoJson) {
+        $CommonArgs += "--write-info-json"
     }
 
-    $CommonArgs += @("--format", $FormatSelector)
+    if ($WriteSourceLink) {
+        $CommonArgs += "--write-link"
+    }
+
+    if ($WriteDescription) {
+        $CommonArgs += "--write-description"
+    }
+
+    if ($WriteThumbnail) {
+        $CommonArgs += "--write-thumbnail"
+    }
+
+    if ($WriteSubs) {
+        $CommonArgs += "--write-subs"
+    }
+
+    if ($WriteAutoSubs) {
+        $CommonArgs += "--write-auto-subs"
+    }
+
+    if ($WriteComments) {
+        $CommonArgs += "--write-comments"
+    }
+
+    if ($SavePlaylistMetadata -and $IncludePlaylist) {
+        $CommonArgs += "--write-playlist-metafiles"
+    }
+
+    if ($GenerateUrlShortcuts) {
+        $CommonArgs += "--write-url-link"
+    }
 }
-elseif ($PreferMp4 -and -not $MetadataOnly) {
-    $CommonArgs += @(
-        "--format", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
-        "--merge-output-format", "mp4"
-    )
+
+$EffectiveFormatStrategy = $FormatStrategy
+if ($PreferMp4 -and $EffectiveFormatStrategy -eq "Best") {
+    $EffectiveFormatStrategy = "PreferMp4"
 }
+
+if (-not $MetadataOnly) {
+    switch ($EffectiveFormatStrategy) {
+        "PreferMp4" {
+            if ($MaxResolution -ne "best") {
+                $FormatSelector = "bv*[ext=mp4][height<=$MaxResolution]+ba[ext=m4a]/b[ext=mp4][height<=$MaxResolution]/bv*[height<=$MaxResolution]+ba/b[height<=$MaxResolution]/best[height<=$MaxResolution]/best"
+            }
+            else {
+                $FormatSelector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best"
+            }
+            $CommonArgs += @("--format", $FormatSelector, "--merge-output-format", "mp4")
+        }
+        "StrictMp4" {
+            if ($MaxResolution -ne "best") {
+                $FormatSelector = "bv*[ext=mp4][height<=$MaxResolution]+ba[ext=m4a]/b[ext=mp4][height<=$MaxResolution]"
+            }
+            else {
+                $FormatSelector = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]"
+            }
+            $CommonArgs += @("--format", $FormatSelector, "--merge-output-format", "mp4")
+        }
+        "AudioOnly" {
+            $CommonArgs += @("--format", "bestaudio/best", "--extract-audio", "--audio-format", "m4a")
+        }
+        "LowBandwidth" {
+            if ($MaxResolution -ne "best") {
+                $FormatSelector = "worst[height<=$MaxResolution]/b[height<=$MaxResolution]/worst"
+            }
+            else {
+                $FormatSelector = "worst/best"
+            }
+            $CommonArgs += @("--format", $FormatSelector)
+        }
+        default {
+            if ($MaxResolution -ne "best") {
+                $FormatSelector = "bv*[height<=$MaxResolution]+ba/b[height<=$MaxResolution]/best[height<=$MaxResolution]/best"
+                $CommonArgs += @("--format", $FormatSelector)
+            }
+        }
+    }
+}
+
 
 if ($DownloadSpeedLimitClean -ne "Disabled") {
     $CommonArgs += @("--limit-rate", $DownloadSpeedLimitClean)
+}
+
+if ($ThrottledRateClean -ne "Disabled") {
+    $CommonArgs += @("--throttled-rate", $ThrottledRateClean)
+}
+
+if ($HttpChunkSizeClean -ne "Disabled") {
+    $CommonArgs += @("--http-chunk-size", $HttpChunkSizeClean)
 }
 
 if ($ConcurrentFragments -gt 1) {
@@ -756,6 +977,39 @@ if ($ImpersonateTarget) {
     $CommonArgs += @("--impersonate", $ImpersonateTarget)
 }
 
+$RunStartTime = Get-Date
+$GuiCacheWarnings = @()
+
+function Invoke-GuiCacheGeneration {
+    param(
+        [Parameter(Mandatory = $true)]
+        [datetime]$Since
+    )
+
+    if ($GuiCacheMode -eq "Off") {
+        return @{
+            ThumbnailOk = $true
+            MediaInfoOk = $true
+        }
+    }
+
+    $thumbnailOk = New-VideoThumbnailsForRecentCaptures -MediaRoot $MediaDir -ThumbnailRoot $GuiThumbnailDir -Since $Since -FFmpegExe $FFmpegForThumbnails
+    $mediaInfoOk = New-MediaInfoForRecentCaptures -MediaRoot $MediaDir -MetadataRoot $GuiMetadataDir -Since $Since -FFprobeExe $FFprobeForMediaInfo
+
+    if (-not $thumbnailOk) {
+        $script:GuiCacheWarnings += "thumbnail"
+    }
+
+    if (-not $mediaInfoOk) {
+        $script:GuiCacheWarnings += "metadata"
+    }
+
+    return @{
+        ThumbnailOk = $thumbnailOk
+        MediaInfoOk = $mediaInfoOk
+    }
+}
+
 for ($i = 0; $i -lt $Urls.Count; $i++) {
     $Url = $Urls[$i]
 
@@ -772,7 +1026,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
             ForEach-Object {
                 $line = $_.ToString()
                 Write-Host $line
-                Add-Content -Path $RunLog -Value $line
+                Add-Content -LiteralPath $RunLog -Value $line -Encoding UTF8
             }
 
         $YtDlpExitCode = $LASTEXITCODE
@@ -781,21 +1035,41 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
         $YtDlpExitCode = 1
         $msg = "ERROR capturing URL: $Url`r`n$($_.Exception.Message)"
         Write-Warning $msg
-        Add-Content -Path $RunLog -Value $msg
+        Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
     }
     finally {
         $ErrorActionPreference = $PreviousErrorActionPreference
     }
 
-    $ThumbnailGenerationOk = New-VideoThumbnailsForRecentCaptures -MediaRoot $MediaDir -ThumbnailRoot $GuiThumbnailDir -Since $CaptureStartTime -FFmpegExe $FFmpegForThumbnails
-    $MediaInfoGenerationOk = New-MediaInfoForRecentCaptures -MediaRoot $MediaDir -MetadataRoot $GuiMetadataDir -Since $CaptureStartTime -FFprobeExe $FFprobeForMediaInfo
+    $ThumbnailGenerationOk = $true
+    $MediaInfoGenerationOk = $true
 
-    if ($YtDlpExitCode -eq 0 -and $ThumbnailGenerationOk -and $MediaInfoGenerationOk) {
-        Add-GuiUrlRecord -Path $GlobalCapturedUrlsFile -Status "captured" -CaseName $SafeCaseName -Url $Url -Detail "exit=0"
+    if ($GuiCacheMode -eq "AfterEachUrl") {
+        $cacheResult = Invoke-GuiCacheGeneration -Since $CaptureStartTime
+        $ThumbnailGenerationOk = [bool]$cacheResult.ThumbnailOk
+        $MediaInfoGenerationOk = [bool]$cacheResult.MediaInfoOk
+    }
+
+    if ($YtDlpExitCode -eq 0) {
+        $cacheDetail = if ($GuiCacheMode -eq "Off") {
+            "local-gui-cache=off"
+        }
+        elseif ($GuiCacheMode -eq "AfterRun") {
+            "local-gui-cache=after-run"
+        }
+        elseif ($ThumbnailGenerationOk -and $MediaInfoGenerationOk) {
+            "local-gui-cache=ok"
+        }
+        else {
+            "local-gui-cache=warning; thumbnail=$ThumbnailGenerationOk; metadata=$MediaInfoGenerationOk"
+        }
+
+        $successDetail = if ($MediaOnly) { "exit=0; media-only; $cacheDetail" } else { "exit=0; $cacheDetail" }
+        Add-GuiUrlRecord -Path $GlobalCapturedUrlsFile -Status "captured" -CaseName $SafeCaseName -Url $Url -Detail $successDetail
         Write-Host ("GUI_QUEUE_URL_COMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
     }
     else {
-        $failureDetail = "exit=$YtDlpExitCode; thumbnail=$ThumbnailGenerationOk; metadata=$MediaInfoGenerationOk"
+        $failureDetail = "exit=$YtDlpExitCode"
         Add-GuiUrlRecord -Path $GlobalFailedUrlsFile -Status "failed" -CaseName $SafeCaseName -Url $Url -Detail $failureDetail
         Write-Host ("GUI_QUEUE_URL_INCOMPLETE`t{0}`t{1}`t{2}" -f ($i + 1), $Urls.Count, $Url)
     }
@@ -803,7 +1077,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     if ($YtDlpExitCode -ne 0) {
         $msg = "yt-dlp exited with code $YtDlpExitCode for URL: $Url"
         Write-Warning $msg
-        Add-Content -Path $RunLog -Value $msg
+        Add-Content -LiteralPath $RunLog -Value $msg -Encoding UTF8
 
         if ($FailureHandling -eq "Stop") {
             Write-Warning "Stopping capture because FailureHandling is set to Stop."
@@ -818,7 +1092,21 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     }
 }
 
+if ($GuiCacheMode -eq "AfterRun") {
+    Write-Section "Preparing Case Browser display cache"
+    $cacheResult = Invoke-GuiCacheGeneration -Since $RunStartTime
+    if (-not $cacheResult.ThumbnailOk -or -not $cacheResult.MediaInfoOk) {
+        Write-RunWarning "Case Browser display cache completed with warnings. Capture success is based on yt-dlp results."
+    }
+}
+elseif ($GuiCacheMode -eq "Off") {
+    Write-Section "Preparing Case Browser display cache"
+    Write-RunLog "Case Browser display cache generation is off for this run."
+}
+
 Write-Section "Hashing captured files"
+
+$manifestSince = if ($ManifestMode -eq "RunOnly") { $RunStartTime } else { [datetime]::MinValue }
 
 $manifestRows = foreach ($file in Get-ChildItem $CaseDir -Recurse -File) {
     if ($file.FullName -eq $HashManifest) {
@@ -833,6 +1121,10 @@ $manifestRows = foreach ($file in Get-ChildItem $CaseDir -Recurse -File) {
         continue
     }
 
+    if ($file.LastWriteTime -lt $manifestSince) {
+        continue
+    }
+
     [PSCustomObject]@{
         Algorithm = "SHA256"
         Hash      = Get-Sha256HashCompat -Path $file.FullName
@@ -842,13 +1134,13 @@ $manifestRows = foreach ($file in Get-ChildItem $CaseDir -Recurse -File) {
 
 $manifestRows | Export-Csv $HashManifest -NoTypeInformation
 
-Write-Host "Hash manifest written to: $HashManifest"
+Write-RunLog "Hash manifest written to: $HashManifest"
 
 Write-Section "Done"
 
-Write-Host "Case folder:      $CaseDir"
-Write-Host "Run log:          $RunLog"
-Write-Host "Download archive: $ArchiveFile"
-Write-Host "Failed URLs:      $GlobalFailedUrlsFile"
-Write-Host "Captured URLs:    $GlobalCapturedUrlsFile"
-Write-Host "SHA256 manifest:  $HashManifest"
+Write-RunLog "Case folder:      $CaseDir"
+Write-RunLog "Run log:          $RunLog"
+Write-RunLog "Download archive: $ArchiveFile"
+Write-RunLog "Failed URLs:      $GlobalFailedUrlsFile"
+Write-RunLog "Captured URLs:    $GlobalCapturedUrlsFile"
+Write-RunLog "SHA256 manifest:  $HashManifest"
