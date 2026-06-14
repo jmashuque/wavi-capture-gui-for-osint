@@ -101,13 +101,34 @@ The following components must be present or provided separately:
 
 - Python
 - PowerShell
+- the Python GUI script, `gui.py`
+- the PowerShell capture script, `script.ps1`
 - `yt-dlp.exe`
-- Deno, when required by the chosen yt-dlp workflow
-- FFmpeg and FFprobe, when media merging, thumbnails, or media details are needed
-- an optional cookies file, if the capture workflow needs browser cookies
-- an optional proxy or VPN path, if required by the organization or investigation
+- `ffmpeg.exe`
+- `ffprobe.exe`
+- `deno.exe`
 
-The app does not install these components.
+The GUI script and PowerShell script should stay together in the same portable app folder unless the paths are intentionally changed in the GUI.
+
+Place `deno.exe` in the same folder as `yt-dlp.exe`. From the source repos/build packages, keep only the required binaries for this app: `yt-dlp.exe`, `deno.exe`, `ffmpeg.exe`, and `ffprobe.exe`. Other bundled files can be omitted or deleted after staging the needed executables.
+
+Python may require administrative privileges to install, depending on the organization's software installation policies. For standard Windows users, use an organization-approved Python install method where permitted by policy.
+
+Windows includes Windows PowerShell, which is sufficient for the included `script.ps1`; PowerShell 7 is not required.
+
+Recommended source pages:
+
+- Python downloads: <https://www.python.org/downloads/windows/>
+- Microsoft Store - Python: <https://apps.microsoft.com/detail/9PNRBTZXMB4Z>
+- Microsoft Store - Python Install Manager: <https://apps.microsoft.com/detail/9NQ7512CXL7T>
+- yt-dlp releases: <https://github.com/yt-dlp/yt-dlp/releases>
+- yt-dlp nightly builds: <https://github.com/yt-dlp/yt-dlp-nightly-builds/releases>
+- Deno releases: <https://github.com/denoland/deno/releases>
+- FFmpeg Windows builds by Gyan.dev: <https://www.gyan.dev/ffmpeg/builds/>
+
+All required binaries, including yt-dlp, FFmpeg/FFprobe, and Deno, should be official releases whenever available. They should be downloaded only from trusted official sources and staged by IT or another approved process.
+
+For FFmpeg, use the Gyan.dev **release essentials** build unless you specifically need the larger full build. The essentials release includes the expected `ffmpeg.exe` and `ffprobe.exe` tools used by this app.
 
 ## Basic Usage
 
