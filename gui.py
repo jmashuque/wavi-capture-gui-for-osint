@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
-APP_VERSION = "v0.2026.0614"
+APP_VERSION = "v0.2026.0616"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_HEIGHT_BASE = 950

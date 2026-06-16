@@ -353,6 +353,15 @@ The app does not automate website logins or collect credentials.
 
 ## Changelog
 
+### v0.2026.0616 - Playlist Preview, URL Persistence, and Case Browser Polish
+
+- Added the **Playlist Preview** tab with manual checked/selected preview scans, request pacing, rate-limit/backoff warnings, playlist/item checkmarks, playlist-split queueing, JSON export, and context menus.
+- Added `%playlist%` case-name tag support and automatic playlist-title case naming for Playlist Preview queue jobs.
+- Added app-level **URL Box Persistence**, silent Input File auto-population when the URL box is empty, and `--fresh` cleanup for persisted URL-box state.
+- Changed default app startup behavior so **Check VPN** and **Use Cookies File** are disabled by default.
+- Improved the **Case Browser** with better filename wrapping and dynamic file-card columns that reflow with available pane width.
+- Refreshed README usage sections around the four main tabs while keeping prior changelog entries intact.
+
 ### v0.2026.0614 - Tabs, Presets, Proxy, and Output Records
 
 - Added a bottom-tab workflow for **Capture**, **Job Queue**, and **Case Browser**, with Case Browser loading the selected Output Root in the background and supporting Domain sort.
