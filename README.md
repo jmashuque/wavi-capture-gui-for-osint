@@ -14,14 +14,14 @@ A lightweight, portable Windows GUI for running an approved yt-dlp capture workf
 - [Basic Usage](#basic-usage)
   - [Capture Tab](#capture-tab)
   - [Job Queue Tab](#job-queue-tab)
-  - [Playlist Preview Tab](#playlist-preview-tab)
+  - [URL Preview Tab](#url-preview-tab)
   - [Case Browser Tab](#case-browser-tab)
 - [Advanced Usage](#advanced-usage)
   - [Capture Tab: Case Names and URL Sources](#capture-tab-case-names-and-url-sources)
   - [Capture Tab: Capture, Metadata, Pacing, and Advanced Options](#capture-tab-capture-metadata-pacing-and-advanced-options)
   - [Capture Tab: Domain Presets and Proxy Options](#capture-tab-domain-presets-and-proxy-options)
   - [Job Queue Tab: Queue Management](#job-queue-tab-queue-management)
-  - [Playlist Preview Tab: Playlist Review and Queueing](#playlist-preview-tab-playlist-review-and-queueing)
+  - [URL Preview Tab: Metadata, Thumbnails, and Queueing](#url-preview-tab-metadata-thumbnails-and-queueing)
   - [Case Browser Tab: Review and Verification](#case-browser-tab-review-and-verification)
   - [App Update Checks](#app-update-checks)
 - [Profiles and Settings](#profiles-and-settings)
@@ -33,13 +33,13 @@ A lightweight, portable Windows GUI for running an approved yt-dlp capture workf
 
 `yt-dlp GUI for OSINT` is a portable Windows interface for running a consistent local capture workflow with `yt-dlp` and a companion PowerShell script.
 
-The app is intentionally narrow in scope. It helps prepare URL lists, run captures, queue work, preview playlists, and review case output. It does not install tools, make authorization decisions, bypass security controls, or analyze evidence.
+The app is intentionally narrow in scope. It helps prepare URL lists, run captures, queue work, preview URL metadata and playlist/context entries, optionally cache preview thumbnails, and review case output. It does not bundle tools, automatically install dependencies, make authorization decisions, bypass security controls, or analyze evidence.
 
 The current workflow uses four tabs:
 
 - **Capture**: capture setup, URL/input handling, options, preflight, and direct capture
 - **Job Queue**: staged jobs, checked-job starts, persistence, interruption recovery, and queue progress
-- **Playlist Preview**: playlist source checks, playlist item review, preview pacing, and playlist-derived queue jobs
+- **URL Preview**: URL metadata preview, thumbnail preview, playlist/context item review, JSON export, and preview-derived start/queue actions
 - **Case Browser**: local case review, file filtering/sorting, thumbnails/media details, and SHA256 verification
 
 ## Screenshots
@@ -53,7 +53,7 @@ The current workflow uses four tabs:
 </p>
 
 <p align="center">
-  <img src="/screenshots/main3.png" alt="playlist preview tab" width="750">
+  <img src="/screenshots/main3.png" alt="url preview tab" width="750">
 </p>
 
 <p align="center">
@@ -72,12 +72,13 @@ The app helps run a repeatable local capture workflow around approved tools.
 
 Key capabilities include:
 
-- preparing pasted URLs or one or more Input Files
+- preparing pasted URLs or one or more Input File(s)
 - running preflight checks for local tools and paths
 - capturing media, metadata, sidecar artifacts, or embedded metadata
-- applying playlist, archive, pacing, retry, format, keyword, and failure-handling options
+- applying playlist, case archive, optional universal archive, pacing, retry, format, keyword, and failure-handling options
 - staging and running queue jobs
-- previewing playlists before capture
+- previewing URL metadata, thumbnails, and playlist/context entries before capture
+- starting, queueing, exporting, or applying filters from URL Preview results
 - applying domain-based capture presets
 - passing optional proxy settings to `yt-dlp`
 - organizing output into case folders
@@ -90,11 +91,13 @@ The app is not a downloader bundle, browser automation system, security bypass, 
 
 Important limits:
 
-- it does not include or install `yt-dlp`, FFmpeg/FFprobe, Deno, Python, or PowerShell
-- it does not bypass EDR/AV, ASR, firewall, proxy, allow-listing, website restrictions, login requirements, paywalls, or rate limits
+- it does not bundle `yt-dlp`, FFmpeg/FFprobe, Deno, Python, or PowerShell, and it does not automatically install dependencies; user-triggered update helpers can update existing local yt-dlp or Deno executables
+- it does not bypass EDR/AV, ASR, firewall, proxy, allow-listing, website restrictions, login requirements, paywalls, bot challenges, or rate limits
 - it does not decide whether a capture is legal, policy-approved, proportionate, or in scope
 - it does not collect passwords, automate sign-ins, solve challenges, or operate a browser for the user
 - it does not guarantee support for any source platform
+- it does not guarantee that URL Preview metadata, titles, thumbnails, uploader names, playlist relationships, or availability fields are complete, current, or authentic
+- it does not guarantee thumbnail availability, even when a media URL itself is valid
 - it does not make proxy/VPN traffic anonymous or invisible to endpoint, network, or administrative controls
 - it does not identify people, assess authenticity, classify evidence, summarize media, or determine evidentiary value
 - it does not upload, sync, retain, or archive cases to external services
@@ -109,14 +112,14 @@ Recommended assumptions:
 - stage approved builds of `yt-dlp`, FFmpeg/FFprobe, Deno, and Python separately
 - expect endpoint protection to inspect or block newly introduced binaries until approved
 - keep case folders local during capture, then move or archive through approved processes
-- treat cookies, proxy settings, URL lists, and case paths as sensitive operational data
+- treat cookies, proxy settings, URL lists, case paths, download archives, URL Preview JSON exports, cached thumbnails, and preview metadata as sensitive operational data
 
 ## Required Components
 
 The following components must be present or provided separately:
 
-- Python
-- PowerShell
+- Python 3 for the Tkinter GUI
+- Windows PowerShell for `script.ps1`
 - the Python GUI script, `gui.py`
 - the PowerShell capture script, `script.ps1`
 - `yt-dlp.exe`
@@ -144,12 +147,19 @@ Use official releases whenever possible. For FFmpeg, the Gyan.dev **release esse
 
 ## Basic Usage
 
-1. Place the app in a local non-synced folder.
-2. Run `gui.py`.
+### Recommended Workflow for Non-Technical Users
+
+For normal captures, keep the defaults and use this simple flow:
+
+1. Place the app in a local non-synced folder and run `gui.py`.
    - If needed, open a terminal in the app folder and run `python gui.py` or `py gui.py`.
-   - To start from a clean app state, run `python gui.py --fresh`.
-3. Confirm paths for `script.ps1`, `yt-dlp.exe`, Output Root, and FFmpeg folder.
-4. Use the tabs below for capture, queueing, playlist review, and case review.
+   - To start from a clean app state, run `python gui.py --fresh`; this also clears the temporary Output Root `.gui-cache` folder.
+2. Confirm paths for `script.ps1`, `yt-dlp.exe`, Output Root, and FFmpeg folder.
+3. Paste URLs into the URL box, then confirm the Case Name and Output Root.
+4. Run **Preflight Check**, then click **Start Capture**.
+5. Use the Case Browser to review the completed case.
+
+Only change advanced options, cookies, VPN checks, URL Preview settings, or archive settings when the investigation specifically requires them. Use the tabs below for capture, queueing, URL preview, and case review.
 
 ### Capture Tab
 
@@ -159,7 +169,7 @@ Typical flow:
 
 1. Set the Output Root.
 2. Enter a case name or case-name template.
-3. Paste URLs or select one or more Input Files.
+3. Paste URLs or select one or more Input File(s).
 4. Set capture options only as needed.
 5. Run **Preflight Check**.
 6. Start the capture directly or add it to the Job Queue.
@@ -168,7 +178,7 @@ Notes:
 
 - Cookies File use is disabled by default.
 - Check VPN is disabled by default.
-- If the URL box is empty, valid Input Files can silently populate it.
+- If the URL box is empty, valid Input File(s) can silently populate it.
 - If URL Box Persistence is enabled, saved URL box text loads first on startup.
 
 ### Job Queue Tab
@@ -177,25 +187,29 @@ Use this tab when captures should be staged, split, resumed, or run in batches.
 
 Typical flow:
 
-1. Add work from the Capture tab or Playlist Preview tab.
+1. Add work from the Capture tab or URL Preview tab.
 2. Check the jobs to run.
-3. Start selected jobs or run the full queue.
+3. Start checked jobs or run the full queue.
 4. Review status, failures, interruptions, and completed work.
 
-Queued jobs keep their own capture settings. App-level proxy settings are evaluated when the job runs.
+Queued jobs keep their own capture settings. App-level settings such as Proxy Options and Universal Download Archive are evaluated when the job runs.
 
-### Playlist Preview Tab
+### URL Preview Tab
 
-Use this tab to inspect playlist-like URLs before capture.
+Use this tab to inspect URLs before capture. It supports regular URLs and playlist, channel, or context-style URLs.
 
 Typical flow:
 
-1. Let the tab load URLs from the current URL box or selected Input Files.
-2. Check URL rows and start a preview scan.
-3. Review detected playlists and item rows.
-4. Queue checked playlists or checked items as needed.
+1. Let the tab load URLs from the current URL box or selected Input File(s).
+2. Use the **Preview** checkmarks to choose which URLs should be queried by **Preview Checked**.
+3. Use the **Include** checkmarks to choose which rows should be used by **Start Included** or **Queue Included**.
+4. Use **Preview All**, **Start All**, or **Queue All** when every top-level URL row should be acted on regardless of checkmarks.
+5. Select a previewed regular URL to review its thumbnail and metadata.
+6. Select a playlist/context URL to review its thumbnail/metadata and its available item rows. Once playlist/context data is confirmed, top-level Start/Queue actions use those item URLs instead of only the source playlist URL.
+7. Right-click a highlighted URL row to preview, start, queue, open, copy, or export only that highlighted row.
+8. Start, queue, export, copy, or apply playlist-item filters as needed.
 
-Previewing makes source requests through `yt-dlp` but does not download media.
+Previewing makes source requests through `yt-dlp` but does not download media. Thumbnail modes may create cached thumbnail files.
 
 ### Case Browser Tab
 
@@ -221,11 +235,13 @@ Useful tags include:
 - date/time tags
 - URL-domain tags
 - preset-related tags
-- `%playlist%` for Playlist Preview queue jobs
+- `%playlist%` for URL Preview playlist/context captures and queue jobs
+
+The `%playlist%` tag resolves from the URL Preview playlist/context title when playlist or context metadata is available. When URL Preview starts or queues a playlist/context source, the app automatically appends `%playlist%` to the case-name template for that run or queued job if the template does not already include it.
 
 The default case name is `Case-%datetime%`.
 
-The URL box supports pasted URLs and one or more Input Files. Multiple Input Files are stored as a semicolon-separated list.
+The URL box supports pasted URLs and one or more Input File(s). Multiple Input File(s) are stored as a semicolon-separated list.
 
 URL box helpers can normalize, validate, deduplicate, group, summarize, copy, save, or clear URL text. Failed and captured URL tools use app-level URL history files under the Output Root.
 
@@ -246,6 +262,16 @@ Capture modes:
 - **Metadata/artifacts only**: supported artifacts without media download
 
 Output Records controls Case Browser cache timing and file manifest scope.
+
+Archive behavior:
+
+- **Use case download archive** uses the resolved case folder's `download-archive.txt` by default and passes archive tracking to yt-dlp.
+- **Ignore archive for this run** does not use download archive history but still avoids overwriting exact existing files.
+- **Force re-capture** requests overwrite/re-capture behavior.
+- **Universal Download Archive** is an optional app-level Settings menu feature. It applies only when Archive Mode is **Use**.
+- When Universal Download Archive is enabled, yt-dlp uses `universal-download-archive.txt` for skip/write behavior while the current case archive is still maintained.
+- Items skipped because they already exist in the universal archive are logged during capture and summarized under the case `manifests` folder as JSON/CSV. Direct capture and queue summaries also show those skips when applicable.
+- **Stop when archived item is found** uses the active archive. With Universal Download Archive enabled, it can stop on entries captured in earlier cases.
 
 ### Capture Tab: Domain Presets and Proxy Options
 
@@ -269,23 +295,48 @@ The queue supports:
 
 Concurrent queue capture is available, with domain-collision checks to reduce accidental simultaneous captures against the same domain.
 
-### Playlist Preview Tab: Playlist Review and Queueing
+URL Preview queue actions pass playlist/context titles into queued jobs when metadata is available. Top-level URL Preview queue actions create one queued job per top-level row being queued. If that row has confirmed playlist/context metadata with extracted item URLs, the queued job contains those playlist/context item URLs under the playlist-tagged case name instead of only the source playlist URL. **Queue All** queues all usable top-level rows. **Queue Included** queues rows with Include checked. Playlist/context item queue actions remain grouped into one queued job for the selected playlist/context and use a single `%playlist%` value.
 
-The tab silently parses current URL sources so the list is ready when selected.
+### URL Preview Tab: Metadata, Thumbnails, and Queueing
 
-The three lists use checkmarks:
+The tab silently parses current URL sources so the top URL list is ready when selected. The URL box takes priority; if it is empty, selected Input File(s) are used.
 
-- **URLs to Preview** controls which source URLs are queried
-- **Playlists Found** controls playlist-level copy and queue actions
-- **Playlist Items** controls item-level copy, URL-box, split, queue, and playlist-item-range actions
+URL Preview uses a top-level URL list and a context-sensitive lower panel. The top list has separate checkmarks:
 
-Preview pacing presets add delay and jitter between preview requests. The app warns before querying more than 10 preview URLs and stops when output suggests rate limiting, bot challenges, or temporary blocking.
+- **Preview** controls which rows are queried by **Preview Checked**.
+- **Include** controls which rows are used by **Start Included** and **Queue Included**.
+- **All** actions act on all usable top-level rows regardless of checkmark state.
 
-Playlist Preview queue actions automatically append `%playlist%` to the queued case template when the template does not already include it.
+Top-level actions include **Preview All**, **Preview Checked**, **Start All**, **Start Included**, **Queue All**, **Queue Included**, **Stop**, and **Export JSON**. Right-click a highlighted row to preview, start, queue, open, copy, or export only that row.
+
+When a previewed playlist/channel/context row has extracted item URLs, Start and Queue actions use those item URLs instead of only the source playlist URL. Top-level queue actions create one job per top-level row. Playlist/context item actions group included item URLs into one playlist-tagged job.
+
+The lower **Selected URL Context** area changes based on selection:
+
+- regular URLs show **Thumbnail** and **Metadata** tabs
+- playlist/channel/context rows show those tabs plus a playlist/context item list
+- selecting a playlist/context item updates the Thumbnail and Metadata tabs for that item
+
+Playlist/context item actions include **Start All Items**, **Start Included Items**, **Queue All Items**, **Queue Included Items**, **Copy Included URLs**, **Load Included URLs**, **Append Included URLs**, **Set Playlist Items**, **Include All**, and **Exclude All**. Included item actions use the item **Include** checkmarks; right-click a highlighted item for single-item actions.
+
+**Load Included URLs** replaces the URL box with individual included playlist/context item URLs. **Append Included URLs** appends them to the existing URL box. **Set Playlist Items** keeps the original playlist workflow and writes included item indexes into Capture tab playlist item filtering.
+
+The collapsible **Preview Options** panel opens from the bottom-left of the URL Preview tab. It includes preview pacing, thumbnail mode, thumbnail rate limiting, cache mode, playlist mode, max items, and timeout seconds.
+
+Preview pacing adds delay and jitter between preview metadata requests. The app warns before querying more than 10 preview URLs and stops when output suggests rate limiting, bot challenges, or temporary blocking.
+
+Thumbnail fetching is best-effort and may fail even when the media URL is valid. **Rate limit thumbnails** uses post-fetch cooldowns and shows a counter in the Thumbnail tab when active. Changing selection updates the active thumbnail target without queueing multiple thumbnail requests.
+
+URL Preview cache has two modes:
+
+- **Temporary**: stores preview cache under the resolved case folder. If the final case folder is not known yet, temporary files are staged under `<OutputRoot>\.gui-cache` and cleared after they are copied into the resolved case cache.
+- **Reuse cached thumbnails**: stores reusable thumbnail cache under `<OutputRoot>\.gui-cache\url-preview-persistent`. This cache is outside case files and is cleared by `--fresh`.
+
+URL Preview metadata depends on yt-dlp extractor behavior. Fast playlist scans may provide limited per-item metadata, while deep metadata mode can be slower and make more source requests.
 
 ### Case Browser Tab: Review and Verification
 
-The Case Browser loads the selected Output Root in the background.
+The Case Browser loads the selected Output Root in the background. Case-level `.gui-cache` folders are rebuildable GUI cache, not case evidence; they are hidden from Case Browser listings and excluded from verification/manifests. Folders that only contain GUI cache, such as preview-only folders with `manifests\.gui-cache`, are not shown as cases. Output Root `.gui-cache` is temporary and cleared by `--fresh`.
 
 It supports:
 
@@ -308,7 +359,7 @@ The app update checker opens the latest app release page for manual download. It
 
 yt-dlp updates are separate from normal capture runs and use the selected local `yt-dlp.exe`.
 
-Deno updates can be started from **Tools > Update Deno**, which runs `deno upgrade` against the detected local Deno executable. The app warns first because newer Deno builds may be incompatible or blocked by endpoint controls.
+Deno updates can be started from **Tools > Update Deno**, which runs `deno upgrade` against the detected local Deno executable. The app warns first because newer Deno builds may be incompatible or blocked by endpoint controls. Deno should still be staged beside `yt-dlp.exe` for this portable workflow; script-level PATH fallback is best-effort only.
 
 ## Profiles and Settings
 
@@ -316,16 +367,27 @@ The app stores settings, profiles, domain presets, and app-level settings in `gu
 
 The **Default** profile is loaded on startup. Custom profiles can be created, loaded, saved, and deleted from the Profile menu.
 
-Profile-level settings include capture paths, capture options, metadata options, pacing options, advanced options, URL/input settings, and selected VPN adapter.
+Profile-level settings include capture paths, capture options, metadata options, pacing options, advanced options, URL/input settings, selected VPN adapter, and URL Preview settings.
 
-App-level settings include Delete Cookies on Exit, Check VPN, Dark Mode, Job Persistence, URL Box Persistence, Case Browser preferences, and Proxy Options.
+Profile-level URL Preview settings include:
+
+- preview pacing
+- thumbnail mode
+- thumbnail rate limiting
+- URL Preview cache mode
+- playlist mode
+- max playlist items
+- preview timeout
+
+App-level settings include Delete Cookies on Exit, Check VPN, Dark Mode, Job Persistence, URL Box Persistence, Universal Download Archive, Case Browser preferences, and Proxy Options. Universal Download Archive applies only when Archive Mode is **Use**.
 
 Other app-root state files:
 
 - `gui-jobs.json` for persisted queue jobs
 - `gui-url-box.txt` for URL Box Persistence, when enabled
+- `universal-download-archive.txt` for the app-level universal download archive, when enabled and used
 
-`python gui.py --fresh` deletes `gui-settings.json`, `gui-jobs.json`, `gui-url-box.txt`, and app-level captured/failed URL history files. It does not delete case folders, media files, cookies, binaries, or scripts.
+`python gui.py --fresh` deletes `gui-settings.json`, `gui-jobs.json`, `gui-url-box.txt`, `universal-download-archive.txt`, app-level captured/failed URL history files, and the temporary Output Root `.gui-cache` folder. It does not delete case folders, case-level `.gui-cache` folders, media files, cookies, binaries, or scripts.
 
 ## Cookies Handling
 
@@ -333,8 +395,11 @@ Cookies File use is disabled by default.
 
 Cookie-related notes:
 
-- cookies are not required for every capture
+- cookies are not required for every capture or preview
 - cookies are sensitive operational data
+- URL Preview metadata requests can use the selected Cookies File when Cookies File use is enabled
+- Reliable thumbnail fallback through yt-dlp can also benefit from the same cookie/session context
+- cookie use does not guarantee access to private, authenticated, restricted, or challenge-protected content
 - exported cookies can optionally be applied to the main Cookies File field
 - local cookie encrypt/decrypt helpers are available
 - Delete Cookies on Exit can remove the selected cookies file when the app closes
@@ -344,14 +409,26 @@ The app does not automate website logins or collect credentials.
 ## Limitations
 
 - Site support depends on the installed `yt-dlp` build and the source platform.
+- URL Preview depends on the installed `yt-dlp` build and source extractor behavior. Fast scans may return limited metadata, while deep scans and reliable thumbnail mode can be slower and make more source requests.
+- Thumbnail fetching is best-effort and may fail even when the media URL is valid.
+- Large playlists and very large cases can take time to preview, render, cache, export, capture, scan, or verify.
+- Universal Download Archive skip behavior applies only when the setting is enabled and Archive Mode is **Use**. It is an app-level history file, not a case evidence artifact. When enabled, archive-based skipping and Stop when archived item is found can reflect captures from other cases. Universal archive skips are logged and summarized, but the app does not yet maintain a universal capture index or copy prior case media into new cases.
 - Browser impersonation targets depend on the installed `yt-dlp` build.
 - Proxy and VPN behavior depends on local policy and routing.
 - Case Browser thumbnails and media details require FFmpeg/FFprobe.
-- Very large cases can take time to scan, render, cache, or verify.
 - Manifest verification checks file hashes only; it does not assess content authenticity or legal sufficiency.
 - The app is not a replacement for authorization, evidence-handling policy, or analyst judgment.
 
 ## Changelog
+
+### v0.2026.0621 - URL Preview, Universal Archive, and Cache Handling
+
+- Replaced **Playlist Preview** with a broader **URL Preview** workflow for metadata preview, thumbnail preview, playlist/context item review, JSON export, and preview-derived start/queue actions.
+- Added profile-level URL Preview options for preview pacing, thumbnail mode, thumbnail rate limiting, cache mode, playlist mode, max items, and preview timeout.
+- Added playlist-aware URL Preview start/queue behavior, including expansion of confirmed playlist/context rows to extracted item URLs and `%playlist%` case-name support.
+- Added optional **Universal Download Archive** skip logging and per-run skip summaries for direct captures and queued jobs.
+- Added temporary and reusable URL Preview thumbnail cache modes, with Output Root `.gui-cache` treated as temporary and cleared by `--fresh`.
+- Improved cache handling so case-level `.gui-cache` folders are hidden from Case Browser and excluded from verification/manifests.
 
 ### v0.2026.0616 - Playlist Preview, URL Persistence, and Case Browser Polish
 

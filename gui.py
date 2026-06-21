@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "yt-dlp GUI for OSINT"
-APP_VERSION = "v0.2026.0616"
+APP_VERSION = "v0.2026.0621"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/ytdlp-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_HEIGHT_BASE = 950
@@ -39,13 +39,14 @@ APP_WINDOW_MIN_HEIGHT_WITH_VPN = 900
 URL_ROW_MIN_HEIGHT = 215
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/ytdlp-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 21
+SETTINGS_SCHEMA_VERSION = 25
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
 JOBS_FILE = os.path.join(ROOT, "gui-jobs.json")
 URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-url-box.txt")
+UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-download-archive.txt")
 JOBS_FILE_VERSION = 2
 DEFAULT_PROFILE_NAME = "Default"
 
@@ -117,6 +118,13 @@ DEFAULTS = {
     "split_queue_mode": "per_group",
     "split_queue_urls_per_group": "10",
     "split_queue_group_count": "2",
+    "url_preview_pacing": "10 sec + up to 15 sec jitter",
+    "url_preview_thumbnail_mode": "Fast",
+    "url_preview_rate_limit_thumbnails": True,
+    "url_preview_cache_mode": "Temporary",
+    "url_preview_playlist_mode": "Fast playlist scan",
+    "url_preview_max_playlist_items": "50",
+    "url_preview_timeout": "120",
 }
 
 DOWNLOAD_SPEED_MIN_BYTES = 1024
@@ -193,6 +201,7 @@ APP_SETTINGS_DEFAULTS = {
     "case_browser_icon_scale": "Medium",
     "job_persistence": True,
     "url_box_persistence": False,
+    "universal_archive_enabled": False,
     "proxy_protocol": "None",
     "proxy_address": "",
     "proxy_port": "",
@@ -242,6 +251,7 @@ playlist_preview_candidate_urls = []
 playlist_preview_source_signature = ""
 playlist_preview_loaded_signature = ""
 playlist_preview_tab_loaded = False
+url_preview_pending_playlist_name = ""
 url_box_autoload_ready = False
 
 FRESH_STARTUP_MESSAGES = []
@@ -289,21 +299,25 @@ def run_fresh_startup_cleanup_if_requested():
     if not fresh_arg_requested():
         return []
 
-    targets = [
+    file_targets = [
         SETTINGS_FILE,
         JOBS_FILE,
         URL_BOX_PERSISTENCE_FILE,
+        UNIVERSAL_ARCHIVE_FILE,
     ]
+    dir_targets = []
 
     for output_root in collect_fresh_output_roots_from_settings():
-        targets.append(os.path.join(output_root, "gui-captured-urls.txt"))
-        targets.append(os.path.join(output_root, "gui-failed-urls.txt"))
+        file_targets.append(os.path.join(output_root, "gui-captured-urls.txt"))
+        file_targets.append(os.path.join(output_root, "gui-failed-urls.txt"))
+        dir_targets.append(os.path.join(output_root, ".gui-cache"))
 
     seen = set()
-    deleted = []
+    deleted_files = []
+    deleted_dirs = []
     failed = []
 
-    for target in targets:
+    for target in file_targets:
         try:
             normalized = os.path.abspath(target)
         except Exception:
@@ -322,25 +336,52 @@ def run_fresh_startup_cleanup_if_requested():
 
         try:
             os.remove(normalized)
-            deleted.append(normalized)
+            deleted_files.append(normalized)
+        except Exception as e:
+            failed.append((normalized, str(e)))
+
+    for target in dir_targets:
+        try:
+            normalized = os.path.abspath(target)
+        except Exception:
+            normalized = str(target)
+
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+
+        if not os.path.exists(normalized):
+            continue
+
+        if not os.path.isdir(normalized):
+            failed.append((normalized, "not a directory"))
+            continue
+
+        try:
+            shutil.rmtree(normalized)
+            deleted_dirs.append(normalized)
         except Exception as e:
             failed.append((normalized, str(e)))
 
     messages = [
         "--fresh was passed. Startup cleanup ran before settings/jobs were loaded.",
-        f"Deleted {len(deleted)} file(s).",
+        f"Deleted {len(deleted_files)} file(s) and {len(deleted_dirs)} output-root cache folder(s).",
     ]
 
-    if deleted:
-        messages.append("Deleted:")
-        messages.extend(f"- {path}" for path in deleted)
+    if deleted_files:
+        messages.append("Deleted files:")
+        messages.extend(f"- {path}" for path in deleted_files)
+
+    if deleted_dirs:
+        messages.append("Deleted output-root cache folders:")
+        messages.extend(f"- {path}" for path in deleted_dirs)
 
     if failed:
         messages.append("Failed:")
         messages.extend(f"- {path}: {error}" for path, error in failed)
 
-    if not deleted and not failed:
-        messages.append("No existing settings/jobs/captured/failed files were found to delete.")
+    if not deleted_files and not deleted_dirs and not failed:
+        messages.append("No existing settings/jobs/captured/failed files or output-root cache folders were found to delete.")
 
     return messages
 
@@ -976,6 +1017,18 @@ def get_resolved_case_name(now=None, domains=None, presets=None, playlist=None):
     return safe_case_name(rendered)
 
 
+def set_url_preview_pending_playlist_name(value):
+    global url_preview_pending_playlist_name
+    url_preview_pending_playlist_name = str(value or "").strip()
+
+
+def consume_url_preview_pending_playlist_name():
+    global url_preview_pending_playlist_name
+    value = str(url_preview_pending_playlist_name or "").strip()
+    url_preview_pending_playlist_name = ""
+    return value
+
+
 def insert_case_name_tag(tag):
     try:
         case_name_entry.insert("insert", tag)
@@ -1177,6 +1230,93 @@ def log_capture_tool_versions(versions):
     append_log(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n\n")
 
 
+
+
+def parse_universal_archive_skip_output_line(line):
+    text = str(line or "").rstrip("\r\n")
+    if not text.startswith("GUI_UNIVERSAL_ARCHIVE_SKIP\t"):
+        return None
+
+    parts = text.split("\t", 4)
+    if len(parts) < 5:
+        return None
+
+    try:
+        url_index = int(parts[1])
+    except Exception:
+        url_index = 0
+
+    try:
+        url_total = int(parts[2])
+    except Exception:
+        url_total = 0
+
+    return {
+        "url_index": url_index,
+        "url_total": url_total,
+        "archive_id": parts[3].strip(),
+        "url": parts[4].strip(),
+    }
+
+
+def parse_universal_archive_skip_summary_line(line):
+    text = str(line or "").rstrip("\r\n")
+    if not text.startswith("GUI_UNIVERSAL_ARCHIVE_SKIP_SUMMARY\t"):
+        return None
+
+    parts = text.split("\t", 3)
+    if len(parts) < 4:
+        return None
+
+    try:
+        count = int(parts[1])
+    except Exception:
+        count = 0
+
+    return {
+        "count": count,
+        "json_path": parts[2].strip(),
+        "csv_path": parts[3].strip(),
+    }
+
+
+def format_universal_archive_skip_record_for_log(record):
+    archive_id = str((record or {}).get("archive_id") or "").strip() or "unknown archive id"
+    url = str((record or {}).get("url") or "").strip()
+    url_index = int((record or {}).get("url_index") or 0)
+    url_total = int((record or {}).get("url_total") or 0)
+    prefix = f"URL {url_index}/{url_total}: " if url_index and url_total else ""
+    return f"Universal archive skip detected: {prefix}{archive_id} | {url}"
+
+
+def append_universal_archive_skip_summary(skip_records=None, skip_summary=None):
+    skip_records = list(skip_records or [])
+    skip_summary = skip_summary or {}
+    count = len(skip_records) or int(skip_summary.get("count") or 0)
+
+    append_log("Universal archive skipped items: ")
+    append_log(f"{count}\n")
+
+    if count <= 0:
+        return
+
+    for index, record in enumerate(skip_records[:50], start=1):
+        archive_id = str(record.get("archive_id") or "").strip() or "unknown archive id"
+        url = str(record.get("url") or "").strip()
+        append_log(f"  {index}. {archive_id}")
+        if url:
+            append_log(f" | {url}")
+        append_log("\n")
+
+    if len(skip_records) > 50:
+        append_log(f"  ... {len(skip_records) - 50} more skipped item(s) not shown.\n")
+
+    if skip_summary.get("json_path"):
+        append_log(f"Universal archive skip JSON: {skip_summary.get('json_path')}\n")
+    if skip_summary.get("csv_path"):
+        append_log(f"Universal archive skip CSV: {skip_summary.get('csv_path')}\n")
+
+
 def is_case_verification_ignored_path(path):
     try:
         parts = {part.lower() for part in os.path.normpath(path).split(os.sep)}
@@ -1218,7 +1358,7 @@ def count_case_files(case_folder):
     return counts
 
 
-def build_case_summary_text(exit_code, submitted_url_count, paths, versions, counts, settings=None):
+def build_case_summary_text(exit_code, submitted_url_count, paths, versions, counts, settings=None, universal_skip_records=None, universal_skip_summary=None):
     settings = settings if isinstance(settings, dict) else {}
 
     def setting_value(key, fallback):
@@ -1240,6 +1380,7 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Logs folder: {paths.get('logs_folder', '')}",
         f"  Manifests folder: {paths.get('manifests_folder', '')}",
         f"  Download archive: {paths.get('download_archive', '')}",
+        f"  Universal archive: {paths.get('universal_archive', UNIVERSAL_ARCHIVE_FILE)}",
         "",
         "Counts:",
         f"  Total files: {counts.get('files', 0)}",
@@ -1247,6 +1388,7 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Metadata JSON files: {counts.get('metadata', 0)}",
         f"  Log files: {counts.get('logs', 0)}",
         f"  Manifest files: {counts.get('manifests', 0)}",
+        f"  Universal archive skipped items: {len(list(universal_skip_records or [])) or int((universal_skip_summary or {}).get('count') or 0)}",
         "",
         "Tools:",
         f"  PowerShell script: {versions.get('powershell_script', '')}",
@@ -1267,6 +1409,7 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Format strategy: {setting_value('format_strategy', format_strategy_var.get())}",
         f"  Source scope: {setting_value('source_scope', source_scope_var.get())}",
         f"  Archive mode: {setting_value('archive_mode', archive_mode_var.get())}",
+        f"  Universal archive: {'enabled; used with Archive Mode = Use and synced to the case archive' if universal_archive_enabled_var.get() else 'disabled'}",
         f"  Max resolution: {setting_value('max_resolution', max_resolution_var.get())}",
         f"  Display cache: {setting_value('gui_cache_mode', gui_cache_mode_var.get())}",
         f"  File manifest: {setting_value('manifest_mode', manifest_mode_var.get())}",
@@ -1304,6 +1447,7 @@ def get_expected_run_paths():
         "logs_folder": os.path.join(case_folder, "logs"),
         "manifests_folder": os.path.join(case_folder, "manifests"),
         "download_archive": os.path.join(case_folder, "download-archive.txt"),
+        "universal_archive": UNIVERSAL_ARCHIVE_FILE,
     }
 
 
@@ -2744,6 +2888,9 @@ def build_powershell_command():
     else:
         cmd += ["-ArchiveMode", "Use"]
 
+    if should_pass_universal_archive(archive_mode):
+        cmd += ["-UniversalArchiveFile", UNIVERSAL_ARCHIVE_FILE]
+
     max_resolution = max_resolution_var.get().strip() or "best"
     if max_resolution != "best":
         cmd += ["-MaxResolution", max_resolution]
@@ -2980,6 +3127,7 @@ def get_expected_run_paths_for_values(output_root, resolved_case_name):
         "logs_folder": os.path.join(case_folder, "logs"),
         "manifests_folder": os.path.join(case_folder, "manifests"),
         "download_archive": os.path.join(case_folder, "download-archive.txt"),
+        "universal_archive": UNIVERSAL_ARCHIVE_FILE,
     }
 
 
@@ -3081,6 +3229,9 @@ def build_powershell_command_for_job(job):
         cmd += ["-ArchiveMode", "Force"]
     else:
         cmd += ["-ArchiveMode", "Use"]
+
+    if should_pass_universal_archive(archive_mode):
+        cmd += ["-UniversalArchiveFile", UNIVERSAL_ARCHIVE_FILE]
 
     max_resolution = str(settings.get("max_resolution", DEFAULTS["max_resolution"]) or "best").strip()
     if max_resolution != "best":
@@ -3236,7 +3387,7 @@ def preflight_check(show_success_popup=True):
         add_check("URLs provided in pasted URL box", url_count != 0, f"{url_count} URL(s)")
     else:
         if not input_file_paths:
-            add_check("Input file(s) selected", False, "No Input Files selected")
+            add_check("Input file(s) selected", False, "No Input File(s) selected")
         else:
             missing_input_files = [path for path in input_file_paths if not os.path.isfile(path)]
             if missing_input_files:
@@ -3423,6 +3574,13 @@ def get_settings_dict():
             split_queue_group_count_var.get(),
             DEFAULTS["split_queue_group_count"],
         ),
+        "url_preview_pacing": normalize_url_preview_pacing(url_preview_pacing_var.get()),
+        "url_preview_thumbnail_mode": normalize_url_preview_thumbnail_mode(url_preview_thumbnail_mode_var.get()),
+        "url_preview_rate_limit_thumbnails": bool(url_preview_rate_limit_thumbnails_var.get()),
+        "url_preview_cache_mode": normalize_url_preview_cache_mode(url_preview_cache_mode_var.get()),
+        "url_preview_playlist_mode": normalize_url_preview_playlist_mode(url_preview_playlist_mode_var.get()),
+        "url_preview_max_playlist_items": normalize_url_preview_max_playlist_items(url_preview_max_playlist_items_var.get()),
+        "url_preview_timeout": normalize_url_preview_timeout(url_preview_timeout_var.get()),
     }
 
 
@@ -3535,6 +3693,13 @@ def apply_settings_dict(settings):
         settings.get("split_queue_group_count", DEFAULTS["split_queue_group_count"]),
         DEFAULTS["split_queue_group_count"],
     ))
+    url_preview_pacing_var.set(normalize_url_preview_pacing(settings.get("url_preview_pacing", DEFAULTS["url_preview_pacing"])))
+    url_preview_thumbnail_mode_var.set(normalize_url_preview_thumbnail_mode(settings.get("url_preview_thumbnail_mode", DEFAULTS["url_preview_thumbnail_mode"])))
+    url_preview_rate_limit_thumbnails_var.set(bool(settings.get("url_preview_rate_limit_thumbnails", DEFAULTS["url_preview_rate_limit_thumbnails"])))
+    url_preview_cache_mode_var.set(normalize_url_preview_cache_mode(settings.get("url_preview_cache_mode", DEFAULTS["url_preview_cache_mode"])))
+    url_preview_playlist_mode_var.set(normalize_url_preview_playlist_mode(settings.get("url_preview_playlist_mode", DEFAULTS["url_preview_playlist_mode"])))
+    url_preview_max_playlist_items_var.set(normalize_url_preview_max_playlist_items(settings.get("url_preview_max_playlist_items", DEFAULTS["url_preview_max_playlist_items"])))
+    url_preview_timeout_var.set(normalize_url_preview_timeout(settings.get("url_preview_timeout", DEFAULTS["url_preview_timeout"])))
     update_capture_options_summary()
 
 
@@ -3687,6 +3852,63 @@ def get_proxy_status_summary():
     return f"enabled ({target}; {save_state})"
 
 
+URL_PREVIEW_PACING_OPTIONS = {
+    "5 sec + up to 10 sec jitter": (5, 10),
+    "10 sec + up to 15 sec jitter": (10, 15),
+    "15 sec + up to 20 sec jitter": (15, 20),
+}
+URL_PREVIEW_THUMBNAIL_MODE_OPTIONS = ["Off", "Fast", "Reliable"]
+URL_PREVIEW_CACHE_MODE_OPTIONS = ["Temporary", "Reuse cached thumbnails"]
+URL_PREVIEW_PLAYLIST_MODE_OPTIONS = ["Fast playlist scan", "Deep metadata first N"]
+
+
+def normalize_url_preview_pacing(value):
+    value = str(value or "").strip()
+    if value in URL_PREVIEW_PACING_OPTIONS:
+        return value
+    return DEFAULTS["url_preview_pacing"]
+
+
+def normalize_url_preview_thumbnail_mode(value):
+    value = str(value or "").strip().lower()
+    for option in URL_PREVIEW_THUMBNAIL_MODE_OPTIONS:
+        if value == option.lower():
+            return option
+    return DEFAULTS["url_preview_thumbnail_mode"]
+
+
+def normalize_url_preview_cache_mode(value):
+    value = str(value or "").strip().lower()
+    for option in URL_PREVIEW_CACHE_MODE_OPTIONS:
+        if value == option.lower():
+            return option
+    return DEFAULTS["url_preview_cache_mode"]
+
+
+def normalize_url_preview_playlist_mode(value):
+    value = str(value or "").strip().lower()
+    for option in URL_PREVIEW_PLAYLIST_MODE_OPTIONS:
+        if value == option.lower():
+            return option
+    return DEFAULTS["url_preview_playlist_mode"]
+
+
+def normalize_url_preview_max_playlist_items(value):
+    value = str(value or "").strip()
+    if value.lower() in {"", "all", "0"}:
+        return "0" if value == "0" else value
+    if value.isdigit():
+        return str(max(1, min(5000, int(value))))
+    return DEFAULTS["url_preview_max_playlist_items"]
+
+
+def normalize_url_preview_timeout(value):
+    value = str(value or "").strip()
+    if value.isdigit():
+        return str(max(10, min(900, int(value))))
+    return DEFAULTS["url_preview_timeout"]
+
+
 def make_default_profile_settings():
     return DEFAULTS.copy()
 
@@ -3702,6 +3924,7 @@ def get_app_settings_dict():
         "case_browser_icon_scale": case_browser_icon_scale_var.get(),
         "job_persistence": job_persistence_var.get(),
         "url_box_persistence": url_box_persistence_var.get(),
+        "universal_archive_enabled": universal_archive_enabled_var.get(),
     }
     settings.update(get_proxy_settings_dict(include_sensitive=False))
     return settings
@@ -3745,6 +3968,13 @@ def apply_app_settings_dict(settings):
     except Exception:
         pass
 
+    try:
+        universal_archive_enabled_var.set(
+            bool(settings.get("universal_archive_enabled", APP_SETTINGS_DEFAULTS["universal_archive_enabled"]))
+        )
+    except Exception:
+        pass
+
     proxy_no_save = bool(settings.get("proxy_no_save", APP_SETTINGS_DEFAULTS["proxy_no_save"]))
     proxy_no_save_var.set(proxy_no_save)
 
@@ -3769,11 +3999,14 @@ def get_app_settings_summary_lines():
     vpn_state = "enabled" if check_vpn_var.get() else "disabled"
     persistence_state = "enabled" if job_persistence_var.get() else "disabled"
     url_box_state = "enabled" if url_box_persistence_var.get() else "disabled"
+    universal_archive_state = "enabled" if universal_archive_enabled_var.get() else "disabled"
     return [
         f"Delete cookies on exit: {delete_state}",
         f"Check VPN: {vpn_state}",
         f"Job persistence: {persistence_state}",
         f"URL box persistence: {url_box_state}",
+        f"Universal download archive: {universal_archive_state} (applies only when Archive Mode = Use)",
+        f"Universal archive file: {UNIVERSAL_ARCHIVE_FILE}",
         f"Proxy: {get_proxy_status_summary()}",
     ]
 
@@ -5208,6 +5441,44 @@ def toggle_url_box_persistence_setting():
         append_log(f"URL box contents saved to: {URL_BOX_PERSISTENCE_FILE}\n")
 
 
+def toggle_universal_archive_setting():
+    state = "enabled" if universal_archive_enabled_var.get() else "disabled"
+    saved = save_app_settings(show_popup=False, changed_setting_label=f"Universal Download Archive {state}")
+    if saved and universal_archive_enabled_var.get():
+        append_log(f"Universal archive file will be used with Archive Mode = Use:\n{UNIVERSAL_ARCHIVE_FILE}\n")
+
+
+def delete_universal_archive_file():
+    if not os.path.isfile(UNIVERSAL_ARCHIVE_FILE):
+        messagebox.showinfo(
+            "Universal archive not found",
+            f"The universal archive file does not exist yet:\n\n{UNIVERSAL_ARCHIVE_FILE}",
+        )
+        return
+
+    confirm = messagebox.askyesno(
+        "Delete universal archive?",
+        "Delete the app-level universal download archive?\n\n"
+        f"{UNIVERSAL_ARCHIVE_FILE}\n\n"
+        "This may allow previously captured media from other cases to be captured again. Case-specific download archives are not deleted.",
+    )
+
+    if not confirm:
+        return
+
+    try:
+        os.remove(UNIVERSAL_ARCHIVE_FILE)
+        append_log(f"\nUniversal archive deleted:\n{UNIVERSAL_ARCHIVE_FILE}\n")
+        messagebox.showinfo("Universal archive deleted", f"Deleted:\n\n{UNIVERSAL_ARCHIVE_FILE}")
+    except Exception as e:
+        messagebox.showerror("Delete failed", f"Could not delete the universal archive file:\n\n{UNIVERSAL_ARCHIVE_FILE}\n\n{e}")
+
+
+def should_pass_universal_archive(archive_mode=None):
+    mode = str(archive_mode if archive_mode is not None else archive_mode_var.get()).strip().lower() or "use"
+    return bool(universal_archive_enabled_var.get()) and mode == "use"
+
+
 def delete_selected_cookies_file_on_exit():
     cookies_path = cookies_file_var.get().strip()
 
@@ -5793,14 +6064,20 @@ def start_capture():
             raise ValueError(describe_current_url_source_problem("starting capture"))
 
         capture_timestamp = datetime.now()
+        pending_playlist_name = consume_url_preview_pending_playlist_name()
         command_settings = get_settings_dict()
         command_settings, applied_domain_presets = apply_checked_domain_presets_to_settings(command_settings, capture_urls)
         capture_domains = sorted({domain for domain in (get_url_domain_key(url) for url in capture_urls) if domain})
-        resolved_case_name = get_resolved_case_name(
+        capture_case_template = command_settings.get("case_name", case_name_var.get().strip())
+        if str(pending_playlist_name or "").strip():
+            capture_case_template = append_playlist_tag_to_case_template(capture_case_template)
+        resolved_case_name = safe_case_name(render_case_name_template(
+            capture_case_template,
             now=capture_timestamp,
             domains=capture_domains,
             presets=applied_domain_presets,
-        )
+            playlist=pending_playlist_name,
+        ))
 
         if not resolved_case_name:
             raise ValueError("Case Name is blank after resolving the template.")
@@ -5885,13 +6162,27 @@ def start_capture():
                 universal_newlines=True,
             )
 
+            universal_skip_records = []
+            universal_skip_summary = {}
+
             if running_process.stdout:
                 for line in running_process.stdout:
+                    skip_record = parse_universal_archive_skip_output_line(line)
+                    if skip_record:
+                        universal_skip_records.append(skip_record)
+                        root.after(0, append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        continue
+
+                    skip_summary = parse_universal_archive_skip_summary_line(line)
+                    if skip_summary:
+                        universal_skip_summary = skip_summary
+                        continue
+
                     root.after(0, append_log, line)
 
             exit_code = running_process.wait()
 
-            root.after(0, show_run_summary, exit_code, submitted_url_count)
+            root.after(0, show_run_summary, exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
             if exit_code == 0:
                 root.after(0, set_status, "Done")
@@ -5912,7 +6203,7 @@ def start_capture():
     threading.Thread(target=worker, daemon=True).start()
 
 
-def show_run_summary(exit_code, submitted_url_count):
+def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
     global last_successful_case_summary
 
     try:
@@ -5932,6 +6223,7 @@ def show_run_summary(exit_code, submitted_url_count):
         append_log(f"Logs folder: {paths['logs_folder']}\n")
         append_log(f"Manifests folder: {paths['manifests_folder']}\n")
         append_log(f"Download archive: {paths['download_archive']}\n")
+        append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary)
 
         counts = count_case_files(paths["case_folder"])
         append_log(f"Total files found: {counts.get('files', 0)}\n")
@@ -5952,6 +6244,8 @@ def show_run_summary(exit_code, submitted_url_count):
             versions,
             counts,
             settings=summary_settings,
+            universal_skip_records=universal_skip_records,
+            universal_skip_summary=universal_skip_summary,
         )
         copy_summary_button.config(state="normal")
         append_log("Case summary is available. Use Copy Case Summary to copy it to the clipboard.\n")
@@ -6629,6 +6923,8 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
         settings = settings.copy() if isinstance(settings, dict) else get_settings_dict()
         settings, applied_presets = apply_checked_domain_presets_to_settings(settings, clean_urls)
         case_template = case_template if case_template is not None else settings.get("case_name", "")
+        if str(playlist_name or "").strip():
+            case_template = append_playlist_tag_to_case_template(case_template)
         job_domains_for_tags = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
         resolved_case_name = resolved_case_name or safe_case_name(render_case_name_template(
             case_template,
@@ -6709,17 +7005,18 @@ def describe_current_url_source_problem(action_label="this action"):
 
     return (
         f"No URLs are available for {action_label}.\n\n"
-        "Add URLs to the URL box or select one or more Input Files containing http:// or https:// URLs."
+        "Add URLs to the URL box or select one or more Input File(s) containing http:// or https:// URLs."
     )
 
 
-def add_current_as_job():
+def add_current_as_job(playlist_name=None):
     try:
         validate_inputs()
         urls = get_current_url_lines_for_queue()
         if not urls:
             raise ValueError(describe_current_url_source_problem("adding the current capture to the queue"))
-        return add_urls_to_queue_as_job(urls)
+        effective_playlist_name = playlist_name if playlist_name is not None else consume_url_preview_pending_playlist_name()
+        return add_urls_to_queue_as_job(urls, playlist_name=effective_playlist_name)
     except Exception as e:
         messagebox.showerror("Add job failed", str(e))
         return False
@@ -7734,8 +8031,22 @@ def run_queue_job(job):
             job_queue_running_processes[job["job_id"]] = process
             running_process = process
 
+            universal_skip_records = []
+            universal_skip_summary = {}
+
             if process.stdout:
                 for line in process.stdout:
+                    skip_record = parse_universal_archive_skip_output_line(line)
+                    if skip_record:
+                        universal_skip_records.append(skip_record)
+                        root.after(0, append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        continue
+
+                    skip_summary = parse_universal_archive_skip_summary_line(line)
+                    if skip_summary:
+                        universal_skip_summary = skip_summary
+                        continue
+
                     root.after(0, append_log, line)
                     if line.startswith("GUI_QUEUE_URL_COMPLETE\t"):
                         root.after(0, handle_queue_output_line, job["job_id"], line)
@@ -7746,12 +8057,12 @@ def run_queue_job(job):
             root.after(0, append_log, f"\nERROR: {e}\n")
             exit_code = 1
 
-        root.after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count)
+        root.after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
     threading.Thread(target=worker, daemon=True).start()
 
 
-def finish_queue_job(job_id, exit_code, submitted_url_count):
+def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
     global job_queue_running, job_queue_current_job_id, job_queue_running_processes, last_successful_case_summary, job_queue_run_filter_ids
 
     job = None
@@ -7796,6 +8107,7 @@ def finish_queue_job(job_id, exit_code, submitted_url_count):
     append_log(f"\nExit code: {exit_code}\n")
     append_log(f"Submitted URLs: {submitted_url_count}\n")
     append_log(f"Case folder: {paths.get('case_folder', '')}\n")
+    append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary)
     append_log(f"Total files found: {counts.get('files', 0)}\n")
     append_log(f"Media files found: {counts.get('media', 0)}\n")
     append_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
@@ -7810,6 +8122,8 @@ def finish_queue_job(job_id, exit_code, submitted_url_count):
             versions,
             counts,
             settings=summary_settings,
+            universal_skip_records=universal_skip_records,
+            universal_skip_summary=universal_skip_summary,
         )
         last_successful_case_summary = job["summary"]
     else:
@@ -9157,14 +9471,14 @@ def show_playlist_preview_placeholder(message=None):
 
     ttk.Label(
         content,
-        text=message or "Playlist Preview is waiting for URL box or Input File URLs.",
+        text=message or "URL Preview is waiting for URL box or Input File(s) URLs.",
         anchor="center",
         justify="center",
     ).pack(pady=(0, 8))
 
     ttk.Button(
         content,
-        text="Refresh Playlist Preview",
+        text="Refresh URL Preview",
         command=lambda: open_playlist_preview_dialog(silent=False, force_reload=True),
     ).pack()
 
@@ -9202,7 +9516,7 @@ def schedule_playlist_preview_autoload(delay_ms=400):
                 open_playlist_preview_dialog(silent=True, force_reload=changed)
             except Exception as e:
                 try:
-                    append_log(f"\nPlaylist Preview auto-load failed: {e}\n")
+                    append_log(f"\nURL Preview auto-load failed: {e}\n")
                 except Exception:
                     pass
 
@@ -9230,7 +9544,7 @@ def on_notebook_tab_changed(event=None):
             open_playlist_preview_dialog(silent=True)
         except Exception as e:
             try:
-                append_log(f"\nPlaylist Preview tab load failed: {e}\n")
+                append_log(f"\nURL Preview tab load failed: {e}\n")
             except Exception:
                 pass
 
@@ -9271,29 +9585,26 @@ def build_playlist_preview_command(url):
     return cmd
 
 
+
 def open_playlist_preview_dialog(silent=False, force_reload=False):
     global playlist_preview_tab_loaded, playlist_preview_loaded_signature
 
     changed = refresh_playlist_preview_candidate_cache()
     urls = list(playlist_preview_candidate_urls)
-
-    if not urls:
-        if silent:
-            show_playlist_preview_placeholder("Playlist Preview is waiting for URL box or Input File URLs.")
-        else:
-            show_playlist_preview_placeholder("No valid URL text or input file contents were found to preview.")
-            try:
-                app_notebook.select(playlist_preview_tab)
-            except Exception:
-                pass
-        return
+    has_preview_urls = bool(urls)
+    no_urls_message = (
+        "URL Preview is waiting for URL box or Input File(s) URLs."
+        if silent else
+        "No valid URL text or input file contents were found to preview."
+    )
 
     try:
         dialog = playlist_preview_tab
-        app_notebook.select(dialog)
+        if has_preview_urls or not silent:
+            app_notebook.select(dialog)
     except NameError:
         if not silent:
-            messagebox.showerror("Playlist Preview unavailable", "Playlist Preview tab is not available.")
+            messagebox.showerror("URL Preview unavailable", "URL Preview tab is not available.")
         return
 
     if playlist_preview_tab_loaded and not force_reload and not changed and playlist_preview_loaded_signature == playlist_preview_source_signature:
@@ -9306,174 +9617,98 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             pass
 
     dialog.columnconfigure(0, weight=1)
-    for row_index in range(0, 12):
+    for row_index in range(0, 9):
         try:
             dialog.rowconfigure(row_index, weight=0)
         except Exception:
             pass
-    dialog.rowconfigure(2, weight=1)
-    dialog.rowconfigure(4, weight=1)
-    dialog.rowconfigure(7, weight=1)
+    dialog.rowconfigure(2, weight=2)
+    dialog.rowconfigure(3, weight=3)
 
     stop_event = threading.Event()
-    playlists = []
-    playlist_by_iid = {}
+    scan_running = {"value": False}
+    thumbnail_token = {"value": 0}
+    thumbnail_image_holder = {"image": None}
+    current_detail_record = {"record": None}
+    thumbnail_state_lock = threading.Lock()
+    thumbnail_state = {
+        "desired_key": "",
+        "desired_record": None,
+        "worker_running": False,
+        # Cooldowns are post-fetch timers. A new thumbnail fetch starts immediately
+        # when the relevant timer has already expired; after a real fetch attempt
+        # completes, the next-allowed time is moved forward.
+        "next_allowed": {"fast": 0.0, "ytdlp": 0.0},
+    }
+
     url_records = [
-        {"iid": f"url-{index}", "number": index, "checked": True, "status": "Ready", "url": url}
+        {
+            "iid": f"url-{index}",
+            "number": index,
+            "preview": True,
+            "include": True,
+            "status": "Ready",
+            "kind": "Unknown",
+            "title": "",
+            "uploader": "",
+            "duration": "",
+            "items": "",
+            "thumbnail_status": "Not fetched",
+            "thumbnail_url": "",
+            "thumbnail_cache_path": "",
+            "thumbnail_error": "",
+            "url": url,
+            "json": {},
+            "entries": [],
+            "error": "",
+        }
         for index, url in enumerate(urls, start=1)
     ]
     url_by_iid = {record["iid"]: record for record in url_records}
-    scan_running = {"value": False}
+    entry_by_iid = {}
 
-    status_var = tk.StringVar(value=f"Loaded {len(urls)} URL(s). Choose URLs, then press Start Checked or Start Selected.")
-    selected_playlist_var = tk.StringVar(value="No playlist selected.")
-    pacing_var = tk.StringVar(value="0 sec + up to 5 sec jitter")
+    status_var = tk.StringVar(value=(
+        f"Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata."
+        if has_preview_urls else
+        f"{no_urls_message} Add URLs in the URL box or select Input File(s) to enable URL Preview."
+    ))
+    context_title_var = tk.StringVar(value="Select a URL row to view details.")
+    thumbnail_status_var = tk.StringVar(value="")
+    pacing_var = url_preview_pacing_var
+    thumbnail_mode_var = url_preview_thumbnail_mode_var
+    rate_limit_thumbnails_var = url_preview_rate_limit_thumbnails_var
+    cache_mode_var = url_preview_cache_mode_var
+    playlist_mode_var = url_preview_playlist_mode_var
+    max_playlist_items_var = url_preview_max_playlist_items_var
+    timeout_var = url_preview_timeout_var
+    options_visible = {"value": False}
 
-    preview_pacing_options = {
-        "0 sec + up to 5 sec jitter": (0, 5),
-        "5 sec + up to 10 sec jitter": (5, 10),
-        "15 sec + up to 30 sec jitter": (15, 30),
-    }
+    preview_pacing_options = URL_PREVIEW_PACING_OPTIONS
+    thumbnail_mode_options = URL_PREVIEW_THUMBNAIL_MODE_OPTIONS
+    cache_mode_options = URL_PREVIEW_CACHE_MODE_OPTIONS
+    playlist_mode_options = URL_PREVIEW_PLAYLIST_MODE_OPTIONS
 
-    header = ttk.Frame(dialog, padding=(12, 12, 12, 6))
-    header.grid(row=0, column=0, sticky="ew")
-    header.columnconfigure(0, weight=1)
+    def bool_mark(value):
+        return "☑" if bool(value) else "☐"
 
-    ttk.Label(header, textvariable=status_var).grid(row=0, column=0, sticky="w")
+    def short_text(value, limit=160):
+        value = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+        return value if len(value) <= limit else value[:limit - 1] + "…"
 
-    pacing_frame = ttk.Frame(header)
-    pacing_frame.grid(row=1, column=0, sticky="w", pady=(4, 0))
-    ttk.Label(pacing_frame, text="Preview pacing").pack(side="left", padx=(0, 6))
-    pacing_menu = ttk.Combobox(
-        pacing_frame,
-        textvariable=pacing_var,
-        values=list(preview_pacing_options.keys()),
-        state="readonly",
-        width=28,
-    )
-    pacing_menu.pack(side="left")
-
-    def set_buttons_scanning(is_scanning):
-        scan_running["value"] = is_scanning
+    def get_preview_timeout_seconds():
         try:
-            start_button.configure(state="disabled" if is_scanning else "normal")
-            start_selected_button.configure(state="disabled" if is_scanning else "normal")
-            stop_button.configure(state="normal" if is_scanning else "disabled")
+            return max(10, min(900, int(str(timeout_var.get()).strip())))
         except Exception:
-            pass
+            return 120
 
-    def url_checkmark(record):
-        return "☑" if record.get("checked") else "☐"
-
-    def update_url_tree_row(iid):
+    def get_max_playlist_items():
+        value = str(max_playlist_items_var.get() or "").strip().lower()
+        if value in {"", "all", "0"}:
+            return 0
         try:
-            record = url_by_iid.get(iid)
-            if not record or not url_tree.exists(iid):
-                return
-            url_tree.item(
-                iid,
-                values=(
-                    url_checkmark(record),
-                    record.get("number", ""),
-                    record.get("status", ""),
-                    record.get("url", ""),
-                ),
-            )
+            return max(1, min(5000, int(value)))
         except Exception:
-            pass
-
-    def set_url_status(iid, status):
-        record = url_by_iid.get(iid)
-        if not record:
-            return
-        record["status"] = status
-        update_url_tree_row(iid)
-
-    def toggle_url_preview_checkmark(iid):
-        record = url_by_iid.get(iid)
-        if not record:
-            return
-        record["checked"] = not bool(record.get("checked", True))
-        update_url_tree_row(iid)
-
-    def clear_tree_selection(tree):
-        try:
-            tree.selection_remove(tree.selection())
-            tree.focus("")
-        except Exception:
-            pass
-
-    def on_url_tree_click(event):
-        try:
-            item_id = url_tree.identify_row(event.y)
-            region = url_tree.identify("region", event.x, event.y)
-            column_id = url_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(url_tree)
-                return "break"
-
-            if column_id == "#1":
-                toggle_url_preview_checkmark(item_id)
-
-            url_tree.selection_set(item_id)
-            url_tree.focus(item_id)
-            return "break"
-        except Exception:
-            return
-
-    def on_url_tree_double_click(event):
-        try:
-            item_id = url_tree.identify_row(event.y)
-            region = url_tree.identify("region", event.x, event.y)
-            column_id = url_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(url_tree)
-                return "break"
-
-            if column_id == "#1":
-                return "break"
-
-            toggle_url_preview_checkmark(item_id)
-            url_tree.selection_set(item_id)
-            url_tree.focus(item_id)
-            return "break"
-        except Exception:
-            return
-
-    def populate_preview_url_tree():
-        for item in url_tree.get_children():
-            url_tree.delete(item)
-        for record in url_records:
-            url_tree.insert(
-                "",
-                "end",
-                iid=record["iid"],
-                values=(
-                    url_checkmark(record),
-                    record.get("number", ""),
-                    record.get("status", ""),
-                    record.get("url", ""),
-                ),
-            )
-
-    def get_preview_url_records_for_scan(selected_only=False):
-        if selected_only:
-            selected_iids = list(url_tree.selection())
-            return [url_by_iid[iid] for iid in selected_iids if iid in url_by_iid]
-
-        return [record for record in url_records if bool(record.get("checked", False))]
-
-    def warn_if_many_preview_urls(count):
-        if count <= 10:
-            return True
-
-        return messagebox.askyesno(
-            "Preview many URLs?",
-            f"You are about to query {count} URL(s) for playlist preview. This can trigger source rate limits, account challenges, or IP throttling.\n\nContinue?",
-            parent=dialog,
-        )
+            return 50
 
     def get_preview_pacing_seconds():
         return preview_pacing_options.get(pacing_var.get(), (0, 5))
@@ -9490,7 +9725,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             return
 
         root.after(0, status_var.set, f"Waiting {delay:.1f}s before next preview URL...")
-        append_log(f"Preview pacing delay before next URL: {delay:.1f}s\n")
+        append_log(f"URL preview pacing delay before next URL: {delay:.1f}s\n")
 
         end_time = time.time() + delay
         while time.time() < end_time:
@@ -9501,7 +9736,6 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def detect_preview_backoff_reason(text):
         combined = str(text or "")
         lowered = combined.lower()
-
         backoff_terms = [
             "http error 429",
             "429 too many requests",
@@ -9519,54 +9753,376 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             "detected unusual",
             "temporarily unavailable due to",
         ]
-
         for term in backoff_terms:
             if term in lowered:
                 return term
-
         if re.search(r"\b429\b", lowered):
             return "HTTP 429"
-
         return ""
 
     def show_preview_backoff_warning(url, reason):
         messagebox.showwarning(
             "Possible rate limit or challenge",
-            "Playlist preview detected a possible rate limit, bot challenge, or temporary block. "
+            "URL preview detected a possible rate limit, bot challenge, or temporary block. "
             "The scan was stopped so the source has time to recover.\n\n"
             f"Reason: {reason}\n\nURL:\n{url}",
             parent=dialog,
         )
 
-    def clear_results():
-        playlists.clear()
-        playlist_by_iid.clear()
-        for tree in (playlist_tree, entry_tree):
-            for item in tree.get_children():
-                tree.delete(item)
-        selected_playlist_var.set("No playlist selected.")
+    def output_root_for_preview_cache():
+        root_value = output_root_var.get().strip() or ROOT
+        return root_value
 
-    def playlist_checkmark(record):
-        return "☑" if record.get("checked", False) else "☐"
+    def url_preview_temp_cache_folder():
+        folder = os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-pending")
+        os.makedirs(folder, exist_ok=True)
+        return folder
 
-    def item_checkmark(entry):
-        return "☑" if entry.get("checked", False) else "☐"
+    def url_preview_persistent_cache_folder():
+        folder = os.path.join(output_root_for_preview_cache(), ".gui-cache", "url-preview-persistent")
+        os.makedirs(folder, exist_ok=True)
+        return folder
 
-    def update_playlist_tree_row(iid):
+    def url_preview_cache_is_persistent():
+        return normalize_url_preview_cache_mode(cache_mode_var.get()) == "Reuse cached thumbnails"
+
+    def case_template_needs_playlist_for_preview():
         try:
-            record = playlist_by_iid.get(iid)
-            if not record or not playlist_tree.exists(iid):
+            return "%playlist%" in str(case_name_var.get() or "").lower()
+        except Exception:
+            return False
+
+    def resolved_preview_cache_folder(playlist_name=None):
+        try:
+            output_root = output_root_for_preview_cache()
+            template = case_name_var.get().strip()
+            if playlist_name:
+                template = append_playlist_tag_to_case_template(template)
+            rendered = render_case_name_template(template, playlist=playlist_name)
+            case_name = safe_case_name(rendered)
+            if not case_name:
+                raise ValueError("blank resolved case name")
+            case_folder = os.path.join(output_root, case_name)
+            folder = os.path.join(case_folder, "manifests", ".gui-cache", "url-preview")
+            os.makedirs(folder, exist_ok=True)
+            return folder
+        except Exception:
+            return url_preview_temp_cache_folder()
+
+    def preview_cache_folder(playlist_name=None):
+        if url_preview_cache_is_persistent():
+            return url_preview_persistent_cache_folder()
+        # If the case template contains %playlist% but no playlist value is known yet,
+        # use a temporary cache under the output root. It will be moved/copied into
+        # the resolved case folder when a playlist-tagged Start/Queue action occurs.
+        if case_template_needs_playlist_for_preview() and not str(playlist_name or "").strip():
+            return url_preview_temp_cache_folder()
+        return resolved_preview_cache_folder(playlist_name=playlist_name)
+
+    def move_preview_cache_to_resolved_case_folder(playlist_name=None):
+        if not str(playlist_name or "").strip() and case_template_needs_playlist_for_preview():
+            return ""
+        source = url_preview_temp_cache_folder()
+        target = resolved_preview_cache_folder(playlist_name=playlist_name)
+        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(target)):
+            return target
+        if not os.path.isdir(source):
+            return target
+        try:
+            os.makedirs(target, exist_ok=True)
+            for name in os.listdir(source):
+                src = os.path.join(source, name)
+                dst = os.path.join(target, name)
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+                elif os.path.isfile(src):
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+            source_abs = os.path.abspath(source)
+            target_abs = os.path.abspath(target)
+            def _rewrite_cache_path(record):
+                try:
+                    current = str((record or {}).get("thumbnail_cache_path") or "")
+                    if current and os.path.abspath(current).startswith(source_abs):
+                        record["thumbnail_cache_path"] = target_abs + os.path.abspath(current)[len(source_abs):]
+                        update_preview_row(record)
+                except Exception:
+                    pass
+            for preview_record in url_records:
+                _rewrite_cache_path(preview_record)
+                for preview_entry in preview_record.get("entries") or []:
+                    _rewrite_cache_path(preview_entry)
+
+            try:
+                shutil.rmtree(source)
+                root_cache = os.path.dirname(source)
+                if os.path.isdir(root_cache) and not os.listdir(root_cache):
+                    os.rmdir(root_cache)
+                append_log(f"URL Preview cache copied into resolved case cache and pending cache was cleared: {target}\n")
+            except Exception as cleanup_error:
+                append_log(f"URL Preview cache copied into resolved case cache, but pending cache cleanup failed: {cleanup_error}\n")
+        except Exception as e:
+            append_log(f"WARNING: Could not move URL Preview cache into resolved case folder: {e}\n")
+        return target
+
+    def choose_thumbnail_url(info):
+        info = info if isinstance(info, dict) else {}
+        direct = str(info.get("thumbnail") or "").strip()
+        if direct.startswith(("http://", "https://")):
+            return direct
+
+        thumbnails = info.get("thumbnails") or []
+        if not isinstance(thumbnails, list):
+            return ""
+
+        candidates = []
+        for thumb in thumbnails:
+            if not isinstance(thumb, dict):
+                continue
+            url = str(thumb.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            try:
+                preference = int(thumb.get("preference") or 0)
+            except Exception:
+                preference = 0
+            try:
+                area = int(thumb.get("width") or 0) * int(thumb.get("height") or 0)
+            except Exception:
+                area = 0
+            candidates.append((preference, area, url))
+
+        if not candidates:
+            return ""
+        candidates.sort(reverse=True)
+        return candidates[0][2]
+
+    def safe_cache_name(value):
+        return hashlib.sha256(str(value or "").encode("utf-8", errors="ignore")).hexdigest()[:32]
+
+    def url_extension_for_cache(url, content_type=""):
+        lowered_type = str(content_type or "").lower()
+        if "png" in lowered_type:
+            return ".png"
+        if "webp" in lowered_type:
+            return ".webp"
+        if "gif" in lowered_type:
+            return ".gif"
+        if "jpeg" in lowered_type or "jpg" in lowered_type:
+            return ".jpg"
+        try:
+            path = urlsplit(url).path.lower()
+            for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"):
+                if path.endswith(ext):
+                    return ".jpg" if ext == ".jpeg" else ext
+        except Exception:
+            pass
+        return ".img"
+
+    def convert_thumbnail_to_png(source_path, png_path):
+        if os.path.isfile(png_path):
+            return png_path
+
+        ffmpeg_exe = get_ffmpeg_executable_for_gui()
+        if not ffmpeg_exe or not os.path.isfile(ffmpeg_exe):
+            ext = os.path.splitext(source_path)[1].lower()
+            if ext == ".png":
+                shutil.copy2(source_path, png_path)
+                return png_path
+            raise ValueError("ffmpeg.exe is not configured; thumbnail conversion is unavailable.")
+
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source_path,
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=260:-1",
+            png_path,
+        ]
+        result = subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(ffmpeg_exe)) or ROOT, capture_output=True, text=True, timeout=45)
+        if result.returncode != 0 or not os.path.isfile(png_path):
+            detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+            raise ValueError(f"ffmpeg thumbnail conversion failed: {detail}")
+        return png_path
+
+    def fetch_thumbnail_fast(record):
+        thumb_url = str(record.get("thumbnail_url") or "").strip()
+        if not thumb_url:
+            raise ValueError("No thumbnail URL was available in metadata.")
+
+        folder = preview_cache_folder()
+        base = safe_cache_name(thumb_url)
+        png_path = os.path.join(folder, f"{base}.png")
+        if os.path.isfile(png_path):
+            return png_path
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        source_url = str(record.get("url") or record.get("source_url") or "").strip()
+        if source_url.startswith(("http://", "https://")):
+            headers["Referer"] = source_url
+
+        req = urllib.request.Request(thumb_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as response:
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" in str(content_type).lower():
+                raise ValueError("Thumbnail request returned HTML instead of an image.")
+            data = response.read(8 * 1024 * 1024)
+            if not data:
+                raise ValueError("Thumbnail request returned no data.")
+
+        raw_ext = url_extension_for_cache(thumb_url, content_type)
+        raw_path = os.path.join(folder, f"{base}{raw_ext}")
+        with open(raw_path, "wb") as f:
+            f.write(data)
+
+        return convert_thumbnail_to_png(raw_path, png_path)
+
+    def build_ytdlp_common_metadata_args(url, include_playlist_mode=True):
+        yt_dlp_path = yt_dlp_path_var.get().strip()
+        if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
+            raise ValueError("yt-dlp path is missing or invalid.")
+
+        cmd = [
+            yt_dlp_path,
+            "--dump-single-json",
+            "--skip-download",
+            "--ignore-no-formats-error",
+            "--no-warnings",
+            "--no-progress",
+            "--js-runtimes",
+            f"deno:{resolve_deno_executable_for_gui()}",
+            "--user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "--add-header",
+            "Accept-Language: en-US,en;q=0.9",
+        ]
+
+        if include_playlist_mode:
+            max_items = get_max_playlist_items()
+            if playlist_mode_var.get() == "Fast playlist scan":
+                cmd.append("--flat-playlist")
+            elif max_items:
+                cmd += ["--playlist-items", f"1:{max_items}"]
+
+        cookies_file = cookies_file_var.get().strip()
+        if use_cookies_file_var.get() and cookies_file:
+            cmd += ["--cookies", cookies_file]
+
+        proxy_url = get_proxy_url_for_command()
+        if proxy_url:
+            cmd += ["--proxy", proxy_url]
+
+        impersonate_target = normalize_impersonate_target(impersonate_var.get())
+        if impersonate_target:
+            cmd += ["--impersonate", impersonate_target]
+
+        cmd.append(url)
+        return cmd
+
+    def fetch_thumbnail_ytdlp(record):
+        source_url = str(record.get("url") or record.get("source_url") or "").strip()
+        if not source_url:
+            raise ValueError("No source URL is available for yt-dlp thumbnail fallback.")
+
+        folder = os.path.join(preview_cache_folder(), safe_cache_name(source_url))
+        os.makedirs(folder, exist_ok=True)
+        png_path = os.path.join(folder, "thumb.png")
+        if os.path.isfile(png_path):
+            return png_path
+
+        cmd = build_ytdlp_common_metadata_args(source_url, include_playlist_mode=False)
+        # Replace JSON-only flags with thumbnail-write flags while preserving cookies/proxy/impersonation/header args.
+        cleaned = []
+        skip_next = False
+        for index, item in enumerate(cmd[:-1]):
+            if skip_next:
+                skip_next = False
+                continue
+            if item in {"--dump-single-json", "--ignore-no-formats-error"}:
+                continue
+            cleaned.append(item)
+        cmd = cleaned + [
+            "--write-thumbnail",
+            "--convert-thumbnails",
+            "png",
+            "-o",
+            os.path.join(folder, "thumb.%(ext)s"),
+            source_url,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(yt_dlp_path_var.get().strip())) or ROOT,
+            capture_output=True,
+            text=True,
+            timeout=get_preview_timeout_seconds(),
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
+            raise ValueError(f"yt-dlp thumbnail fallback failed: {detail}")
+
+        if os.path.isfile(png_path):
+            return png_path
+
+        candidates = []
+        for name in os.listdir(folder):
+            lowered = name.lower()
+            if lowered.startswith("thumb.") and lowered.rsplit(".", 1)[-1] in {"png", "jpg", "jpeg", "webp", "gif", "avif"}:
+                candidates.append(os.path.join(folder, name))
+        if not candidates:
+            raise ValueError("yt-dlp thumbnail fallback did not create a thumbnail file.")
+
+        candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+        return convert_thumbnail_to_png(candidates[0], png_path)
+
+    def fetch_thumbnail_hybrid(record):
+        mode = thumbnail_mode_var.get()
+        if mode == "Off":
+            return ""
+
+        errors = []
+        try:
+            return fetch_thumbnail_fast(record)
+        except Exception as e:
+            errors.append(str(e))
+
+        if mode == "Reliable":
+            try:
+                return fetch_thumbnail_ytdlp(record)
+            except Exception as e:
+                errors.append(str(e))
+
+        raise ValueError("; ".join(error for error in errors if error) or "thumbnail fetch failed")
+
+    def update_url_tree_row(iid):
+        try:
+            record = url_by_iid.get(iid)
+            if not record or not url_tree.exists(iid):
                 return
-            playlist_tree.item(
+            url_tree.item(
                 iid,
                 values=(
-                    playlist_checkmark(record),
+                    bool_mark(record.get("preview")),
+                    bool_mark(record.get("include")),
                     record.get("number", ""),
-                    record.get("title", ""),
-                    record.get("entry_count", 0),
-                    record.get("extractor", ""),
-                    record.get("id", ""),
-                    record.get("source_url", ""),
+                    record.get("status", ""),
+                    record.get("kind", ""),
+                    short_text(record.get("title", ""), 90),
+                    short_text(record.get("uploader", ""), 55),
+                    record.get("duration", ""),
+                    record.get("items", ""),
+                    record.get("thumbnail_status", ""),
+                    record.get("url", ""),
                 ),
             )
         except Exception:
@@ -9574,666 +10130,720 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
     def update_entry_tree_row(iid):
         try:
-            selected_playlist = playlist_tree.selection()
-            playlist_record = playlist_by_iid.get(selected_playlist[0]) if selected_playlist else None
-            if not playlist_record or not entry_tree.exists(iid):
+            entry = entry_by_iid.get(iid)
+            if not entry or not entry_tree.exists(iid):
                 return
-
-            entry_index = int(str(iid).split(":", 1)[1])
-            entry = playlist_record["entries"][entry_index]
             entry_tree.item(
                 iid,
                 values=(
-                    item_checkmark(entry),
+                    bool_mark(entry.get("include")),
                     entry.get("index", ""),
-                    entry.get("title", ""),
-                    entry.get("id", ""),
+                    entry.get("status", ""),
+                    short_text(entry.get("title", ""), 90),
                     entry.get("duration", ""),
+                    entry.get("thumbnail_status", ""),
+                    "yes" if entry.get("json") else "",
                     entry.get("url", ""),
                 ),
             )
         except Exception:
             pass
 
-    def toggle_playlist_preview_checkmark(iid):
-        record = playlist_by_iid.get(iid)
-        if not record:
-            return
-        record["checked"] = not bool(record.get("checked", False))
-        update_playlist_tree_row(iid)
-
-    def toggle_entry_preview_checkmark(iid):
-        selected_playlist = playlist_tree.selection()
-        playlist_record = playlist_by_iid.get(selected_playlist[0]) if selected_playlist else None
-        if not playlist_record:
-            return
-
+    def update_preview_row(record):
         try:
-            entry_index = int(str(iid).split(":", 1)[1])
-            entry = playlist_record["entries"][entry_index]
-            entry["checked"] = not bool(entry.get("checked", False))
-            update_entry_tree_row(iid)
+            iid = str((record or {}).get("iid") or "")
+            if iid in url_by_iid:
+                update_url_tree_row(iid)
+            elif iid in entry_by_iid:
+                update_entry_tree_row(iid)
         except Exception:
             pass
 
-    def checked_playlist_records():
-        return [record for record in playlists if bool(record.get("checked", False))]
+    def set_record_status(record, status):
+        record["status"] = status
+        update_url_tree_row(record.get("iid", ""))
 
-    def selected_playlist_records():
-        selected = playlist_tree.selection()
-        records = []
-        for iid in selected:
-            record = playlist_by_iid.get(iid)
-            if record:
-                records.append(record)
-        return records
+    def clear_tree_selection(tree):
+        try:
+            tree.selection_remove(tree.selection())
+            tree.focus("")
+        except Exception:
+            pass
 
-    def current_playlist_record():
-        selected = selected_playlist_records()
-        if selected:
-            return selected[0]
+    def selected_url_records():
+        return [url_by_iid[iid] for iid in url_tree.selection() if iid in url_by_iid]
 
-        checked = checked_playlist_records()
-        if len(checked) == 1:
-            return checked[0]
+    def current_url_record():
+        selected = selected_url_records()
+        return selected[0] if selected else None
 
-        return None
+    def selected_entry_records():
+        return [entry_by_iid[iid] for iid in entry_tree.selection() if iid in entry_by_iid]
 
-    def current_entry_records(checked_only=True):
-        playlist_record = current_playlist_record()
-        if not playlist_record:
+    def included_entry_records():
+        return current_playlist_entries(included_only=True, selected_only=False)
+
+    def unique_valid_top_records(records, require_key=None):
+        records_to_use = []
+        seen = set()
+        for record in records or []:
+            if require_key and not record.get(require_key):
+                continue
+            url = clean_extracted_url(record.get("url", ""))
+            if not url_shape_is_valid(url):
+                continue
+            normalized = normalize_url_for_compare(url)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            records_to_use.append(record)
+        return records_to_use
+
+    def preview_checked_top_records():
+        return unique_valid_top_records(url_records, require_key="preview")
+
+    def include_checked_top_records():
+        return unique_valid_top_records(url_records, require_key="include")
+
+    def all_top_records():
+        return unique_valid_top_records(url_records)
+
+    def top_records_for_start_or_queue(selected_only=False):
+        return include_checked_top_records() if selected_only else all_top_records()
+
+    def included_top_records(selected_only=False):
+        return top_records_for_start_or_queue(selected_only)
+
+    def included_top_urls(selected_only=False):
+        return [clean_extracted_url(record.get("url", "")) for record in included_top_records(selected_only)]
+
+    def record_has_playlist_data(record):
+        record = record or {}
+        data = record.get("json") if isinstance(record.get("json"), dict) else {}
+        kind = str(record.get("kind") or data.get("_type") or data.get("extractor_key") or data.get("extractor") or "").lower()
+        if record.get("entries"):
+            return True
+        if data.get("entries"):
+            return True
+        if data.get("_type") == "playlist":
+            return True
+        if data.get("playlist_count") or data.get("n_entries"):
+            return True
+        return any(token in kind for token in ("playlist", "channel", "tab", "search", "collection"))
+
+    def playlist_name_for_record(record):
+        if not record_has_playlist_data(record):
+            return ""
+        data = record.get("json") if isinstance((record or {}).get("json"), dict) else {}
+        return str(
+            record.get("title")
+            or data.get("playlist_title")
+            or data.get("playlist")
+            or data.get("title")
+            or record.get("id")
+            or record.get("url")
+            or "preview"
+        ).strip()
+
+    def playlist_name_for_records(records):
+        records = [record for record in records or [] if record]
+        if len(records) != 1:
+            return ""
+        return playlist_name_for_record(records[0])
+
+    def current_playlist_entries(included_only=True, selected_only=False):
+        record = current_url_record()
+        entries = list((record or {}).get("entries", []))
+        if selected_only:
+            selected_ids = {id(entry) for entry in selected_entry_records()}
+            entries = [entry for entry in entries if id(entry) in selected_ids]
+        if included_only:
+            entries = [entry for entry in entries if entry.get("include")]
+        return entries
+
+    def urls_from_entries(entries):
+        urls_to_use = []
+        seen = set()
+        for entry in entries or []:
+            url = clean_extracted_url(entry.get("url", ""))
+            if not url_shape_is_valid(url):
+                continue
+            normalized = normalize_url_for_compare(url)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            urls_to_use.append(url)
+        return urls_to_use
+
+    def playlist_item_urls_for_top_record(record):
+        """Return all usable previewed playlist/context item URLs for a top-level URL row.
+
+        Top-level URL Preview Start/Queue actions should mirror the bottom
+        playlist/context item list's All Items behavior once playlist metadata is
+        confirmed. That means confirmed playlist rows are expanded to their
+        extracted item URLs instead of queueing/capturing only the source URL.
+        """
+        if not record_has_playlist_data(record):
             return []
+        entries = list((record or {}).get("entries") or [])
+        return urls_from_entries(entries)
 
-        entries = playlist_record.get("entries", [])
-        if checked_only:
-            return [entry for entry in entries if bool(entry.get("checked", False))]
+    def top_record_capture_payload(record):
+        record = record or {}
+        playlist_name = playlist_name_for_record(record)
+        playlist_urls = playlist_item_urls_for_top_record(record)
+        if playlist_urls:
+            return playlist_urls, playlist_name, "playlist/context item URL(s)"
+        url = clean_extracted_url(record.get("url", ""))
+        if not url_shape_is_valid(url):
+            return [], "", "top-level URL"
+        return [url], playlist_name, "top-level URL"
 
-        return list(entries)
+    def top_records_capture_payload(records):
+        urls_to_use = []
+        seen = set()
+        playlist_names = []
+        expanded_count = 0
+        source_count = 0
+        for record in records or []:
+            record_urls, playlist_name, payload_type = top_record_capture_payload(record)
+            if not record_urls:
+                continue
+            if playlist_name and playlist_name not in playlist_names:
+                playlist_names.append(playlist_name)
+            if payload_type.startswith("playlist"):
+                expanded_count += 1
+            else:
+                source_count += 1
+            for url in record_urls:
+                normalized = normalize_url_for_compare(url)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                urls_to_use.append(url)
+        playlist_name = playlist_names[0] if len(playlist_names) == 1 else ""
+        return urls_to_use, playlist_name, expanded_count, source_count
 
     def copy_text_to_clipboard(text_value, description):
         text_value = str(text_value or "").strip()
-
         if not text_value:
-            messagebox.showwarning("Nothing to copy", f"No {description} were available to copy.")
+            messagebox.showwarning("Nothing to copy", f"No {description} were available to copy.", parent=dialog)
             return
-
         root.clipboard_clear()
         root.clipboard_append(text_value)
         root.update()
         append_log(f"\nCopied {description} to clipboard.\n")
 
-    def copy_checked_playlist_urls():
-        records = checked_playlist_records()
-        urls_to_copy = [record["source_url"] for record in records if record.get("source_url")]
-        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist URL(s)")
+    def copy_selected_preview_urls():
+        urls_to_copy = [record.get("url", "") for record in selected_url_records() if record.get("url")]
+        copy_text_to_clipboard("\n".join(urls_to_copy), "selected URL(s)")
 
-    def copy_checked_playlist_item_urls():
-        urls_to_copy = []
-        for record in checked_playlist_records():
-            for entry in record.get("entries", []):
-                if entry.get("url"):
-                    urls_to_copy.append(entry["url"])
-
-        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist item URL(s)")
-
-    def copy_checked_current_item_urls():
-        entries = current_entry_records(checked_only=True)
-        urls_to_copy = [entry["url"] for entry in entries if entry.get("url")]
-        copy_text_to_clipboard("\n".join(urls_to_copy), "checked playlist item URL(s)")
-
-    def copy_all_current_item_urls():
-        entries = current_entry_records(checked_only=False)
-        urls_to_copy = [entry["url"] for entry in entries if entry.get("url")]
-        copy_text_to_clipboard("\n".join(urls_to_copy), "all current playlist item URL(s)")
-
-    def copy_playlist_urls():
-        copy_checked_playlist_urls()
-
-    def copy_selected_item_urls():
-        copy_checked_current_item_urls()
-
-    def copy_all_item_urls():
-        copy_checked_playlist_item_urls()
-
-    def set_url_box_from_selected_items(append=False):
-        entries = current_entry_records(checked_only=True)
-
-        if not entries:
-            messagebox.showwarning("No checked items", "Check one or more playlist items first.")
+    def copy_selected_record_json():
+        record = highlighted_url_record() or current_url_record()
+        if not record or not record.get("json"):
+            messagebox.showwarning("No JSON", "Right-click or select a previewed URL row first.", parent=dialog)
             return
+        copy_text_to_clipboard(json.dumps(record.get("json"), indent=2, ensure_ascii=False), "highlighted URL JSON")
 
-        urls_to_use = [entry["url"] for entry in entries if entry.get("url")]
+    def export_record_json(record, description):
+        if not record or not record.get("json"):
+            messagebox.showwarning("No JSON", f"No JSON is available for the {description}.", parent=dialog)
+            return
+        safe_title = safe_case_name(record.get("title") or record.get("id") or description or "url-preview")[:80] or "url-preview"
+        initial_file = f"{safe_title}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            title=f"Export {description} JSON",
+            defaultextension=".json",
+            initialdir=preview_cache_folder(playlist_name=playlist_name_for_record(record) if record_has_playlist_data(record) else None),
+            initialfile=initial_file,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            parent=dialog,
+        )
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            payload = {
+                "app": APP_TITLE,
+                "app_version": APP_VERSION,
+                "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "description": description,
+                "url": record.get("url") or record.get("source_url") or "",
+                "title": record.get("title", ""),
+                "json": record.get("json") or {},
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            append_log(f"\nExported highlighted URL Preview JSON: {path}\n")
+            messagebox.showinfo("Export complete", f"Exported JSON to:\n\n{path}", parent=dialog)
+        except Exception as e:
+            messagebox.showerror("Export failed", f"Could not export JSON:\n\n{e}", parent=dialog)
 
+    def export_highlighted_url_json():
+        record, _url = highlighted_url_value()
+        export_record_json(record, "highlighted URL")
+
+    def export_highlighted_entry_json():
+        entry, _url = highlighted_entry_value()
+        export_record_json(entry, "highlighted playlist/context item")
+
+    entry_context_iid = {"value": ""}
+
+    def highlighted_entry_record():
+        iid = str(entry_context_iid.get("value") or "")
+        if iid in entry_by_iid:
+            return entry_by_iid[iid]
+        focused = str(entry_tree.focus() or "")
+        if focused in entry_by_iid:
+            return entry_by_iid[focused]
+        selected = selected_entry_records()
+        return selected[0] if selected else None
+
+    def highlighted_entry_value():
+        entry = highlighted_entry_record()
+        url = clean_extracted_url((entry or {}).get("url", ""))
+        return entry, url
+
+    def copy_highlighted_entry_json():
+        entry, _url = highlighted_entry_value()
+        if not entry:
+            messagebox.showwarning("No playlist item", "Right-click a playlist/context item row first.", parent=dialog)
+            return
+        copy_text_to_clipboard(json.dumps(entry.get("json") or {}, indent=2, ensure_ascii=False), "highlighted playlist item JSON")
+
+    def open_highlighted_entry_url():
+        entry, url = highlighted_entry_value()
+        if not entry or not url_shape_is_valid(url):
+            messagebox.showwarning("No item URL", "Right-click a playlist/context item row first.", parent=dialog)
+            return
+        try:
+            webbrowser.open(url)
+            append_log(f"\nOpened URL Preview playlist/context item URL: {url}\n")
+        except Exception as e:
+            messagebox.showerror("Open URL failed", str(e), parent=dialog)
+
+    def start_highlighted_entry():
+        entry, url = highlighted_entry_value()
+        if not entry or not url_shape_is_valid(url):
+            messagebox.showwarning("No item URL", "Right-click a playlist/context item row first.", parent=dialog)
+            return
+        start_urls_now([url], "highlighted playlist/context item URL", playlist_name=get_current_playlist_name())
+
+    def queue_highlighted_entry():
+        entry, url = highlighted_entry_value()
+        if not entry or not url_shape_is_valid(url):
+            messagebox.showwarning("No item URL", "Right-click a playlist/context item row first.", parent=dialog)
+            return
+        queue_urls([url], "highlighted playlist/context item URL", playlist_name=get_current_playlist_name())
+
+    def toggle_highlighted_entry_include():
+        iid = str(entry_context_iid.get("value") or entry_tree.focus() or "")
+        if iid in entry_by_iid:
+            toggle_entry_include(iid)
+
+    def set_url_preview_flags(records, key, value):
+        for record in records:
+            record[key] = bool(value)
+            update_url_tree_row(record.get("iid", ""))
+
+    def set_all_url_preview_flags(key, value):
+        set_url_preview_flags(url_records, key, value)
+
+    def invert_url_preview_flags(key):
+        for record in url_records:
+            record[key] = not bool(record.get(key))
+            update_url_tree_row(record.get("iid", ""))
+
+    def set_selected_url_preview_flags(key, value):
+        records = selected_url_records()
+        if not records:
+            messagebox.showwarning("No URL selection", "Select one or more URL rows first.", parent=dialog)
+            return
+        set_url_preview_flags(records, key, value)
+
+    def toggle_url_flag(iid, key):
+        record = url_by_iid.get(iid)
+        if not record:
+            return
+        record[key] = not bool(record.get(key))
+        update_url_tree_row(iid)
+
+    def set_all_current_item_includes(value):
+        for entry in current_playlist_entries(included_only=False):
+            entry["include"] = bool(value)
+        for iid in entry_tree.get_children():
+            update_entry_tree_row(iid)
+
+    def invert_current_item_includes():
+        for entry in current_playlist_entries(included_only=False):
+            entry["include"] = not bool(entry.get("include"))
+        for iid in entry_tree.get_children():
+            update_entry_tree_row(iid)
+
+    def toggle_entry_include(iid):
+        entry = entry_by_iid.get(iid)
+        if not entry:
+            return
+        entry["include"] = not bool(entry.get("include"))
+        update_entry_tree_row(iid)
+
+    def start_urls_now(urls_to_start, description, playlist_name=None):
+        if not urls_to_start:
+            messagebox.showwarning("No URLs", f"No usable {description} are available to start.", parent=dialog)
+            return
+        if playlist_name:
+            move_preview_cache_to_resolved_case_folder(playlist_name=playlist_name)
+        set_url_box_urls(urls_to_start)
+        set_url_preview_pending_playlist_name(playlist_name)
+        append_log(f"\nURL Preview set URL box to {len(urls_to_start)} {description} and started capture.\n")
+        if playlist_name:
+            append_log(f"URL Preview playlist tag value: {playlist_name}\n")
+        try:
+            app_notebook.select(main)
+        except Exception:
+            pass
+        start_capture()
+
+    def queue_urls(urls_to_queue, description, playlist_name=None):
+        if not urls_to_queue:
+            messagebox.showwarning("No URLs", f"No usable {description} are available to queue.", parent=dialog)
+            return
+        if playlist_name:
+            move_preview_cache_to_resolved_case_folder(playlist_name=playlist_name)
+        if not job_queue_window_is_open():
+            open_job_queue()
+        if add_urls_to_queue_as_job(urls_to_queue, playlist_name=playlist_name):
+            append_log(f"\nQueued {len(urls_to_queue)} {description} from URL Preview.\n")
+
+    def playlist_name_for_any_record(records):
+        for record in records or []:
+            name = playlist_name_for_record(record)
+            if name:
+                return name
+        return ""
+
+    def start_top_urls(selected_only, description):
+        records = included_top_records(selected_only)
+        urls_to_start, playlist_name, expanded_count, source_count = top_records_capture_payload(records)
+        if expanded_count:
+            description = f"expanded playlist/context item URL(s) from {expanded_count} top-level row(s)"
+            if source_count:
+                description += f" plus {source_count} source URL(s)"
+        start_urls_now(urls_to_start, description, playlist_name=playlist_name)
+
+    def queue_top_urls(selected_only, description):
+        records = included_top_records(selected_only)
+        if not records:
+            messagebox.showwarning("No URLs", f"No usable {description} are available to queue.", parent=dialog)
+            return
+        if not job_queue_window_is_open():
+            open_job_queue()
+
+        queued_count = 0
+        queued_url_count = 0
+        expanded_jobs = 0
+        for record in records:
+            urls_to_queue, playlist_name, expanded_count, _source_count = top_records_capture_payload([record])
+            if not urls_to_queue:
+                continue
+            if playlist_name:
+                move_preview_cache_to_resolved_case_folder(playlist_name=playlist_name)
+            if add_urls_to_queue_as_job(urls_to_queue, playlist_name=playlist_name):
+                queued_count += 1
+                queued_url_count += len(urls_to_queue)
+                if expanded_count:
+                    expanded_jobs += 1
+                if playlist_name:
+                    append_log(f"URL Preview playlist tag value for queued job: {playlist_name}\n")
+
+        if queued_count:
+            detail = f" ({queued_url_count} URL(s) total"
+            if expanded_jobs:
+                detail += f"; {expanded_jobs} playlist/context row(s) expanded to item URLs"
+            detail += ")"
+            append_log(f"\nQueued {queued_count} separate job(s) from URL Preview {description}{detail}.\n")
+        else:
+            messagebox.showwarning("No jobs queued", f"No {description} could be queued.", parent=dialog)
+
+    url_context_iid = {"value": ""}
+
+    def highlighted_url_record():
+        iid = str(url_context_iid.get("value") or "")
+        if iid in url_by_iid:
+            return url_by_iid[iid]
+        focused = str(url_tree.focus() or "")
+        if focused in url_by_iid:
+            return url_by_iid[focused]
+        selected = selected_url_records()
+        return selected[0] if selected else None
+
+    def highlighted_url_value():
+        record = highlighted_url_record()
+        url = clean_extracted_url((record or {}).get("url", ""))
+        return record, url
+
+    def preview_highlighted_url():
+        record, url = highlighted_url_value()
+        if not record or not url_shape_is_valid(url):
+            messagebox.showwarning("No URL", "Right-click a URL row first.", parent=dialog)
+            return
+        start_preview(explicit_records=[record])
+
+    def start_highlighted_url():
+        record, url = highlighted_url_value()
+        if not record or not url_shape_is_valid(url):
+            messagebox.showwarning("No URL", "Right-click a URL row first.", parent=dialog)
+            return
+        urls_to_start, playlist_name, expanded_count, _source_count = top_records_capture_payload([record])
+        description = "highlighted playlist/context item URL(s)" if expanded_count else "highlighted top-level URL"
+        start_urls_now(urls_to_start, description, playlist_name=playlist_name)
+
+    def queue_highlighted_url():
+        record, url = highlighted_url_value()
+        if not record or not url_shape_is_valid(url):
+            messagebox.showwarning("No URL", "Right-click a URL row first.", parent=dialog)
+            return
+        urls_to_queue, playlist_name, expanded_count, _source_count = top_records_capture_payload([record])
+        description = "highlighted playlist/context item URL(s)" if expanded_count else "highlighted top-level URL"
+        queue_urls(urls_to_queue, description, playlist_name=playlist_name)
+
+    def open_highlighted_url():
+        record, url = highlighted_url_value()
+        if not record or not url_shape_is_valid(url):
+            messagebox.showwarning("No URL", "Right-click a URL row first.", parent=dialog)
+            return
+        try:
+            webbrowser.open(url)
+            append_log(f"\nOpened URL from URL Preview: {url}\n")
+        except Exception as e:
+            messagebox.showerror("Open URL failed", str(e), parent=dialog)
+
+    def get_current_playlist_name():
+        record = current_url_record() or {}
+        return str(record.get("title") or record.get("id") or record.get("url") or "preview").strip()
+
+    def set_url_box_from_current_items(append=False):
+        urls_to_use = urls_from_entries(current_playlist_entries(included_only=True, selected_only=False))
         if not urls_to_use:
-            messagebox.showwarning("No usable URLs", "The selected playlist items did not expose usable item URLs.")
+            messagebox.showwarning("No item URLs", "No included playlist item URLs are available.", parent=dialog)
             return
-
         if append:
             append_text_to_urls_box("\n".join(urls_to_use))
-            append_log(f"\nAppended {len(urls_to_use)} playlist item URL(s) to the URL box.\n")
+            append_log(f"\nAppended {len(urls_to_use)} URL Preview playlist item URL(s) to the URL box.\n")
         else:
             set_url_box_urls(urls_to_use)
-            append_log(f"\nReplaced URL box with {len(urls_to_use)} playlist item URL(s).\n")
+            append_log(f"\nReplaced URL box with {len(urls_to_use)} URL Preview playlist item URL(s).\n")
 
-    def set_playlist_items_from_selection():
-        entries = current_entry_records(checked_only=True)
-
+    def set_playlist_items_from_current_selection():
+        entries = current_playlist_entries(included_only=True, selected_only=False)
         if not entries:
-            messagebox.showwarning("No checked items", "Check one or more playlist items first.")
+            messagebox.showwarning("No included items", "Include one or more playlist item rows first.", parent=dialog)
             return
-
         indexes = [entry.get("index") for entry in entries]
         item_value = collapse_playlist_indexes(indexes)
-
         if not item_value:
-            messagebox.showwarning("No usable indexes", "The selected playlist items did not expose usable playlist indexes.")
+            messagebox.showwarning("No usable indexes", "The included playlist items did not expose usable playlist indexes.", parent=dialog)
             return
-
         source_scope_var.set("include_playlist")
         playlist_items_enabled_var.set(True)
         playlist_items_var.set(item_value)
         update_playlist_metadata_visibility()
         update_capture_options_summary()
         save_settings(show_popup=False)
-        append_log(f"\nSet Playlist Items from preview selection: {item_value}\n")
-        messagebox.showinfo("Playlist Items set", f"Playlist Items was set to:\n\n{item_value}")
-
-    def get_preview_item_urls_from_entries(entries):
-        urls_to_use = []
-        seen = set()
-
-        for entry in entries or []:
-            url = clean_extracted_url(entry.get("url", ""))
-            if not url_shape_is_valid(url):
-                continue
-
-            normalized = normalize_url_for_compare(url)
-            if normalized in seen:
-                continue
-
-            seen.add(normalized)
-            urls_to_use.append(url)
-
-        return urls_to_use
-
-    def get_selected_preview_item_entries_with_playlist():
-        playlist_record = current_playlist_record()
-        if not playlist_record:
-            return None, []
-
-        entries = current_entry_records(checked_only=True)
-        return playlist_record, entries
-
-    def get_preview_playlist_groups_for_queue(selected_only=True):
-        groups = []
-        records = checked_playlist_records() if selected_only else list(playlists)
-        source_label = "checked playlist(s)" if selected_only else "all detected playlist(s)"
-
-        for record in records:
-            urls = get_preview_item_urls_from_entries(record.get("entries", []))
-            if urls:
-                groups.append({
-                    "record": record,
-                    "urls": urls,
-                    "source_label": source_label,
-                })
-
-        return groups, source_label
-
-    def get_all_preview_item_entries():
-        return [
-            entry
-            for record in playlists
-            for entry in record.get("entries", [])
-        ]
-
-    def get_checked_current_preview_item_entries():
-        return current_entry_records(checked_only=True), "checked item(s)"
-
-    def get_preview_item_urls_for_action(selected_only=True):
-        if selected_only:
-            entries, source_label = get_checked_current_preview_item_entries()
-        else:
-            entries = get_all_preview_item_entries()
-            source_label = "all detected playlist item(s)"
-
-        return get_preview_item_urls_from_entries(entries), source_label
-
-    def get_playlist_case_tag_value(record, fallback_index=1):
-        record = record or {}
-        value = str(record.get("title") or record.get("id") or record.get("source_url") or "").strip()
-        return value or f"playlist{fallback_index:02d}"
-
-    def get_playlist_queue_suffix(record, fallback_index):
-        suffix = format_case_playlist_tag(get_playlist_case_tag_value(record, fallback_index))
-
-        if not suffix:
-            suffix = f"playlist{fallback_index:02d}"
-
-        return suffix[:80]
-
-    def get_playlist_preview_case_template(settings):
-        return append_playlist_tag_to_case_template((settings or {}).get("case_name", ""))
-
-    def get_preview_item_queue_settings():
-        settings = get_settings_dict()
-        settings["source_scope"] = "single"
-        settings["playlist_items_enabled"] = False
-        settings["playlist_order_enabled"] = False
-        settings["max_playlist_items_enabled"] = False
-        settings["break_on_existing"] = False
-        settings["skip_playlist_after_errors_enabled"] = False
-        return settings
-
-    def queue_preview_item_urls(selected_only=True):
-        groups, source_label = get_preview_playlist_groups_for_queue(selected_only=selected_only)
-
-        if not groups:
-            messagebox.showwarning(
-                "No item URLs",
-                "Check one or more playlist rows with usable item URLs first." if selected_only else "No detected playlist item URLs are available to queue.",
-                parent=dialog,
-            )
-            return
-
-        if not job_queue_window_is_open():
-            open_job_queue()
-
-        settings = get_preview_item_queue_settings()
-        case_template = get_playlist_preview_case_template(settings)
-        added_count = 0
-        queued_url_count = 0
-
-        for index, group in enumerate(groups, start=1):
-            record = group.get("record") or {}
-            urls_to_queue = group.get("urls", [])
-            if not urls_to_queue:
-                continue
-
-            playlist_name = get_playlist_case_tag_value(record, index)
-
-            if add_urls_to_queue_as_job(
-                urls_to_queue,
-                settings=settings,
-                case_template=case_template,
-                playlist_name=playlist_name,
-            ):
-                added_count += 1
-                queued_url_count += len(urls_to_queue)
-
-        if added_count:
-            append_log(
-                f"\nQueued {queued_url_count} playlist preview item URL(s) from {source_label} "
-                f"as {added_count} playlist-split queue job(s).\n"
-            )
-
-    def split_and_queue_preview_item_urls(selected_only=True):
-        urls_to_queue, source_label = get_preview_item_urls_for_action(selected_only=selected_only)
-
-        if not urls_to_queue:
-            messagebox.showwarning(
-                "No item URLs",
-                "Check one or more playlist item rows with usable item URLs first." if selected_only else "No detected playlist item URLs are available.",
-                parent=dialog,
-            )
-            return
-
-        mode, value = show_split_queue_dialog(len(urls_to_queue))
-        if not mode or not value:
-            return
-
-        if mode == "per_group":
-            groups = split_urls_by_count(urls_to_queue, value)
-            split_label = f"{value} URL(s) per group"
-        else:
-            groups = split_urls_by_group_count(urls_to_queue, value)
-            split_label = f"{value} requested group(s)"
-
-        if not groups:
-            messagebox.showinfo("No groups created", "No URL groups were created.", parent=dialog)
-            return
-
-        if not job_queue_window_is_open():
-            open_job_queue()
-
-        settings = get_preview_item_queue_settings()
-        playlist_record = current_playlist_record()
-        playlist_name = get_playlist_case_tag_value(playlist_record, 1)
-        case_template = get_playlist_preview_case_template(settings)
-        added_count = 0
-
-        for index, group_urls in enumerate(groups, start=1):
-            part_case_template = f"{case_template}-part{index:02d}"
-            if add_urls_to_queue_as_job(
-                group_urls,
-                settings=settings,
-                case_template=part_case_template,
-                playlist_name=playlist_name,
-            ):
-                added_count += 1
-
-        append_log(
-            f"\nSplit {len(urls_to_queue)} playlist preview item URL(s) from {source_label} "
-            f"into {added_count} queue job(s) using {split_label}.\n"
-        )
+        append_log(f"\nSet Playlist Items from URL Preview included items: {item_value}\n")
+        messagebox.showinfo("Playlist Items set", f"Playlist Items was set to:\n\n{item_value}", parent=dialog)
 
     def export_preview_json():
-        if not playlists:
-            messagebox.showwarning("No preview data", "No playlist preview data is available to export.", parent=dialog)
+        if not url_records:
+            messagebox.showwarning("No preview data", "No URL preview data is available to export.", parent=dialog)
             return
-
-        initial_file = f"playlist-preview-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        initial_file = f"url-preview-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
         path = filedialog.asksaveasfilename(
-            title="Export Playlist Preview JSON",
+            title="Export URL Preview JSON",
             defaultextension=".json",
-            initialdir=ROOT,
+            initialdir=preview_cache_folder(),
             initialfile=initial_file,
-            filetypes=[
-                ("JSON files", "*.json"),
-                ("All files", "*.*"),
-            ],
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
             parent=dialog,
         )
-
         if not path:
             return
-
-        export_playlists = []
-
-        for record in playlists:
-            clean_record = {
-                "source_url": record.get("source_url", ""),
-                "title": record.get("title", ""),
-                "entry_count": record.get("entry_count", 0),
-                "extractor": record.get("extractor", ""),
-                "id": record.get("id", ""),
-                "entries": record.get("entries", []),
-            }
-            export_playlists.append(clean_record)
-
         payload = {
             "app": APP_TITLE,
             "app_version": APP_VERSION,
             "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source_url_count": len(urls),
-            "playlist_count": len(export_playlists),
-            "preview_mode": "yt-dlp --flat-playlist --dump-single-json",
-            "playlists": export_playlists,
+            "source_url_count": len(url_records),
+            "preview_mode": "yt-dlp --dump-single-json --skip-download",
+            "thumbnail_mode": thumbnail_mode_var.get(),
+            "cache_mode": cache_mode_var.get(),
+            "playlist_mode": playlist_mode_var.get(),
+            "urls": [
+                {
+                    "source_url": record.get("url", ""),
+                    "preview": bool(record.get("preview")),
+                    "include": bool(record.get("include")),
+                    "status": record.get("status", ""),
+                    "type": record.get("kind", ""),
+                    "title": record.get("title", ""),
+                    "uploader": record.get("uploader", ""),
+                    "duration": record.get("duration", ""),
+                    "items": record.get("items", ""),
+                    "thumbnail_url": record.get("thumbnail_url", ""),
+                    "thumbnail_cache_path": record.get("thumbnail_cache_path", ""),
+                    "error": record.get("error", ""),
+                    "json": record.get("json", {}),
+                    "entries": record.get("entries", []),
+                }
+                for record in url_records
+            ],
         }
-
         try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
                 f.write("\n")
-
-            append_log(f"\nExported playlist preview JSON: {path}\n")
-            messagebox.showinfo("Export complete", f"Playlist preview JSON was exported to:\n\n{path}", parent=dialog)
+            append_log(f"\nExported URL preview JSON: {path}\n")
+            messagebox.showinfo("Export complete", f"URL preview JSON was exported to:\n\n{path}", parent=dialog)
         except Exception as e:
-            messagebox.showerror("Export failed", f"Could not export playlist preview JSON:\n\n{e}", parent=dialog)
+            messagebox.showerror("Export failed", f"Could not export URL preview JSON:\n\n{e}", parent=dialog)
 
-    def populate_entries(record):
-        for item in entry_tree.get_children():
-            entry_tree.delete(item)
+    def normalized_info_record(record, data):
+        data = data if isinstance(data, dict) else {}
+        entries_raw = data.get("entries") if isinstance(data.get("entries"), list) else []
+        is_playlist = data.get("_type") == "playlist" or bool(entries_raw)
+        kind = "Playlist" if is_playlist else str(data.get("extractor_key") or data.get("extractor") or "URL").strip()
+        title = str(data.get("title") or data.get("playlist_title") or "").strip()
+        uploader = str(data.get("uploader") or data.get("channel") or data.get("creator") or "").strip()
+        duration = format_preview_duration(data.get("duration"))
+        thumb_url = choose_thumbnail_url(data)
 
-        if not record:
-            selected_playlist_var.set("No playlist selected.")
-            return
+        entries = []
+        for item_index, entry in enumerate(entries_raw, start=1):
+            entry = entry if isinstance(entry, dict) else {}
+            playlist_index = entry.get("playlist_index") or entry.get("n_entries") or item_index
+            entry_thumb = choose_thumbnail_url(entry)
+            entry_url = get_playlist_entry_url(entry, data)
+            entries.append({
+                "include": True,
+                "index": playlist_index,
+                "status": "Ready",
+                "kind": "Playlist Item",
+                "title": str(entry.get("title") or "").strip(),
+                "uploader": str(entry.get("uploader") or entry.get("channel") or "").strip(),
+                "id": str(entry.get("id") or "").strip(),
+                "duration": format_preview_duration(entry.get("duration")),
+                "items": "",
+                "url": entry_url,
+                "source_url": entry_url,
+                "thumbnail_url": entry_thumb,
+                "thumbnail_status": "URL" if entry_thumb else "Missing",
+                "thumbnail_cache_path": "",
+                "thumbnail_error": "",
+                "error": "",
+                "json": entry,
+            })
 
-        selected_playlist_var.set(
-            f"{record.get('title') or '(untitled playlist)'} - {len(record.get('entries', []))} item(s)"
+        record.update({
+            "status": "Previewed",
+            "kind": kind or "URL",
+            "title": title,
+            "uploader": uploader,
+            "duration": duration,
+            "items": len(entries) if is_playlist else "",
+            "thumbnail_url": thumb_url,
+            "thumbnail_status": "URL" if thumb_url else "Missing",
+            "json": data,
+            "entries": entries,
+            "error": "",
+        })
+
+    def add_preview_error(record, status, detail):
+        record.update({
+            "status": status,
+            "kind": "Error" if status in {"Failed", "Error", "Backoff"} else record.get("kind", "Unknown"),
+            "error": str(detail or "").strip(),
+        })
+        update_url_tree_row(record.get("iid", ""))
+
+    def records_for_preview(selected_only=False):
+        return preview_checked_top_records() if selected_only else all_top_records()
+
+    def warn_if_many_preview_urls(count):
+        if count <= 10:
+            return True
+        return messagebox.askyesno(
+            "Preview many URLs?",
+            f"You are about to query {count} URL(s) for metadata preview. This can trigger source rate limits, account challenges, or IP throttling.\n\nContinue?",
+            parent=dialog,
         )
-
-        for entry_number, entry in enumerate(record.get("entries", [])):
-            entry.setdefault("checked", True)
-            iid = f"{record['iid']}:{entry_number}"
-            entry_tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=(
-                    item_checkmark(entry),
-                    entry.get("index", ""),
-                    entry.get("title", ""),
-                    entry.get("id", ""),
-                    entry.get("duration", ""),
-                    entry.get("url", ""),
-                ),
-            )
-
-    def on_playlist_selected(event=None):
-        selected = playlist_tree.selection()
-        record = playlist_by_iid.get(selected[0]) if selected else None
-        populate_entries(record)
-
-    def on_playlist_tree_click(event):
-        try:
-            item_id = playlist_tree.identify_row(event.y)
-            region = playlist_tree.identify("region", event.x, event.y)
-            column_id = playlist_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(playlist_tree)
-                populate_entries(None)
-                return "break"
-
-            if column_id == "#1":
-                toggle_playlist_preview_checkmark(item_id)
-
-            playlist_tree.selection_set(item_id)
-            playlist_tree.focus(item_id)
-            populate_entries(playlist_by_iid.get(item_id))
-            return "break"
-        except Exception:
-            return
-
-    def on_playlist_tree_double_click(event):
-        try:
-            item_id = playlist_tree.identify_row(event.y)
-            region = playlist_tree.identify("region", event.x, event.y)
-            column_id = playlist_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(playlist_tree)
-                populate_entries(None)
-                return "break"
-
-            if column_id == "#1":
-                return "break"
-
-            toggle_playlist_preview_checkmark(item_id)
-            playlist_tree.selection_set(item_id)
-            playlist_tree.focus(item_id)
-            populate_entries(playlist_by_iid.get(item_id))
-            return "break"
-        except Exception:
-            return
-
-    def on_entry_tree_click(event):
-        try:
-            item_id = entry_tree.identify_row(event.y)
-            region = entry_tree.identify("region", event.x, event.y)
-            column_id = entry_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(entry_tree)
-                return "break"
-
-            if column_id == "#1":
-                toggle_entry_preview_checkmark(item_id)
-
-            entry_tree.selection_set(item_id)
-            entry_tree.focus(item_id)
-            return "break"
-        except Exception:
-            return
-
-    def on_entry_tree_double_click(event):
-        try:
-            item_id = entry_tree.identify_row(event.y)
-            region = entry_tree.identify("region", event.x, event.y)
-            column_id = entry_tree.identify_column(event.x)
-
-            if not item_id or region not in {"cell", "tree"}:
-                clear_tree_selection(entry_tree)
-                return "break"
-
-            if column_id == "#1":
-                return "break"
-
-            toggle_entry_preview_checkmark(item_id)
-            entry_tree.selection_set(item_id)
-            entry_tree.focus(item_id)
-            return "break"
-        except Exception:
-            return
-
-    def add_playlist_result(record):
-        if not dialog.winfo_exists():
-            return
-
-        record["iid"] = f"playlist-{len(playlists)}"
-        record["number"] = len(playlists) + 1
-        record.setdefault("checked", True)
-        playlists.append(record)
-        playlist_by_iid[record["iid"]] = record
-
-        playlist_tree.insert(
-            "",
-            "end",
-            iid=record["iid"],
-            values=(
-                playlist_checkmark(record),
-                record.get("number", ""),
-                record.get("title", ""),
-                record.get("entry_count", 0),
-                record.get("extractor", ""),
-                record.get("id", ""),
-                record.get("source_url", ""),
-            ),
-        )
-
-        if len(playlists) == 1:
-            playlist_tree.selection_set(record["iid"])
-            playlist_tree.focus(record["iid"])
-            populate_entries(record)
-
-    def add_non_playlist_status(index, url, detail):
-        if dialog.winfo_exists():
-            status_var.set(f"Scanned {index}/{len(urls)}. Latest non-playlist: {detail[:120]}")
 
     def scan_worker(scan_records):
         total_count = len(scan_records)
-
         for index, record in enumerate(scan_records, start=1):
             if stop_event.is_set():
                 break
-
             url = record.get("url", "")
-            iid = record.get("iid", "")
-
-            root.after(0, set_url_status, iid, "Scanning")
-            root.after(0, status_var.set, f"Scanning {index}/{total_count}: {url[:140]}")
-
+            root.after(0, set_record_status, record, "Scanning")
+            root.after(0, status_var.set, f"Previewing {index}/{total_count}: {url[:140]}")
             try:
-                cmd = build_playlist_preview_command(url)
-                append_log(f"\nPreviewing playlist URL {index}/{total_count}:\n{format_command_for_log(cmd)}\n")
+                cmd = build_ytdlp_common_metadata_args(url, include_playlist_mode=True)
+                append_log(f"\nURL Preview metadata scan {index}/{total_count}:\n{format_command_for_log(cmd)}\n")
                 result = subprocess.run(
                     cmd,
                     cwd=os.path.dirname(os.path.abspath(yt_dlp_path_var.get().strip())) or ROOT,
                     capture_output=True,
                     text=True,
-                    timeout=120,
+                    timeout=get_preview_timeout_seconds(),
                 )
-
-                combined_output = "\n".join(
-                    part for part in [result.stdout, result.stderr] if part
-                )
+                combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part)
                 backoff_reason = detect_preview_backoff_reason(combined_output)
-
                 if backoff_reason:
-                    root.after(0, set_url_status, iid, "Backoff")
-                    root.after(0, add_non_playlist_status, index, url, f"suspected rate limit/backoff: {backoff_reason}")
+                    root.after(0, add_preview_error, record, "Backoff", backoff_reason)
                     root.after(0, show_preview_backoff_warning, url, backoff_reason)
                     stop_event.set()
                     break
-
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
-                    root.after(0, set_url_status, iid, "Failed")
-                    root.after(0, add_non_playlist_status, index, url, f"yt-dlp failed: {detail}")
+                    root.after(0, add_preview_error, record, "Failed", detail)
                     sleep_before_next_preview_url(index, total_count)
                     continue
-
                 data = extract_json_object_from_stdout(result.stdout)
-                entries = data.get("entries", [])
-
-                if not isinstance(entries, list) or not entries:
-                    root.after(0, set_url_status, iid, "No playlist")
-                    root.after(0, add_non_playlist_status, index, url, "no playlist entries returned")
-                    sleep_before_next_preview_url(index, total_count)
-                    continue
-
-                item_rows = []
-                for item_index, entry in enumerate(entries, start=1):
-                    entry = entry if isinstance(entry, dict) else {}
-                    playlist_index = entry.get("playlist_index") or entry.get("n_entries")
-                    if not str(playlist_index or "").strip():
-                        playlist_index = item_index
-
-                    item_rows.append({
-                        "checked": True,
-                        "index": playlist_index,
-                        "title": str(entry.get("title") or "").strip(),
-                        "id": str(entry.get("id") or "").strip(),
-                        "duration": format_preview_duration(entry.get("duration")),
-                        "url": get_playlist_entry_url(entry, data),
-                    })
-
-                record_payload = {
-                    "source_url": url,
-                    "title": str(data.get("title") or data.get("playlist_title") or url).strip(),
-                    "entry_count": len(item_rows),
-                    "extractor": str(data.get("extractor_key") or data.get("extractor") or "").strip(),
-                    "id": str(data.get("id") or "").strip(),
-                    "entries": item_rows,
-                }
-
-                root.after(0, set_url_status, iid, f"Playlist: {len(item_rows)}")
-                root.after(0, add_playlist_result, record_payload)
-
+                root.after(0, normalized_info_record, record, data)
+                root.after(0, update_url_tree_row, record.get("iid", ""))
             except Exception as e:
                 message_text = str(e)
                 backoff_reason = detect_preview_backoff_reason(message_text)
                 if backoff_reason:
-                    root.after(0, set_url_status, iid, "Backoff")
-                    root.after(0, add_non_playlist_status, index, url, f"suspected rate limit/backoff: {backoff_reason}")
+                    root.after(0, add_preview_error, record, "Backoff", backoff_reason)
                     root.after(0, show_preview_backoff_warning, url, backoff_reason)
                     stop_event.set()
                     break
-
-                root.after(0, set_url_status, iid, "Error")
-                root.after(0, add_non_playlist_status, index, url, f"error: {e}")
-
+                root.after(0, add_preview_error, record, "Error", message_text)
             sleep_before_next_preview_url(index, total_count)
 
         def finish():
             if not dialog.winfo_exists():
                 return
-
             set_buttons_scanning(False)
+            update_action_states()
+            selected = current_url_record()
+            if selected:
+                show_context_for_record(selected)
+            previewed_count = len([record for record in url_records if record.get("json")])
             if stop_event.is_set():
-                status_var.set(f"Scan stopped. Found {len(playlists)} playlist URL(s).")
+                status_var.set(f"URL preview stopped. {previewed_count}/{len(url_records)} URL(s) have metadata.")
             else:
-                status_var.set(f"Scan complete. Found {len(playlists)} playlist URL(s) from {total_count} queried URL(s).")
-
-            append_log(f"\nPlaylist preview finished. Found {len(playlists)} playlist URL(s).\n")
+                status_var.set(f"URL preview complete. {previewed_count}/{len(url_records)} URL(s) have metadata.")
+            append_log(f"\nURL preview finished. {previewed_count}/{len(url_records)} URL(s) have metadata.\n")
 
         root.after(0, finish)
 
-    def start_scan(selected_only=False):
+    def start_preview(selected_only=False, explicit_records=None):
         if scan_running["value"]:
             return
-
+        if not has_preview_urls:
+            return
         try:
             yt_dlp_path = yt_dlp_path_var.get().strip()
             if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
@@ -10241,117 +10851,552 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         except Exception as e:
             messagebox.showerror("yt-dlp not found", str(e), parent=dialog)
             return
-
-        scan_records = get_preview_url_records_for_scan(selected_only=selected_only)
-
+        scan_records = unique_valid_top_records(explicit_records) if explicit_records is not None else records_for_preview(selected_only=selected_only)
         if not scan_records:
             messagebox.showwarning(
                 "No URLs selected",
-                "Select one or more URL rows or check one or more URLs before starting preview.",
+                "Use Preview Checked with checked Preview rows, or right-click a highlighted row and choose Preview Highlighted URL.",
                 parent=dialog,
             )
             return
-
         if not warn_if_many_preview_urls(len(scan_records)):
             return
-
-        clear_results()
-
-        for record in url_records:
-            if record in scan_records:
-                record["status"] = "Queued"
-            elif record.get("status") in {"Queued", "Scanning", "No playlist", "Failed", "Error", "Backoff"}:
-                record["status"] = "Ready"
-            update_url_tree_row(record["iid"])
-
+        for record in scan_records:
+            record["status"] = "Queued"
+            update_url_tree_row(record.get("iid", ""))
         stop_event.clear()
         set_buttons_scanning(True)
         append_log(
-            f"\nStarting playlist preview scan for {len(scan_records)} URL(s). "
-            f"Pacing: {pacing_var.get()}.\n"
+            f"\nStarting URL preview for {len(scan_records)} URL(s). "
+            f"Pacing: {pacing_var.get()}; thumbnail mode: {thumbnail_mode_var.get()}; playlist mode: {playlist_mode_var.get()}.\n"
         )
         threading.Thread(target=lambda: scan_worker(scan_records), daemon=True).start()
 
-    def stop_scan():
+    def stop_preview():
         stop_event.set()
-        status_var.set("Stopping playlist preview after current URL...")
+        status_var.set("Stopping URL preview after current URL...")
 
-    def close_dialog():
-        stop_event.set()
+    def set_buttons_scanning(is_scanning):
+        scan_running["value"] = is_scanning
         try:
-            app_notebook.select(main)
+            preview_all_button.configure(state="disabled" if is_scanning or not has_preview_urls else "normal")
+            preview_selected_button.configure(state="disabled" if is_scanning or not has_preview_urls else "normal")
+            stop_button.configure(state="normal" if is_scanning else "disabled")
         except Exception:
             pass
 
-    def pack_preview_button(widget):
-        widget.pack(side="left", padx=(0, 6), pady=2)
+    def update_action_states():
+        enabled_state = "normal" if has_preview_urls and not scan_running["value"] else "disabled"
+        for widget in action_buttons:
+            try:
+                widget.configure(state=enabled_state)
+            except Exception:
+                pass
+        try:
+            stop_button.configure(state="normal" if scan_running["value"] else "disabled")
+        except Exception:
+            pass
+        if not has_preview_urls:
+            for tree in (url_tree, entry_tree):
+                try:
+                    tree.configure(selectmode="none")
+                    tree.state(["disabled"])
+                except Exception:
+                    pass
+        else:
+            for tree in (url_tree, entry_tree):
+                try:
+                    tree.configure(selectmode="extended")
+                    tree.state(["!disabled"])
+                except Exception:
+                    pass
 
-    def selected_url_records():
-        return [url_by_iid[iid] for iid in url_tree.selection() if iid in url_by_iid]
-
-    def copy_selected_preview_urls():
-        records = selected_url_records()
-        urls_to_copy = [record.get("url", "") for record in records if record.get("url")]
-        copy_text_to_clipboard("\n".join(urls_to_copy), "selected preview URL(s)")
-
-    def set_selected_url_checks(checked):
-        records = selected_url_records()
-        if not records:
-            messagebox.showwarning("No URL selection", "Select one or more URL rows first.", parent=dialog)
-            return
-
-        for record in records:
-            record["checked"] = bool(checked)
-            update_url_tree_row(record["iid"])
-
-    def set_all_url_checks(checked):
+    def populate_url_tree():
+        for item in url_tree.get_children():
+            url_tree.delete(item)
         for record in url_records:
-            record["checked"] = bool(checked)
+            url_tree.insert("", "end", iid=record["iid"], values=("", "", "", "", "", "", "", "", "", "", ""))
             update_url_tree_row(record["iid"])
 
-    def invert_url_checks():
-        for record in url_records:
-            record["checked"] = not bool(record.get("checked", False))
-            update_url_tree_row(record["iid"])
-
-    def set_all_playlist_checks(checked):
-        for record in playlists:
-            record["checked"] = bool(checked)
-            update_playlist_tree_row(record.get("iid", ""))
-
-    def set_all_current_item_checks(checked):
-        playlist_record = current_playlist_record()
-        if not playlist_record:
-            return
-
-        for entry in playlist_record.get("entries", []):
-            entry["checked"] = bool(checked)
-
-        for iid in entry_tree.get_children():
+    def populate_entry_tree(record):
+        entry_by_iid.clear()
+        for item in entry_tree.get_children():
+            entry_tree.delete(item)
+        entries = list((record or {}).get("entries", []))
+        for index, entry in enumerate(entries):
+            iid = f"{record.get('iid', 'url')}:entry-{index}"
+            entry["iid"] = iid
+            entry_by_iid[iid] = entry
+            entry_tree.insert("", "end", iid=iid, values=("", "", "", "", "", "", "", "", ""))
             update_entry_tree_row(iid)
 
-    def invert_current_item_checks():
-        playlist_record = current_playlist_record()
-        if not playlist_record:
+    def set_details_text(text_value):
+        details_text.configure(state="normal")
+        details_text.delete("1.0", "end")
+        details_text.insert("1.0", str(text_value or ""))
+        details_text.configure(state="disabled")
+
+    def format_record_details(record):
+        if not record:
+            return "Select a URL row to view details."
+        lines = [
+            f"Status: {record.get('status', '')}",
+            f"Type: {record.get('kind', '')}",
+            f"Index: {record.get('index', '')}",
+            f"Title: {record.get('title', '')}",
+            f"Uploader/channel: {record.get('uploader', '')}",
+            f"Duration: {record.get('duration', '')}",
+            f"Items: {record.get('items', '')}",
+            f"Extractor: {(record.get('json') or {}).get('extractor_key') or (record.get('json') or {}).get('extractor') or ''}",
+            f"ID: {(record.get('json') or {}).get('id') or record.get('id') or ''}",
+            f"URL: {record.get('url', '')}",
+            f"Webpage URL: {(record.get('json') or {}).get('webpage_url') or record.get('url', '')}",
+            f"Original URL: {(record.get('json') or {}).get('original_url') or record.get('url', '')}",
+            f"Availability: {(record.get('json') or {}).get('availability') or ''}",
+            f"Live status: {(record.get('json') or {}).get('live_status') or ''}",
+            f"Upload date: {(record.get('json') or {}).get('upload_date') or ''}",
+            f"Playlist: {(record.get('json') or {}).get('playlist') or (record.get('json') or {}).get('playlist_title') or ''}",
+            f"Playlist ID: {(record.get('json') or {}).get('playlist_id') or ''}",
+            f"Playlist index: {(record.get('json') or {}).get('playlist_index') or ''}",
+            f"Thumbnail URL: {record.get('thumbnail_url', '')}",
+            f"Thumbnail cache: {record.get('thumbnail_cache_path', '')}",
+        ]
+        if record.get("error"):
+            lines.extend(["", f"Error/notes: {record.get('error')}"])
+        return "\n".join(lines)
+
+    def set_thumbnail_status(text=""):
+        try:
+            thumbnail_status_var.set(str(text or ""))
+        except Exception:
+            pass
+
+    def clear_thumbnail(text="No thumbnail loaded", status_text=""):
+        thumbnail_image_holder["image"] = None
+        try:
+            thumbnail_label.configure(image="", text=text)
+        except Exception:
+            pass
+        set_thumbnail_status(status_text)
+
+    def thumbnail_record_key(record):
+        if not record:
+            return ""
+        mode = normalize_url_preview_thumbnail_mode(thumbnail_mode_var.get())
+        thumb_url = str(record.get("thumbnail_url") or "").strip()
+        source_url = clean_extracted_url(record.get("url") or record.get("source_url") or "")
+        if not thumb_url and not source_url:
+            return ""
+        return hashlib.sha256(f"{mode}\n{thumb_url}\n{source_url}".encode("utf-8", errors="ignore")).hexdigest()
+
+    def thumbnail_record_label(record):
+        return short_text((record or {}).get("title") or (record or {}).get("url") or "thumbnail", 80)
+
+    def thumbnail_rate_limit_enabled():
+        try:
+            return bool(rate_limit_thumbnails_var.get())
+        except Exception:
+            return True
+
+    def thumbnail_cooldown_delay(fetch_kind):
+        if not thumbnail_rate_limit_enabled():
+            return 0.0
+        if fetch_kind == "ytdlp":
+            return 10.0 + random.uniform(0, 10.0)
+        return 5.0 + random.uniform(0, 5.0)
+
+    def thumbnail_cooldown_remaining(fetch_kind):
+        if not thumbnail_rate_limit_enabled():
+            return 0.0
+        now = time.time()
+        with thumbnail_state_lock:
+            next_allowed = thumbnail_state.get("next_allowed") or {}
+            allowed_at = float(next_allowed.get(fetch_kind) or 0.0)
+        return max(0.0, allowed_at - now)
+
+    def mark_thumbnail_fetch_attempt_completed(fetch_kind):
+        if not thumbnail_rate_limit_enabled():
+            with thumbnail_state_lock:
+                next_allowed = thumbnail_state.setdefault("next_allowed", {"fast": 0.0, "ytdlp": 0.0})
+                next_allowed[fetch_kind] = 0.0
+            return 0.0
+
+        delay = thumbnail_cooldown_delay(fetch_kind)
+        with thumbnail_state_lock:
+            next_allowed = thumbnail_state.setdefault("next_allowed", {"fast": 0.0, "ytdlp": 0.0})
+            next_allowed[fetch_kind] = time.time() + delay
+        return delay
+
+    def thumbnail_desired_key():
+        with thumbnail_state_lock:
+            return thumbnail_state.get("desired_key", "")
+
+    def load_thumbnail_image(record, png_path):
+        if not record or not png_path or not os.path.isfile(png_path):
+            clear_thumbnail("Thumbnail unavailable")
+            return
+        try:
+            image = tk.PhotoImage(file=png_path)
+            thumbnail_image_holder["image"] = image
+            thumbnail_label.configure(image=image, text="")
+            set_thumbnail_status("Thumbnail loaded from cache." if record.get("thumbnail_status") == "Cached" else "Thumbnail loaded.")
+            record["thumbnail_cache_path"] = png_path
+            record["thumbnail_status"] = "Cached"
+            update_preview_row(record)
+            if current_detail_record.get("record") is record:
+                set_details_text(format_record_details(record))
+        except Exception as e:
+            record["thumbnail_error"] = str(e)
+            record["thumbnail_status"] = "Display failed"
+            update_preview_row(record)
+            clear_thumbnail("Thumbnail display failed", "Thumbnail display failed.")
+
+    def apply_thumbnail_fetch_result(record, key, path, error=""):
+        if path:
+            record["thumbnail_cache_path"] = path
+            record["thumbnail_status"] = "Cached"
+            record["thumbnail_error"] = ""
+        else:
+            record["thumbnail_error"] = error
+            record["thumbnail_status"] = "Fetch failed"
+        update_preview_row(record)
+
+        if thumbnail_desired_key() != key or current_detail_record.get("record") is not record:
             return
 
-        for entry in playlist_record.get("entries", []):
-            entry["checked"] = not bool(entry.get("checked", False))
+        if path:
+            load_thumbnail_image(record, path)
+        else:
+            clear_thumbnail("Thumbnail fetch failed", "Thumbnail fetch failed.")
+            set_details_text(format_record_details(record) + (f"\n\nThumbnail error: {error}" if error else ""))
 
-        for iid in entry_tree.get_children():
-            update_entry_tree_row(iid)
+    def cached_fast_thumbnail_path(record):
+        thumb_url = str((record or {}).get("thumbnail_url") or "").strip()
+        if not thumb_url:
+            return ""
+        png_path = os.path.join(preview_cache_folder(), f"{safe_cache_name(thumb_url)}.png")
+        return png_path if os.path.isfile(png_path) else ""
 
-    def select_all_preview_items():
-        children = entry_tree.get_children()
-        if children:
-            entry_tree.selection_set(children)
-            set_all_current_item_checks(True)
+    def cached_ytdlp_thumbnail_path(record):
+        source_url = str((record or {}).get("url") or (record or {}).get("source_url") or "").strip()
+        if not source_url:
+            return ""
+        png_path = os.path.join(preview_cache_folder(), safe_cache_name(source_url), "thumb.png")
+        return png_path if os.path.isfile(png_path) else ""
 
-    def show_tree_context_menu(event, tree, menu):
+    def wait_thumbnail_cooldown(fetch_kind, key, record):
+        if not thumbnail_rate_limit_enabled():
+            return thumbnail_desired_key() == key
+
+        label = "yt-dlp thumbnail fallback" if fetch_kind == "ytdlp" else "thumbnail fetch"
+        while True:
+            remaining = thumbnail_cooldown_remaining(fetch_kind)
+            if remaining <= 0:
+                break
+            with thumbnail_state_lock:
+                visible_record = thumbnail_state.get("desired_record")
+            if visible_record and current_detail_record.get("record") is visible_record:
+                root.after(0, set_thumbnail_status, f"Rate-limited {label}; fetching in {remaining:.1f}s...")
+                root.after(0, lambda r=remaining, l=label: thumbnail_label.configure(image="", text=f"Rate-limited {l}\n{r:.1f}s"))
+            time.sleep(min(0.25, max(0.0, remaining)))
+
+        return thumbnail_desired_key() == key
+
+    def fetch_thumbnail_for_record_with_rate_limits(record, key):
+        mode = thumbnail_mode_var.get()
+        errors = []
+        has_thumbnail_url = bool(str(record.get("thumbnail_url") or "").strip())
+        has_source_url = bool(clean_extracted_url(record.get("url") or record.get("source_url") or ""))
+
+        if mode == "Off":
+            return "", "Thumbnail fetching is off."
+        if not has_thumbnail_url and mode != "Reliable":
+            return "", "No thumbnail URL was available in metadata."
+        if not has_thumbnail_url and not has_source_url:
+            return "", "No thumbnail source URL was available."
+
+        if has_thumbnail_url:
+            cached_path = cached_fast_thumbnail_path(record)
+            if cached_path:
+                return cached_path, ""
+            if not wait_thumbnail_cooldown("fast", key, record):
+                return "", "superseded"
+            did_attempt = False
+            try:
+                root.after(0, set_thumbnail_status, "Fetching thumbnail from metadata URL...")
+                did_attempt = True
+                path = fetch_thumbnail_fast(record)
+                return path, ""
+            except Exception as e:
+                errors.append(str(e))
+            finally:
+                if did_attempt:
+                    mark_thumbnail_fetch_attempt_completed("fast")
+
+        if mode == "Reliable":
+            cached_path = cached_ytdlp_thumbnail_path(record)
+            if cached_path:
+                return cached_path, ""
+            if not wait_thumbnail_cooldown("ytdlp", key, record):
+                return "", "superseded"
+            did_attempt = False
+            try:
+                root.after(0, set_thumbnail_status, "Fetching thumbnail with yt-dlp fallback...")
+                did_attempt = True
+                path = fetch_thumbnail_ytdlp(record)
+                return path, ""
+            except Exception as e:
+                errors.append(str(e))
+            finally:
+                if did_attempt:
+                    mark_thumbnail_fetch_attempt_completed("ytdlp")
+
+        return "", "; ".join(error for error in errors if error) or "thumbnail fetch failed"
+
+    def thumbnail_worker_loop():
+        try:
+            while True:
+                with thumbnail_state_lock:
+                    record = thumbnail_state.get("desired_record")
+                    key = thumbnail_state.get("desired_key", "")
+                if not record or not key:
+                    return
+
+                cached_path = record.get("thumbnail_cache_path")
+                if cached_path and os.path.isfile(cached_path):
+                    root.after(0, load_thumbnail_image, record, cached_path)
+                    return
+
+                if thumbnail_mode_var.get() == "Off":
+                    if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
+                        root.after(0, clear_thumbnail, "Thumbnail fetching is off", "")
+                    return
+
+                record["thumbnail_status"] = "Fetching"
+                root.after(0, update_preview_row, record)
+                if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
+                    root.after(0, clear_thumbnail, "Preparing thumbnail fetch...", "")
+
+                path, error = fetch_thumbnail_for_record_with_rate_limits(record, key)
+
+                if error == "superseded" or thumbnail_desired_key() != key:
+                    continue
+
+                if path:
+                    record["thumbnail_cache_path"] = path
+                    record["thumbnail_status"] = "Cached"
+                    record["thumbnail_error"] = ""
+                else:
+                    record["thumbnail_status"] = "Fetch failed"
+                    record["thumbnail_error"] = error
+                root.after(0, apply_thumbnail_fetch_result, record, key, path, error)
+                return
+        finally:
+            restart_needed = False
+            with thumbnail_state_lock:
+                thumbnail_state["worker_running"] = False
+                record = thumbnail_state.get("desired_record")
+                key = thumbnail_state.get("desired_key", "")
+                if record and key:
+                    cached = record.get("thumbnail_cache_path") and os.path.isfile(record.get("thumbnail_cache_path"))
+                    if not cached and record.get("thumbnail_status") in {"Waiting", "Fetching"}:
+                        restart_needed = True
+            if restart_needed:
+                root.after(0, ensure_thumbnail_worker)
+
+    def ensure_thumbnail_worker():
+        with thumbnail_state_lock:
+            if thumbnail_state.get("worker_running"):
+                return
+            thumbnail_state["worker_running"] = True
+        threading.Thread(target=thumbnail_worker_loop, daemon=True).start()
+
+    def begin_thumbnail_fetch(record):
+        mode = thumbnail_mode_var.get()
+        if mode == "Off":
+            with thumbnail_state_lock:
+                thumbnail_state["desired_key"] = ""
+                thumbnail_state["desired_record"] = None
+            clear_thumbnail("Thumbnail fetching is off")
+            return
+        if not record:
+            with thumbnail_state_lock:
+                thumbnail_state["desired_key"] = ""
+                thumbnail_state["desired_record"] = None
+            clear_thumbnail("No thumbnail loaded")
+            return
+
+        key = thumbnail_record_key(record)
+        has_thumbnail_url = bool(str(record.get("thumbnail_url") or "").strip())
+        has_source_url = bool(clean_extracted_url(record.get("url") or record.get("source_url") or ""))
+        if not has_thumbnail_url and mode != "Reliable":
+            clear_thumbnail("No thumbnail URL")
+            set_thumbnail_status("No thumbnail URL available for Fast mode.")
+            return
+        if not has_thumbnail_url and not has_source_url:
+            clear_thumbnail("No thumbnail source URL")
+            set_thumbnail_status("No thumbnail source URL available.")
+            return
+        if record.get("thumbnail_cache_path") and os.path.isfile(record.get("thumbnail_cache_path")):
+            with thumbnail_state_lock:
+                thumbnail_state["desired_key"] = key
+                thumbnail_state["desired_record"] = record
+            load_thumbnail_image(record, record.get("thumbnail_cache_path"))
+            return
+
+        with thumbnail_state_lock:
+            same_target = thumbnail_state.get("desired_key") == key and thumbnail_state.get("desired_record") is record
+            worker_running = bool(thumbnail_state.get("worker_running"))
+            thumbnail_state["desired_key"] = key
+            thumbnail_state["desired_record"] = record
+        if same_target and worker_running:
+            return
+
+        record["thumbnail_status"] = "Fetching"
+        update_preview_row(record)
+        clear_thumbnail("Fetching thumbnail...")
+        ensure_thumbnail_worker()
+
+    def show_context_for_record(record):
+        context_title_var.set("Select a URL row to view details.")
+        current_detail_record["record"] = record
+        details_frame.grid_remove()
+        playlist_frame.grid_remove()
+        clear_thumbnail()
+        set_details_text("")
+        populate_entry_tree(None)
+
+        if not record:
+            details_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            details_frame.tkraise()
+            set_details_text("Select a URL row to view details.")
+            return
+
+        entries = record.get("entries") or []
+        if entries:
+            context_title_var.set(f"Playlist/context items: {record.get('title') or record.get('url')} ({len(entries)} item(s))")
+            populate_entry_tree(record)
+            # Explicit columnspan=1 is important because the non-playlist state
+            # uses columnspan=2. Without resetting it, Tk can retain the old
+            # span and draw the details notebook underneath/over the playlist list.
+            details_frame.grid(row=1, column=0, columnspan=1, sticky="nsew", padx=(0, 8))
+            playlist_frame.grid(row=1, column=1, columnspan=1, sticky="nsew")
+            details_frame.tkraise()
+            playlist_frame.tkraise()
+            set_details_text(format_record_details(record))
+            begin_thumbnail_fetch(record)
+        else:
+            context_title_var.set(f"URL details: {record.get('title') or record.get('url')}")
+            details_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            details_frame.tkraise()
+            set_details_text(format_record_details(record))
+            begin_thumbnail_fetch(record)
+
+    def show_context_for_entry(entry):
+        if not entry:
+            return
+        current_detail_record["record"] = entry
+        context_title_var.set(f"Playlist item details: {entry.get('title') or entry.get('url')}")
+        set_details_text(format_record_details(entry))
+        begin_thumbnail_fetch(entry)
+
+    def on_url_tree_select(event=None):
+        show_context_for_record(current_url_record())
+
+    def on_entry_tree_select(event=None):
+        entries = selected_entry_records()
+        if entries:
+            show_context_for_entry(entries[0])
+
+    def on_url_tree_click(event):
+        if not has_preview_urls:
+            return "break"
+        try:
+            item_id = url_tree.identify_row(event.y)
+            region = url_tree.identify("region", event.x, event.y)
+            column_id = url_tree.identify_column(event.x)
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(url_tree)
+                show_context_for_record(None)
+                return "break"
+            if column_id == "#1":
+                toggle_url_flag(item_id, "preview")
+                url_tree.selection_set(item_id)
+                url_tree.focus(item_id)
+                show_context_for_record(url_by_iid.get(item_id))
+                return "break"
+            if column_id == "#2":
+                toggle_url_flag(item_id, "include")
+                url_tree.selection_set(item_id)
+                url_tree.focus(item_id)
+                show_context_for_record(url_by_iid.get(item_id))
+                return "break"
+            return None
+        except Exception:
+            return
+
+    def on_url_tree_double_click(event):
+        if not has_preview_urls:
+            return "break"
+        try:
+            item_id = url_tree.identify_row(event.y)
+            column_id = url_tree.identify_column(event.x)
+            if not item_id:
+                return "break"
+            if column_id not in {"#1", "#2"}:
+                toggle_url_flag(item_id, "preview")
+            url_tree.selection_set(item_id)
+            url_tree.focus(item_id)
+            show_context_for_record(url_by_iid.get(item_id))
+            return "break"
+        except Exception:
+            return
+
+    def on_entry_tree_click(event):
+        if not has_preview_urls:
+            return "break"
+        try:
+            item_id = entry_tree.identify_row(event.y)
+            region = entry_tree.identify("region", event.x, event.y)
+            column_id = entry_tree.identify_column(event.x)
+            if not item_id or region not in {"cell", "tree"}:
+                clear_tree_selection(entry_tree)
+                return "break"
+            if column_id == "#1":
+                toggle_entry_include(item_id)
+                entry_tree.selection_set(item_id)
+                entry_tree.focus(item_id)
+                show_context_for_entry(entry_by_iid.get(item_id))
+                return "break"
+            return None
+        except Exception:
+            return
+
+    def on_entry_tree_double_click(event):
+        if not has_preview_urls:
+            return "break"
+        try:
+            item_id = entry_tree.identify_row(event.y)
+            if not item_id:
+                return "break"
+            toggle_entry_include(item_id)
+            entry_tree.selection_set(item_id)
+            entry_tree.focus(item_id)
+            show_context_for_entry(entry_by_iid.get(item_id))
+            return "break"
+        except Exception:
+            return
+
+    def show_tree_context_menu(event, tree, menu, context_holder=None):
+        if not has_preview_urls:
+            return "break"
         try:
             iid = tree.identify_row(event.y)
-            if iid and iid not in tree.selection():
+            if context_holder is not None:
+                context_holder["value"] = iid or ""
+            if iid:
                 tree.selection_set(iid)
+                tree.focus(iid)
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             try:
@@ -10360,201 +11405,335 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 pass
         return "break"
 
+    def toggle_options_panel():
+        options_visible["value"] = not options_visible["value"]
+        if options_visible["value"]:
+            options_panel.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 6))
+            options_panel.tkraise()
+            options_button.configure(text="Preview Options ▴")
+        else:
+            options_panel.grid_remove()
+            options_button.configure(text="Preview Options ▾")
+
+    def pack_preview_button(widget):
+        widget.pack(side="left", padx=(0, 6), pady=2)
+        return widget
+
+    header = ttk.Frame(dialog, padding=(12, 12, 12, 4))
+    header.grid(row=0, column=0, sticky="ew")
+    header.columnconfigure(0, weight=1)
+    ttk.Label(header, textvariable=status_var).grid(row=0, column=0, sticky="w")
+
     url_action_frame = ttk.LabelFrame(dialog, text="URL Preview Actions", padding=8)
     url_action_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
+    action_buttons = []
+    preview_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Preview All", command=lambda: start_preview(False)))
+    action_buttons.append(preview_all_button)
+    preview_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Preview Checked", command=lambda: start_preview(True)))
+    action_buttons.append(preview_selected_button)
+    stop_button = pack_preview_button(ttk.Button(url_action_frame, text="Stop", command=stop_preview, state="disabled"))
+    start_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Start All", command=lambda: start_top_urls(False, "all usable top-level URL(s)")))
+    action_buttons.append(start_all_button)
+    start_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Start Included", command=lambda: start_top_urls(True, "included top-level URL(s)")))
+    action_buttons.append(start_selected_button)
+    queue_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue All", command=lambda: queue_top_urls(False, "all usable top-level URL(s)")))
+    action_buttons.append(queue_all_button)
+    queue_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue Included", command=lambda: queue_top_urls(True, "included top-level URL(s)")))
+    action_buttons.append(queue_selected_button)
+    export_button = pack_preview_button(ttk.Button(url_action_frame, text="Export JSON", command=export_preview_json))
+    action_buttons.append(export_button)
 
-    start_button = ttk.Button(url_action_frame, text="Start Checked", command=lambda: start_scan(False))
-    pack_preview_button(start_button)
-    start_selected_button = ttk.Button(url_action_frame, text="Start Selected", command=lambda: start_scan(True))
-    pack_preview_button(start_selected_button)
-    stop_button = ttk.Button(url_action_frame, text="Stop", command=stop_scan, state="disabled")
-    pack_preview_button(stop_button)
-    pack_preview_button(ttk.Button(url_action_frame, text="Check All", command=lambda: set_all_url_checks(True)))
-    pack_preview_button(ttk.Button(url_action_frame, text="Uncheck All", command=lambda: set_all_url_checks(False)))
-    pack_preview_button(ttk.Button(url_action_frame, text="Invert Checks", command=invert_url_checks))
-    pack_preview_button(ttk.Button(url_action_frame, text="Copy Selected URL(s)", command=copy_selected_preview_urls))
-
-    url_frame = ttk.LabelFrame(dialog, text="URLs to Preview", padding=8)
+    url_frame = ttk.LabelFrame(dialog, text="URLs", padding=8)
     url_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
     url_frame.columnconfigure(0, weight=1)
     url_frame.rowconfigure(0, weight=1)
 
     url_tree = ttk.Treeview(
         url_frame,
-        columns=("selected", "number", "status", "url"),
+        columns=("preview", "include", "number", "status", "type", "title", "uploader", "duration", "items", "thumb", "url"),
         show="headings",
-        selectmode="browse",
-        height=8,
+        selectmode="extended",
+        height=9,
     )
-    url_tree.heading("selected", text="Use")
-    url_tree.heading("number", text="#")
-    url_tree.heading("status", text="Status")
-    url_tree.heading("url", text="URL")
-    url_tree.column("selected", width=55, anchor="center", stretch=False)
-    url_tree.column("number", width=55, anchor="e", stretch=False)
-    url_tree.column("status", width=130, stretch=False)
-    url_tree.column("url", width=900)
+    for col, label in (
+        ("preview", "Preview"), ("include", "Include"), ("number", "#"), ("status", "Status"),
+        ("type", "Type"), ("title", "Title"), ("uploader", "Uploader"), ("duration", "Duration"),
+        ("items", "Items"), ("thumb", "Thumbnail"), ("url", "URL"),
+    ):
+        url_tree.heading(col, text=label)
+    url_tree.column("preview", width=70, anchor="center", stretch=False)
+    url_tree.column("include", width=70, anchor="center", stretch=False)
+    url_tree.column("number", width=45, anchor="e", stretch=False)
+    url_tree.column("status", width=110, stretch=False)
+    url_tree.column("type", width=100, stretch=False)
+    url_tree.column("title", width=250)
+    url_tree.column("uploader", width=150)
+    url_tree.column("duration", width=85, stretch=False)
+    url_tree.column("items", width=65, anchor="e", stretch=False)
+    url_tree.column("thumb", width=95, stretch=False)
+    url_tree.column("url", width=430)
     url_tree.grid(row=0, column=0, sticky="nsew")
-
     url_scroll_y = ttk.Scrollbar(url_frame, orient="vertical", command=url_tree.yview)
     url_scroll_y.grid(row=0, column=1, sticky="ns")
     url_scroll_x = ttk.Scrollbar(url_frame, orient="horizontal", command=url_tree.xview)
     url_scroll_x.grid(row=1, column=0, sticky="ew")
     url_tree.configure(yscrollcommand=url_scroll_y.set, xscrollcommand=url_scroll_x.set)
+    url_tree.bind("<<TreeviewSelect>>", on_url_tree_select)
     url_tree.bind("<Button-1>", on_url_tree_click)
     url_tree.bind("<Double-1>", on_url_tree_double_click)
-    populate_preview_url_tree()
+    populate_url_tree()
 
-    playlist_action_frame = ttk.LabelFrame(dialog, text="Playlist Actions", padding=8)
-    playlist_action_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 6))
+    bottom_outer = ttk.LabelFrame(dialog, text="Selected URL Context", padding=8)
+    bottom_outer.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    bottom_outer.columnconfigure(0, weight=1, minsize=320)
+    bottom_outer.columnconfigure(1, weight=2)
+    bottom_outer.rowconfigure(1, weight=1)
 
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Copy Checked Playlist URL(s)", command=copy_checked_playlist_urls))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Copy Items from Checked", command=copy_checked_playlist_item_urls))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Queue Checked Playlist(s)", command=lambda: queue_preview_item_urls(True)))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Queue All Playlist(s)", command=lambda: queue_preview_item_urls(False)))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Check All", command=lambda: set_all_playlist_checks(True)))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Uncheck All", command=lambda: set_all_playlist_checks(False)))
-    pack_preview_button(ttk.Button(playlist_action_frame, text="Export JSON", command=export_preview_json))
+    bottom_header = ttk.Frame(bottom_outer)
+    bottom_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+    bottom_header.columnconfigure(0, weight=1)
+    ttk.Label(bottom_header, textvariable=context_title_var).grid(row=0, column=0, sticky="w")
 
-    playlist_frame = ttk.LabelFrame(dialog, text="Playlists Found", padding=8)
-    playlist_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    options_panel = ttk.Frame(dialog, padding=8)
+    options_panel.columnconfigure(7, weight=1)
+    ttk.Label(options_panel, text="Preview pacing").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+    ttk.Combobox(options_panel, textvariable=pacing_var, values=list(preview_pacing_options.keys()), state="readonly", width=28).grid(row=0, column=1, sticky="w", padx=(0, 12), pady=2)
+    ttk.Label(options_panel, text="Thumbnails").grid(row=0, column=2, sticky="w", padx=(0, 6), pady=2)
+    ttk.Combobox(options_panel, textvariable=thumbnail_mode_var, values=thumbnail_mode_options, state="readonly", width=12).grid(row=0, column=3, sticky="w", padx=(0, 12), pady=2)
+    ttk.Label(options_panel, text="Playlist mode").grid(row=0, column=4, sticky="w", padx=(0, 6), pady=2)
+    ttk.Combobox(options_panel, textvariable=playlist_mode_var, values=playlist_mode_options, state="readonly", width=22).grid(row=0, column=5, sticky="w", padx=(0, 12), pady=2)
+    ttk.Label(options_panel, text="Max items").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=2)
+    ttk.Entry(options_panel, textvariable=max_playlist_items_var, width=8).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=2)
+    ttk.Label(options_panel, text="Timeout sec").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=2)
+    ttk.Entry(options_panel, textvariable=timeout_var, width=8).grid(row=1, column=3, sticky="w", padx=(0, 12), pady=2)
+    ttk.Checkbutton(
+        options_panel,
+        text="Rate limit thumbnails",
+        variable=rate_limit_thumbnails_var,
+    ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(0, 12), pady=2)
+    ttk.Label(options_panel, text="Cache mode").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=2)
+    ttk.Combobox(options_panel, textvariable=cache_mode_var, values=cache_mode_options, state="readonly", width=24).grid(row=2, column=1, columnspan=3, sticky="w", padx=(0, 12), pady=2)
+    options_panel.grid_remove()
+
+    preview_options_bar = ttk.Frame(dialog)
+    preview_options_bar.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 8))
+    preview_options_bar.columnconfigure(1, weight=1)
+    options_button = ttk.Button(preview_options_bar, text="Preview Options ▾", command=toggle_options_panel)
+    options_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+    details_frame = ttk.Frame(bottom_outer)
+    details_frame.columnconfigure(0, weight=1)
+    details_frame.rowconfigure(0, weight=1)
+
+    details_notebook = ttk.Notebook(details_frame)
+    details_notebook.grid(row=0, column=0, sticky="nsew")
+
+    thumbnail_tab = ttk.Frame(details_notebook, padding=8)
+    thumbnail_tab.columnconfigure(0, weight=1)
+    thumbnail_tab.rowconfigure(0, weight=1)
+    thumbnail_tab.rowconfigure(1, weight=0)
+    thumbnail_label = ttk.Label(thumbnail_tab, text="No thumbnail loaded", anchor="center", justify="center", width=32)
+    thumbnail_label.grid(row=0, column=0, sticky="nsew")
+    ttk.Label(thumbnail_tab, textvariable=thumbnail_status_var, anchor="center", justify="center", wraplength=260).grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+    metadata_tab = ttk.Frame(details_notebook, padding=8)
+    metadata_tab.columnconfigure(0, weight=1)
+    metadata_tab.rowconfigure(0, weight=1)
+    details_text = tk.Text(metadata_tab, height=9, wrap="none", state="disabled")
+    details_text.grid(row=0, column=0, sticky="nsew")
+    details_scroll_y = ttk.Scrollbar(metadata_tab, orient="vertical", command=details_text.yview)
+    details_scroll_y.grid(row=0, column=1, sticky="ns")
+    details_scroll_x = ttk.Scrollbar(metadata_tab, orient="horizontal", command=details_text.xview)
+    details_scroll_x.grid(row=1, column=0, sticky="ew")
+    details_text.configure(yscrollcommand=details_scroll_y.set, xscrollcommand=details_scroll_x.set)
+
+    details_notebook.add(thumbnail_tab, text="Thumbnail")
+    details_notebook.add(metadata_tab, text="Metadata")
+
+    playlist_frame = ttk.Frame(bottom_outer)
     playlist_frame.columnconfigure(0, weight=1)
-    playlist_frame.rowconfigure(0, weight=1)
+    playlist_frame.rowconfigure(1, weight=1)
+    playlist_action_frame = ttk.LabelFrame(playlist_frame, text="Playlist Item Actions", padding=8)
+    playlist_action_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    playlist_action_frame.columnconfigure(1, weight=1)
 
-    playlist_tree = ttk.Treeview(
-        playlist_frame,
-        columns=("selected", "number", "title", "entries", "extractor", "id", "url"),
-        show="headings",
-        selectmode="browse",
-        height=8,
+    def scroll_playlist_action_buttons(direction):
+        try:
+            bbox = playlist_action_canvas.bbox("all")
+            if not bbox:
+                return
+            content_width = max(1, bbox[2] - bbox[0])
+            view_width = max(1, playlist_action_canvas.winfo_width())
+            if content_width <= view_width:
+                playlist_action_canvas.xview_moveto(0)
+                return
+            current_left = playlist_action_canvas.canvasx(0)
+            new_left = max(0, min(content_width - view_width, current_left + (direction * 180)))
+            playlist_action_canvas.xview_moveto(new_left / content_width)
+        except Exception:
+            try:
+                playlist_action_canvas.xview_scroll(direction * 3, "units")
+            except Exception:
+                pass
+
+    def update_playlist_action_scroll_region(_event=None):
+        try:
+            playlist_action_canvas.configure(scrollregion=playlist_action_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    playlist_action_left = ttk.Button(
+        playlist_action_frame,
+        text="◀",
+        width=3,
+        command=lambda: scroll_playlist_action_buttons(-1),
     )
-    playlist_tree.heading("selected", text="Select")
-    playlist_tree.heading("number", text="#")
-    playlist_tree.heading("title", text="Title")
-    playlist_tree.heading("entries", text="Items")
-    playlist_tree.heading("extractor", text="Source")
-    playlist_tree.heading("id", text="ID")
-    playlist_tree.heading("url", text="URL")
-    playlist_tree.column("selected", width=70, anchor="center", stretch=False)
-    playlist_tree.column("number", width=45, anchor="e", stretch=False)
-    playlist_tree.column("title", width=300)
-    playlist_tree.column("entries", width=70, anchor="e", stretch=False)
-    playlist_tree.column("extractor", width=110, stretch=False)
-    playlist_tree.column("id", width=140)
-    playlist_tree.column("url", width=390)
-    playlist_tree.grid(row=0, column=0, sticky="nsew")
+    playlist_action_left.grid(row=0, column=0, sticky="w", padx=(0, 6))
 
-    playlist_scroll_y = ttk.Scrollbar(playlist_frame, orient="vertical", command=playlist_tree.yview)
-    playlist_scroll_y.grid(row=0, column=1, sticky="ns")
-    playlist_scroll_x = ttk.Scrollbar(playlist_frame, orient="horizontal", command=playlist_tree.xview)
-    playlist_scroll_x.grid(row=1, column=0, sticky="ew")
-    playlist_tree.configure(yscrollcommand=playlist_scroll_y.set, xscrollcommand=playlist_scroll_x.set)
-    playlist_tree.bind("<<TreeviewSelect>>", on_playlist_selected)
-    playlist_tree.bind("<Button-1>", on_playlist_tree_click)
-    playlist_tree.bind("<Double-1>", on_playlist_tree_double_click)
+    try:
+        playlist_action_canvas_bg = dialog.cget("background")
+    except Exception:
+        playlist_action_canvas_bg = None
+    playlist_action_canvas_kwargs = {"height": 36, "highlightthickness": 0, "borderwidth": 0}
+    if playlist_action_canvas_bg:
+        playlist_action_canvas_kwargs["background"] = playlist_action_canvas_bg
+    playlist_action_canvas = tk.Canvas(playlist_action_frame, **playlist_action_canvas_kwargs)
+    playlist_action_canvas.grid(row=0, column=1, sticky="ew")
 
-    ttk.Label(dialog, textvariable=selected_playlist_var, padding=(12, 2, 12, 4)).grid(row=5, column=0, sticky="ew")
+    playlist_action_button_frame = ttk.Frame(playlist_action_canvas)
+    playlist_action_window = playlist_action_canvas.create_window(
+        (0, 0),
+        window=playlist_action_button_frame,
+        anchor="nw",
+    )
+    playlist_action_button_frame.bind("<Configure>", update_playlist_action_scroll_region)
+    playlist_action_canvas.bind(
+        "<Configure>",
+        lambda event: (
+            playlist_action_canvas.itemconfigure(playlist_action_window, height=event.height),
+            update_playlist_action_scroll_region(),
+        ),
+    )
 
-    item_action_frame = ttk.LabelFrame(dialog, text="Playlist Item Actions", padding=8)
-    item_action_frame.grid(row=6, column=0, sticky="ew", padx=12, pady=(0, 6))
+    playlist_action_right = ttk.Button(
+        playlist_action_frame,
+        text="▶",
+        width=3,
+        command=lambda: scroll_playlist_action_buttons(1),
+    )
+    playlist_action_right.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
-    pack_preview_button(ttk.Button(item_action_frame, text="Copy Checked Item URL(s)", command=copy_selected_item_urls))
-    pack_preview_button(ttk.Button(item_action_frame, text="Copy All Item URL(s)", command=copy_all_current_item_urls))
-    pack_preview_button(ttk.Button(item_action_frame, text="Use Checked in URL Box", command=lambda: set_url_box_from_selected_items(False)))
-    pack_preview_button(ttk.Button(item_action_frame, text="Append Checked", command=lambda: set_url_box_from_selected_items(True)))
-    pack_preview_button(ttk.Button(item_action_frame, text="Split and Queue Checked", command=lambda: split_and_queue_preview_item_urls(True)))
-    pack_preview_button(ttk.Button(item_action_frame, text="Set Playlist Items", command=set_playlist_items_from_selection))
-    pack_preview_button(ttk.Button(item_action_frame, text="Check All Items", command=lambda: set_all_current_item_checks(True)))
-    pack_preview_button(ttk.Button(item_action_frame, text="Uncheck All Items", command=lambda: set_all_current_item_checks(False)))
+    def pack_playlist_action_button(widget):
+        widget.pack(side="left", padx=(0, 6), pady=2)
+        return widget
 
-    entries_frame = ttk.LabelFrame(dialog, text="Playlist Items", padding=8)
-    entries_frame.grid(row=7, column=0, sticky="nsew", padx=12, pady=(0, 8))
-    entries_frame.columnconfigure(0, weight=1)
-    entries_frame.rowconfigure(0, weight=1)
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start All Items", command=lambda: start_urls_now(urls_from_entries(current_playlist_entries(False, False)), "playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start Included Items", command=lambda: start_urls_now(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue All Items", command=lambda: queue_urls(urls_from_entries(current_playlist_entries(False, False)), "playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue Included Items", command=lambda: queue_urls(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Copy Included URLs", command=lambda: copy_text_to_clipboard("\n".join(urls_from_entries(current_playlist_entries(True, False))), "included playlist item URL(s)")))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Load Included URLs", command=lambda: set_url_box_from_current_items(False)))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Append Included URLs", command=lambda: set_url_box_from_current_items(True)))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Set Playlist Items", command=set_playlist_items_from_current_selection))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Include All", command=lambda: set_all_current_item_includes(True)))
+    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Exclude All", command=lambda: set_all_current_item_includes(False)))
 
+    entry_frame = ttk.LabelFrame(playlist_frame, text="Playlist / Context URLs", padding=8)
+    entry_frame.grid(row=1, column=0, sticky="nsew")
+    entry_frame.columnconfigure(0, weight=1)
+    entry_frame.rowconfigure(0, weight=1)
     entry_tree = ttk.Treeview(
-        entries_frame,
-        columns=("selected", "index", "title", "id", "duration", "url"),
+        entry_frame,
+        columns=("include", "index", "status", "title", "duration", "thumb", "json", "url"),
         show="headings",
-        selectmode="browse",
+        selectmode="extended",
         height=8,
     )
-    entry_tree.heading("selected", text="Select")
-    entry_tree.heading("index", text="Index")
-    entry_tree.heading("title", text="Title")
-    entry_tree.heading("id", text="ID")
-    entry_tree.heading("duration", text="Duration")
-    entry_tree.heading("url", text="URL")
-    entry_tree.column("selected", width=70, anchor="center", stretch=False)
+    for col, label in (
+        ("include", "Include"), ("index", "Index"), ("status", "Status"), ("title", "Title"),
+        ("duration", "Duration"), ("thumb", "Thumbnail"), ("json", "JSON"), ("url", "URL"),
+    ):
+        entry_tree.heading(col, text=label)
+    entry_tree.column("include", width=70, anchor="center", stretch=False)
     entry_tree.column("index", width=70, anchor="e", stretch=False)
-    entry_tree.column("title", width=360)
-    entry_tree.column("id", width=140)
+    entry_tree.column("status", width=90, stretch=False)
+    entry_tree.column("title", width=260)
     entry_tree.column("duration", width=90, stretch=False)
-    entry_tree.column("url", width=420)
+    entry_tree.column("thumb", width=95, stretch=False)
+    entry_tree.column("json", width=60, anchor="center", stretch=False)
+    entry_tree.column("url", width=380)
     entry_tree.grid(row=0, column=0, sticky="nsew")
-
-    entry_scroll_y = ttk.Scrollbar(entries_frame, orient="vertical", command=entry_tree.yview)
+    entry_scroll_y = ttk.Scrollbar(entry_frame, orient="vertical", command=entry_tree.yview)
     entry_scroll_y.grid(row=0, column=1, sticky="ns")
-    entry_scroll_x = ttk.Scrollbar(entries_frame, orient="horizontal", command=entry_tree.xview)
+    entry_scroll_x = ttk.Scrollbar(entry_frame, orient="horizontal", command=entry_tree.xview)
     entry_scroll_x.grid(row=1, column=0, sticky="ew")
     entry_tree.configure(yscrollcommand=entry_scroll_y.set, xscrollcommand=entry_scroll_x.set)
+    entry_tree.bind("<<TreeviewSelect>>", on_entry_tree_select)
     entry_tree.bind("<Button-1>", on_entry_tree_click)
     entry_tree.bind("<Double-1>", on_entry_tree_double_click)
 
-    url_context_menu = tk.Menu(dialog, tearoff=False)
-    url_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_url_preview_checkmark(iid) for iid in url_tree.selection()])
-    url_context_menu.add_command(label="Check Selected", command=lambda: set_selected_url_checks(True))
-    url_context_menu.add_command(label="Uncheck Selected", command=lambda: set_selected_url_checks(False))
-    url_context_menu.add_separator()
-    url_context_menu.add_command(label="Check All", command=lambda: set_all_url_checks(True))
-    url_context_menu.add_command(label="Uncheck All", command=lambda: set_all_url_checks(False))
-    url_context_menu.add_command(label="Invert Checks", command=invert_url_checks)
-    url_context_menu.add_separator()
-    url_context_menu.add_command(label="Start Checked", command=lambda: start_scan(False))
-    url_context_menu.add_command(label="Start Selected", command=lambda: start_scan(True))
-    url_context_menu.add_command(label="Copy Selected URL(s)", command=copy_selected_preview_urls)
+    details_frame.grid(row=1, column=0, columnspan=2, sticky="nsew")
+    details_frame.tkraise()
+    playlist_frame.grid_remove()
+    show_context_for_record(None)
 
-    playlist_context_menu = tk.Menu(dialog, tearoff=False)
-    playlist_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_playlist_preview_checkmark(iid) for iid in playlist_tree.selection()])
-    playlist_context_menu.add_command(label="Check All", command=lambda: set_all_playlist_checks(True))
-    playlist_context_menu.add_command(label="Uncheck All", command=lambda: set_all_playlist_checks(False))
-    playlist_context_menu.add_separator()
-    playlist_context_menu.add_command(label="Copy Checked Playlist URL(s)", command=copy_checked_playlist_urls)
-    playlist_context_menu.add_command(label="Copy Items from Checked", command=copy_checked_playlist_item_urls)
-    playlist_context_menu.add_separator()
-    playlist_context_menu.add_command(label="Queue Checked Playlist(s)", command=lambda: queue_preview_item_urls(True))
-    playlist_context_menu.add_command(label="Queue All Playlist(s)", command=lambda: queue_preview_item_urls(False))
-    playlist_context_menu.add_separator()
-    playlist_context_menu.add_command(label="Export JSON", command=export_preview_json)
+    url_context_menu = tk.Menu(dialog, tearoff=False)
+    url_context_menu.add_command(label="Toggle Preview for Highlighted Row", command=lambda: toggle_url_flag(url_context_iid.get("value") or url_tree.focus(), "preview"))
+    url_context_menu.add_command(label="Toggle Include for Highlighted Row", command=lambda: toggle_url_flag(url_context_iid.get("value") or url_tree.focus(), "include"))
+    url_context_menu.add_separator()
+    url_context_menu.add_command(label="Preview Highlighted URL", command=preview_highlighted_url)
+    url_context_menu.add_command(label="Start Highlighted URL", command=start_highlighted_url)
+    url_context_menu.add_command(label="Queue Highlighted URL", command=queue_highlighted_url)
+    url_context_menu.add_command(label="Open Highlighted URL", command=open_highlighted_url)
+    url_context_menu.add_separator()
+    url_context_menu.add_command(label="Copy Highlighted URL", command=lambda: copy_text_to_clipboard(highlighted_url_value()[1], "highlighted URL"))
+    url_context_menu.add_command(label="Copy Highlighted JSON", command=copy_selected_record_json)
+    url_context_menu.add_command(label="Export Highlighted JSON...", command=export_highlighted_url_json)
+    url_context_menu.add_separator()
+    url_context_menu.add_command(label="Preview All On", command=lambda: set_all_url_preview_flags("preview", True))
+    url_context_menu.add_command(label="Preview All Off", command=lambda: set_all_url_preview_flags("preview", False))
+    url_context_menu.add_command(label="Include All", command=lambda: set_all_url_preview_flags("include", True))
+    url_context_menu.add_command(label="Exclude All", command=lambda: set_all_url_preview_flags("include", False))
 
     entry_context_menu = tk.Menu(dialog, tearoff=False)
-    entry_context_menu.add_command(label="Toggle Check", command=lambda: [toggle_entry_preview_checkmark(iid) for iid in entry_tree.selection()])
-    entry_context_menu.add_command(label="Check All Items", command=lambda: set_all_current_item_checks(True))
-    entry_context_menu.add_command(label="Uncheck All Items", command=lambda: set_all_current_item_checks(False))
-    entry_context_menu.add_command(label="Invert Item Checks", command=invert_current_item_checks)
+    entry_context_menu.add_command(label="Toggle Include for Highlighted Item", command=toggle_highlighted_entry_include)
+    entry_context_menu.add_command(label="Include All Items", command=lambda: set_all_current_item_includes(True))
+    entry_context_menu.add_command(label="Exclude All Items", command=lambda: set_all_current_item_includes(False))
+    entry_context_menu.add_command(label="Invert Item Includes", command=invert_current_item_includes)
     entry_context_menu.add_separator()
-    entry_context_menu.add_command(label="Copy Checked Item URL(s)", command=copy_selected_item_urls)
-    entry_context_menu.add_command(label="Copy All Item URL(s)", command=copy_all_current_item_urls)
+    entry_context_menu.add_command(label="Start Highlighted Item", command=start_highlighted_entry)
+    entry_context_menu.add_command(label="Queue Highlighted Item", command=queue_highlighted_entry)
+    entry_context_menu.add_command(label="Open Highlighted Item URL", command=open_highlighted_entry_url)
+    entry_context_menu.add_command(label="Copy Highlighted Item JSON", command=copy_highlighted_entry_json)
+    entry_context_menu.add_command(label="Export Highlighted Item JSON...", command=export_highlighted_entry_json)
+    entry_context_menu.add_command(label="Copy Included Item URL(s)", command=lambda: copy_text_to_clipboard("\n".join(urls_from_entries(included_entry_records())), "included playlist item URL(s)"))
     entry_context_menu.add_separator()
-    entry_context_menu.add_command(label="Use Checked in URL Box", command=lambda: set_url_box_from_selected_items(False))
-    entry_context_menu.add_command(label="Append Checked", command=lambda: set_url_box_from_selected_items(True))
-    entry_context_menu.add_separator()
-    entry_context_menu.add_command(label="Split and Queue Checked", command=lambda: split_and_queue_preview_item_urls(True))
-    entry_context_menu.add_command(label="Set Playlist Items", command=set_playlist_items_from_selection)
+    entry_context_menu.add_command(label="Start Included Items", command=lambda: start_urls_now(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name()))
+    entry_context_menu.add_command(label="Queue Included Items", command=lambda: queue_urls(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name()))
 
-    url_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, url_tree, url_context_menu))
-    playlist_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, playlist_tree, playlist_context_menu))
-    entry_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, entry_tree, entry_context_menu))
+    url_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, url_tree, url_context_menu, url_context_iid))
+    entry_tree.bind("<Button-3>", lambda event: show_tree_context_menu(event, entry_tree, entry_context_menu, entry_context_iid))
+
+    extra_action_frame = ttk.Frame(url_action_frame)
+    extra_action_frame.pack(side="left", padx=(6, 0))
+    pack_preview_button(ttk.Button(extra_action_frame, text="Preview ✓ All", command=lambda: set_all_url_preview_flags("preview", True)))
+    pack_preview_button(ttk.Button(extra_action_frame, text="Preview ☐ All", command=lambda: set_all_url_preview_flags("preview", False)))
+    pack_preview_button(ttk.Button(extra_action_frame, text="Include ✓ All", command=lambda: set_all_url_preview_flags("include", True)))
+    pack_preview_button(ttk.Button(extra_action_frame, text="Include ☐ All", command=lambda: set_all_url_preview_flags("include", False)))
 
     try:
         configure_tk_widget_theme(dialog, get_theme_colors())
     except Exception:
         pass
 
+    update_action_states()
+    if has_preview_urls:
+        status_var.set(f"Loaded {len(urls)} URL(s). Use Preview All/Checked to gather metadata; Include checkmarks control Start/Queue Included actions.")
+    else:
+        status_var.set(f"{no_urls_message} Add URLs in the URL box or select Input File(s) to enable URL Preview.")
+
     playlist_preview_tab_loaded = True
     playlist_preview_loaded_signature = playlist_preview_source_signature
-    status_var.set(f"Loaded {len(urls)} URL(s). Press Start Checked to scan checked URLs or Start Selected to scan selected rows.")
-
 
 def check_impersonate_targets():
     yt_dlp_path = yt_dlp_path_var.get().strip()
@@ -12791,6 +13970,31 @@ def open_case_browser(select_tab=True, silent=False):
 
     paned.add(right_frame, weight=4)
 
+    case_browser_ignored_folder_names = {".gui-cache", "__pycache__"}
+    case_browser_ignored_file_names = {".ds_store", "desktop.ini", "thumbs.db"}
+
+    def folder_contains_meaningful_case_files(folder_path):
+        """Return True when a top-level folder looks like a real case, not only GUI cache."""
+
+        if not os.path.isdir(folder_path):
+            return False
+
+        try:
+            for root_dir, dir_names, file_names in os.walk(folder_path):
+                dir_names[:] = [
+                    name for name in dir_names
+                    if name.lower() not in case_browser_ignored_folder_names
+                ]
+
+                for file_name in file_names:
+                    if file_name.lower() in case_browser_ignored_file_names:
+                        continue
+                    return True
+        except Exception:
+            return False
+
+        return False
+
     def build_folder_tree_snapshot(folder_path, max_depth=4, depth=0):
         if depth > max_depth:
             return []
@@ -12798,10 +14002,16 @@ def open_case_browser(select_tab=True, silent=False):
         try:
             entries = [
                 entry for entry in os.scandir(folder_path)
-                if entry.is_dir() and entry.name.lower() not in {".gui-cache", "__pycache__"}
+                if entry.is_dir() and entry.name.lower() not in case_browser_ignored_folder_names
             ]
         except Exception:
             entries = []
+
+        if depth == 0:
+            entries = [
+                entry for entry in entries
+                if folder_contains_meaningful_case_files(entry.path)
+            ]
 
         entries.sort(key=lambda entry: entry.name.lower())
         nodes = []
@@ -13597,6 +14807,13 @@ target_status_var = tk.StringVar(value="Impersonate targets: Not checked")
 split_queue_mode_var = tk.StringVar(value=DEFAULTS["split_queue_mode"])
 split_queue_urls_per_group_var = tk.StringVar(value=DEFAULTS["split_queue_urls_per_group"])
 split_queue_group_count_var = tk.StringVar(value=DEFAULTS["split_queue_group_count"])
+url_preview_pacing_var = tk.StringVar(value=DEFAULTS["url_preview_pacing"])
+url_preview_thumbnail_mode_var = tk.StringVar(value=DEFAULTS["url_preview_thumbnail_mode"])
+url_preview_rate_limit_thumbnails_var = tk.BooleanVar(value=DEFAULTS["url_preview_rate_limit_thumbnails"])
+url_preview_cache_mode_var = tk.StringVar(value=DEFAULTS["url_preview_cache_mode"])
+url_preview_playlist_mode_var = tk.StringVar(value=DEFAULTS["url_preview_playlist_mode"])
+url_preview_max_playlist_items_var = tk.StringVar(value=DEFAULTS["url_preview_max_playlist_items"])
+url_preview_timeout_var = tk.StringVar(value=DEFAULTS["url_preview_timeout"])
 status_var = tk.StringVar(value="Ready")
 yt_dlp_version_status_var = tk.StringVar(value="yt-dlp: not checked")
 preflight_done_var = tk.BooleanVar(value=False)
@@ -13610,6 +14827,7 @@ case_browser_current_only_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["case_
 case_browser_icon_scale_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["case_browser_icon_scale"])
 job_persistence_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["job_persistence"])
 url_box_persistence_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["url_box_persistence"])
+universal_archive_enabled_var = tk.BooleanVar(value=APP_SETTINGS_DEFAULTS["universal_archive_enabled"])
 proxy_protocol_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_protocol"])
 proxy_address_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_address"])
 proxy_port_var = tk.StringVar(value=APP_SETTINGS_DEFAULTS["proxy_port"])
@@ -13742,7 +14960,7 @@ case_browser_tab = ttk.Frame(app_notebook, padding=0)
 
 app_notebook.add(main, text="Capture")
 app_notebook.add(job_queue_tab, text="Job Queue")
-app_notebook.add(playlist_preview_tab, text="Playlist Preview")
+app_notebook.add(playlist_preview_tab, text="URL Preview")
 app_notebook.add(case_browser_tab, text="Case Browser")
 
 job_queue_tab.columnconfigure(0, weight=1)
@@ -13763,7 +14981,7 @@ playlist_preview_placeholder_content.grid(row=0, column=0)
 
 ttk.Label(
     playlist_preview_placeholder_content,
-    text="Playlist Preview will automatically load current URL box or selected Input File contents when this tab is selected.",
+    text="URL Preview will automatically load current URL box or selected Input File(s) contents when this tab is selected.",
     anchor="center",
     justify="center",
 ).pack()
@@ -13840,7 +15058,6 @@ cookies_menu.add_command(label="Decrypt Cookies from Storage", command=decrypt_c
 tools_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Tools", menu=tools_menu)
 tools_menu.add_command(label="Proxy Options", command=open_proxy_options_dialog)
-tools_menu.add_command(label="Open Playlist Preview Tab", command=open_playlist_preview_dialog)
 tools_menu.add_command(label="Update Deno", command=update_deno_direct)
 tools_menu.add_command(label="Domain Presets", command=open_domain_presets_window)
 profile_menu = tk.Menu(menu_bar, tearoff=0)
@@ -13879,6 +15096,13 @@ settings_menu.add_checkbutton(
     variable=url_box_persistence_var,
     command=toggle_url_box_persistence_setting,
 )
+settings_menu.add_separator()
+settings_menu.add_checkbutton(
+    label="Universal Download Archive",
+    variable=universal_archive_enabled_var,
+    command=toggle_universal_archive_setting,
+)
+settings_menu.add_command(label="Delete Universal Archive File...", command=delete_universal_archive_file)
 settings_menu.add_separator()
 settings_menu.add_command(label="Reset Defaults", command=reset_defaults)
 settings_menu.add_separator()
@@ -13932,7 +15156,7 @@ ttk.Label(
     textvariable=yt_dlp_version_status_var,
 ).grid(row=0, column=2, sticky="w")
 
-add_file_row(2, "Input Files", input_file_var)
+add_file_row(2, "Input File(s)", input_file_var)
 
 ttk.Label(main, text="Case Name").grid(row=3, column=0, sticky="nw", pady=(6, 3))
 case_name_frame = ttk.Frame(main)
@@ -14106,7 +15330,7 @@ update_vpn_section_visibility()
 
 ttk.Label(
     main,
-    text="Paste URLs below, one per line. If this box is used, it overrides the Input File field.",
+    text="Paste URLs below, one per line. If this box is used, it overrides the Input File(s) field.",
 ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(10, 3))
 
 urls_text = scrolledtext.ScrolledText(main, height=8, wrap="word")
@@ -14195,7 +15419,7 @@ preflight_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
 preflight_check_box = ttk.Checkbutton(
     workflow_frame,
-    text="Preflight run",
+    text="Preflight passed",
     variable=preflight_done_var,
     state="disabled",
 )

@@ -81,6 +81,9 @@ param(
     [string]$ArchiveMode = "Use",
 
     [Parameter(Mandatory = $false)]
+    [string]$UniversalArchiveFile,
+
+    [Parameter(Mandatory = $false)]
     [string]$DateAfter,
 
     [Parameter(Mandatory = $false)]
@@ -627,6 +630,116 @@ if (-not [string]::IsNullOrWhiteSpace($FFmpegFolder)) {
     }
 }
 
+function Read-DownloadArchiveEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return @()
+    }
+
+    return @(
+        Get-Content -LiteralPath $Path -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Trim() } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+}
+
+function New-ArchiveEntryLookup {
+    param(
+        [Parameter(Mandatory = $false)][string[]]$Entries = @()
+    )
+
+    $lookup = @{}
+    foreach ($entry in $Entries) {
+        $clean = [string]$entry
+        if (-not [string]::IsNullOrWhiteSpace($clean) -and -not $lookup.ContainsKey($clean)) {
+            $lookup[$clean] = $true
+        }
+    }
+
+    return $lookup
+}
+
+function Add-UniqueDownloadArchiveEntries {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][string[]]$Entries = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not $Entries -or $Entries.Count -eq 0) {
+        return 0
+    }
+
+    $archiveDir = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($archiveDir) -and -not (Test-Path -LiteralPath $archiveDir)) {
+        New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        New-Item -ItemType File -Path $Path -Force | Out-Null
+    }
+
+    $existing = New-ArchiveEntryLookup -Entries (Read-DownloadArchiveEntries -Path $Path)
+    $toAdd = New-Object System.Collections.Generic.List[string]
+
+    foreach ($entry in $Entries) {
+        $clean = ([string]$entry).Trim()
+        if ([string]::IsNullOrWhiteSpace($clean)) {
+            continue
+        }
+
+        if (-not $existing.ContainsKey($clean)) {
+            $existing[$clean] = $true
+            [void]$toAdd.Add($clean)
+        }
+    }
+
+    if ($toAdd.Count -gt 0) {
+        Add-Content -LiteralPath $Path -Value $toAdd.ToArray() -Encoding UTF8
+    }
+
+    return $toAdd.Count
+}
+
+function Write-CombinedDownloadArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $false)][string[]]$SourcePaths = @()
+    )
+
+    $combined = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    foreach ($sourcePath in $SourcePaths) {
+        foreach ($entry in (Read-DownloadArchiveEntries -Path $sourcePath)) {
+            $clean = ([string]$entry).Trim()
+            if ([string]::IsNullOrWhiteSpace($clean)) {
+                continue
+            }
+
+            if (-not $seen.ContainsKey($clean)) {
+                $seen[$clean] = $true
+                [void]$combined.Add($clean)
+            }
+        }
+    }
+
+    $combinedDir = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($combinedDir) -and -not (Test-Path -LiteralPath $combinedDir)) {
+        New-Item -ItemType Directory -Path $combinedDir -Force | Out-Null
+    }
+
+    if ($combined.Count -gt 0) {
+        Set-Content -LiteralPath $Path -Value $combined.ToArray() -Encoding UTF8
+    }
+    else {
+        New-Item -ItemType File -Path $Path -Force | Out-Null
+    }
+}
+
+
 $SafeCaseName = New-SafeCaseName $CaseName
 $CaseDir = Join-Path $OutputRoot $SafeCaseName
 $MediaDir = Join-Path $CaseDir "media"
@@ -637,6 +750,16 @@ $GuiThumbnailDir = Join-Path $GuiCacheDir "thumbnails"
 $GuiMetadataDir = Join-Path $GuiCacheDir "metadata"
 
 $ArchiveFile = Join-Path $CaseDir "download-archive.txt"
+$ArchiveFileForYtDlp = $ArchiveFile
+$UniversalArchiveActive = ($ArchiveMode -eq "Use" -and -not [string]::IsNullOrWhiteSpace($UniversalArchiveFile))
+$UniversalArchivePreRunEntries = @{}
+$script:UniversalArchiveSeededFromCase = 0
+$script:UniversalArchiveNewEntriesThisRun = 0
+$script:UniversalArchiveCaseEntriesAddedThisRun = 0
+$script:UniversalArchiveSkipRecords = New-Object System.Collections.Generic.List[object]
+$script:UniversalArchiveSkipLookup = @{}
+$UniversalArchiveSkipJson = Join-Path $ManifestDir ("universal-archive-skips_{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$UniversalArchiveSkipCsv = Join-Path $ManifestDir ("universal-archive-skips_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $GlobalFailedUrlsFile = Join-Path $OutputRoot "gui-failed-urls.txt"
 $GlobalCapturedUrlsFile = Join-Path $OutputRoot "gui-captured-urls.txt"
 $RunLog = Join-Path $LogDir ("yt-dlp-run_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -644,6 +767,32 @@ $script:RunLog = $RunLog
 $HashManifest = Join-Path $ManifestDir ("sha256-manifest_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 
 New-Item -ItemType Directory -Path $CaseDir, $MediaDir, $LogDir, $ManifestDir, $GuiThumbnailDir, $GuiMetadataDir -Force | Out-Null
+
+if ($UniversalArchiveActive) {
+    try {
+        $UniversalArchiveFile = [System.IO.Path]::GetFullPath($UniversalArchiveFile)
+    }
+    catch {
+        throw "UniversalArchiveFile is invalid: $UniversalArchiveFile"
+    }
+
+    $universalArchiveDir = Split-Path -Parent $UniversalArchiveFile
+    if (-not [string]::IsNullOrWhiteSpace($universalArchiveDir) -and -not (Test-Path -LiteralPath $universalArchiveDir)) {
+        New-Item -ItemType Directory -Path $universalArchiveDir -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $UniversalArchiveFile -PathType Leaf)) {
+        New-Item -ItemType File -Path $UniversalArchiveFile -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $ArchiveFile -PathType Leaf)) {
+        New-Item -ItemType File -Path $ArchiveFile -Force | Out-Null
+    }
+
+    $script:UniversalArchiveSeededFromCase = Add-UniqueDownloadArchiveEntries -Path $UniversalArchiveFile -Entries (Read-DownloadArchiveEntries -Path $ArchiveFile)
+    $UniversalArchivePreRunEntries = New-ArchiveEntryLookup -Entries (Read-DownloadArchiveEntries -Path $UniversalArchiveFile)
+    $ArchiveFileForYtDlp = $UniversalArchiveFile
+}
 
 function Add-GuiUrlRecord {
     param(
@@ -659,6 +808,141 @@ function Add-GuiUrlRecord {
     $safeDetail = $safeDetail -replace "`r?`n", " "
     $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $timestamp, $Status, $CaseName, $Url, $safeDetail
     Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+}
+
+function Sync-UniversalArchiveEntriesToCase {
+    if (-not $UniversalArchiveActive) {
+        return
+    }
+
+    $newEntries = @(
+        foreach ($entry in (Read-DownloadArchiveEntries -Path $UniversalArchiveFile)) {
+            $clean = ([string]$entry).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($clean) -and -not $UniversalArchivePreRunEntries.ContainsKey($clean)) {
+                $clean
+            }
+        }
+    )
+
+    if (-not $newEntries -or $newEntries.Count -eq 0) {
+        return
+    }
+
+    $caseAdded = Add-UniqueDownloadArchiveEntries -Path $ArchiveFile -Entries $newEntries
+
+    foreach ($entry in $newEntries) {
+        $clean = ([string]$entry).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($clean)) {
+            $UniversalArchivePreRunEntries[$clean] = $true
+        }
+    }
+
+    $script:UniversalArchiveNewEntriesThisRun += $newEntries.Count
+    $script:UniversalArchiveCaseEntriesAddedThisRun += $caseAdded
+
+    $entryWord = if ($caseAdded -eq 1) { "entry" } else { "entries" }
+    Write-RunLog "Universal archive sync: appended $caseAdded new $entryWord to the case archive."
+}
+
+function Get-UniversalArchiveSkipArchiveIdFromLine {
+    param(
+        [Parameter(Mandatory = $false)][string]$Line
+    )
+
+    $value = [string]$Line
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $null
+    }
+
+    if ($value -match '^\[download\]\s+(.+?)\s+has already been recorded in the archive') {
+        return $matches[1].Trim()
+    }
+
+    if ($value -match 'has already been recorded in the archive') {
+        return ""
+    }
+
+    return $null
+}
+
+function Add-UniversalArchiveSkipRecord {
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $false)][string]$ArchiveId = "",
+        [Parameter(Mandatory = $false)][string]$Message = "",
+        [Parameter(Mandatory = $false)][int]$UrlIndex = 0,
+        [Parameter(Mandatory = $false)][int]$UrlTotal = 0
+    )
+
+    if (-not $UniversalArchiveActive) {
+        return
+    }
+
+    $cleanUrl = ([string]$Url).Trim()
+    $cleanArchiveId = ([string]$ArchiveId).Trim()
+    $cleanMessage = ([string]$Message).Trim()
+    $lookupKey = "{0}`n{1}" -f $cleanUrl, $cleanArchiveId
+
+    if ($script:UniversalArchiveSkipLookup.ContainsKey($lookupKey)) {
+        return
+    }
+
+    $script:UniversalArchiveSkipLookup[$lookupKey] = $true
+
+    $record = [PSCustomObject]@{
+        timestamp_utc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        case_name = $SafeCaseName
+        url = $cleanUrl
+        archive_id = $cleanArchiveId
+        message = $cleanMessage
+        url_index = $UrlIndex
+        url_total = $UrlTotal
+    }
+
+    [void]$script:UniversalArchiveSkipRecords.Add($record)
+
+    $displayId = if ([string]::IsNullOrWhiteSpace($cleanArchiveId)) { "unknown archive id" } else { $cleanArchiveId }
+    Write-RunLog "Universal archive skip detected: $displayId | URL: $cleanUrl"
+
+    $safeArchiveId = $cleanArchiveId -replace "`t", " "
+    $safeUrl = $cleanUrl -replace "`t", " "
+    Write-Host ("GUI_UNIVERSAL_ARCHIVE_SKIP`t{0}`t{1}`t{2}`t{3}" -f $UrlIndex, $UrlTotal, $safeArchiveId, $safeUrl)
+}
+
+function Write-UniversalArchiveSkipSummary {
+    if (-not $UniversalArchiveActive) {
+        return
+    }
+
+    $skipCount = $script:UniversalArchiveSkipRecords.Count
+
+    Write-Section "Universal archive skip summary"
+
+    if ($skipCount -le 0) {
+        Write-RunLog "No items were skipped because the universal archive already contained them."
+        return
+    }
+
+    try {
+        $script:UniversalArchiveSkipRecords | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $UniversalArchiveSkipJson -Encoding UTF8
+        $script:UniversalArchiveSkipRecords | Export-Csv -LiteralPath $UniversalArchiveSkipCsv -NoTypeInformation -Encoding UTF8
+    }
+    catch {
+        Write-RunWarning "Could not write universal archive skip manifest: $($_.Exception.Message)"
+    }
+
+    Write-RunLog "Universal archive skipped $skipCount item(s) because the active universal archive already contained them."
+    Write-RunLog "Universal archive skip JSON: $UniversalArchiveSkipJson"
+    Write-RunLog "Universal archive skip CSV: $UniversalArchiveSkipCsv"
+
+    foreach ($record in $script:UniversalArchiveSkipRecords) {
+        $displayId = if ([string]::IsNullOrWhiteSpace($record.archive_id)) { "unknown archive id" } else { $record.archive_id }
+        Write-RunLog ("- {0} | {1}" -f $displayId, $record.url)
+    }
+
+    $safeJson = $UniversalArchiveSkipJson -replace "`t", " "
+    $safeCsv = $UniversalArchiveSkipCsv -replace "`t", " "
+    Write-Host ("GUI_UNIVERSAL_ARCHIVE_SKIP_SUMMARY`t{0}`t{1}`t{2}" -f $skipCount, $safeJson, $safeCsv)
 }
 
 $FFmpegForThumbnails = Resolve-FFmpegForThumbnail -Folder $FFmpegFolder
@@ -783,6 +1067,8 @@ $OptionLines = @(
     "Embed chapters:         $EmbedChapters",
     "Embed info JSON:        $EmbedInfoJson",
     "Archive mode:           $ArchiveMode",
+    "Universal archive:      $($UniversalArchiveActive)",
+    "Universal archive file: $UniversalArchiveFile",
     "Date after:             $DateAfterClean",
     "Date before:            $DateBeforeClean",
     "Rate limit:             $RateLimit ($SleepBaselineSeconds-$SleepMaxSeconds sec between URLs; $SleepRequestSeconds sec yt-dlp request sleep)",
@@ -883,7 +1169,7 @@ if ($FailureHandling -eq "Continue") {
 
 switch ($ArchiveMode) {
     "Use" {
-        $CommonArgs += @("--download-archive", $ArchiveFile)
+        $CommonArgs += @("--download-archive", $ArchiveFileForYtDlp)
         $CommonArgs += "--no-overwrites"
     }
     "Ignore" {
@@ -920,7 +1206,7 @@ else {
             $CommonArgs += "--break-on-existing"
         }
         else {
-            Write-RunWarning "Break on existing was requested but Archive Mode is not Use. The option was not passed because it requires the case download archive."
+            Write-RunWarning "Break on existing was requested but Archive Mode is not Use. The option was not passed because it requires an active download archive."
         }
     }
 
@@ -1164,6 +1450,13 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
                 $line = $_.ToString()
                 Write-Host $line
                 Add-Content -LiteralPath $RunLog -Value $line -Encoding UTF8
+
+                if ($UniversalArchiveActive) {
+                    $skipArchiveId = Get-UniversalArchiveSkipArchiveIdFromLine -Line $line
+                    if ($null -ne $skipArchiveId) {
+                        Add-UniversalArchiveSkipRecord -Url $Url -ArchiveId $skipArchiveId -Message $line -UrlIndex ($i + 1) -UrlTotal $Urls.Count
+                    }
+                }
             }
 
         $YtDlpExitCode = $LASTEXITCODE
@@ -1177,6 +1470,8 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     finally {
         $ErrorActionPreference = $PreviousErrorActionPreference
     }
+
+    Sync-UniversalArchiveEntriesToCase
 
     $ThumbnailGenerationOk = $true
     $MediaInfoGenerationOk = $true
@@ -1241,6 +1536,18 @@ elseif ($GuiCacheMode -eq "Off") {
     Write-RunLog "Case Browser display cache generation is off for this run."
 }
 
+if ($UniversalArchiveActive) {
+    Write-Section "Synchronizing universal download archive"
+    Sync-UniversalArchiveEntriesToCase
+
+    Write-RunLog "Universal archive file: $UniversalArchiveFile"
+    Write-RunLog "Case archive entries seeded into universal archive before run: $script:UniversalArchiveSeededFromCase"
+    Write-RunLog "New archive entries detected this run: $script:UniversalArchiveNewEntriesThisRun"
+    Write-RunLog "New entries appended to case archive: $script:UniversalArchiveCaseEntriesAddedThisRun"
+
+    Write-UniversalArchiveSkipSummary
+}
+
 Write-Section "Hashing captured files"
 
 $manifestSince = if ($ManifestMode -eq "RunOnly") { $RunStartTime } else { [datetime]::MinValue }
@@ -1278,6 +1585,7 @@ Write-Section "Done"
 Write-RunLog "Case folder:      $CaseDir"
 Write-RunLog "Run log:          $RunLog"
 Write-RunLog "Download archive: $ArchiveFile"
+Write-RunLog "Universal archive: $UniversalArchiveFile"
 Write-RunLog "Failed URLs:      $GlobalFailedUrlsFile"
 Write-RunLog "Captured URLs:    $GlobalCapturedUrlsFile"
 Write-RunLog "SHA256 manifest:  $HashManifest"
