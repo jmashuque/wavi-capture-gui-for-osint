@@ -1,7 +1,8 @@
 *
 
 !gui.py
-!script.ps1
+!script-gallerydl.ps1
+!script-ytdlp.ps1
 !README.md
 !LICENSE
 !.gitattributes
@@ -12,3 +13,4 @@
 !screenshots/main2.png
 !screenshots/main3.png
 !screenshots/main4.png
+!screenshots/main5.png

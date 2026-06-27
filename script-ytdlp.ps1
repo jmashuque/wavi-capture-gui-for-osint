@@ -6,6 +6,9 @@ param(
     [string]$CaseName,
 
     [Parameter(Mandatory = $false)]
+    [string]$OutputTemplate,
+
+    [Parameter(Mandatory = $false)]
     [string]$CookiesFile,
 
     [Parameter(Mandatory = $false)]
@@ -307,6 +310,43 @@ function Resolve-ToolPath {
 function New-SafeCaseName {
     param([string]$Name)
     return ($Name -replace '[\\/:*?"<>|]', '_').Trim()
+}
+
+function Test-RelativeOutputTemplate {
+    param([Parameter(Mandatory = $true)][string]$Template)
+
+    $clean = $Template.Trim().Replace('\', '/')
+
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        throw "OutputTemplate cannot be blank."
+    }
+
+    # Do not use [System.IO.Path]::IsPathRooted() here. yt-dlp/gallery-dl
+    # output templates can contain native placeholder syntax such as
+    # %(uploader|unknown)s, and .NET path validation treats the pipe as an
+    # illegal literal path character before the capture tool has a chance to
+    # resolve it. Only block clear absolute-path forms after normalizing
+    # backslashes to forward slashes.
+    if ($clean -match '^[A-Za-z]:' -or $clean.StartsWith('/')) {
+        throw "OutputTemplate must be relative to the case media folder, not an absolute path."
+    }
+
+    if ($clean -notmatch '%\(ext' -and $clean -notmatch '%ext%') {
+        $clean = "$clean.%(ext)s"
+    }
+
+    $parts = $clean -split '/'
+    foreach ($part in $parts) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            throw "OutputTemplate cannot contain empty path segments."
+        }
+
+        if ($part -eq '..') {
+            throw "OutputTemplate cannot contain '..' path traversal."
+        }
+    }
+
+    return $clean
 }
 
 function Get-Sha256HashCompat {
@@ -703,42 +743,6 @@ function Add-UniqueDownloadArchiveEntries {
     return $toAdd.Count
 }
 
-function Write-CombinedDownloadArchive {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $false)][string[]]$SourcePaths = @()
-    )
-
-    $combined = New-Object System.Collections.Generic.List[string]
-    $seen = @{}
-
-    foreach ($sourcePath in $SourcePaths) {
-        foreach ($entry in (Read-DownloadArchiveEntries -Path $sourcePath)) {
-            $clean = ([string]$entry).Trim()
-            if ([string]::IsNullOrWhiteSpace($clean)) {
-                continue
-            }
-
-            if (-not $seen.ContainsKey($clean)) {
-                $seen[$clean] = $true
-                [void]$combined.Add($clean)
-            }
-        }
-    }
-
-    $combinedDir = Split-Path -Parent $Path
-    if (-not [string]::IsNullOrWhiteSpace($combinedDir) -and -not (Test-Path -LiteralPath $combinedDir)) {
-        New-Item -ItemType Directory -Path $combinedDir -Force | Out-Null
-    }
-
-    if ($combined.Count -gt 0) {
-        Set-Content -LiteralPath $Path -Value $combined.ToArray() -Encoding UTF8
-    }
-    else {
-        New-Item -ItemType File -Path $Path -Force | Out-Null
-    }
-}
-
 
 $SafeCaseName = New-SafeCaseName $CaseName
 $CaseDir = Join-Path $OutputRoot $SafeCaseName
@@ -765,6 +769,12 @@ $GlobalCapturedUrlsFile = Join-Path $OutputRoot "gui-captured-urls.txt"
 $RunLog = Join-Path $LogDir ("yt-dlp-run_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $script:RunLog = $RunLog
 $HashManifest = Join-Path $ManifestDir ("sha256-manifest_{0}.csv" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+if ([string]::IsNullOrWhiteSpace($OutputTemplate)) {
+    $OutputTemplate = "%(extractor)s/%(uploader|unknown)s/%(upload_date|unknown)s_%(id)s_%(title).180B.%(ext)s"
+}
+
+$OutputTemplateForYtDlp = Test-RelativeOutputTemplate -Template $OutputTemplate
 
 New-Item -ItemType Directory -Path $CaseDir, $MediaDir, $LogDir, $ManifestDir, $GuiThumbnailDir, $GuiMetadataDir -Force | Out-Null
 
@@ -1111,6 +1121,7 @@ if (-not $Urls -or $Urls.Count -eq 0) {
 Write-Host "Found $($Urls.Count) URL(s)."
 
 Write-Section "Starting capture"
+Write-RunLog ("Output template: {0}" -f $OutputTemplateForYtDlp)
 
 switch ($RetryBehavior) {
     "Light" {
@@ -1146,7 +1157,7 @@ $CommonArgs = @(
 
     "--paths", $MediaDir,
 
-    "--output", "%(extractor)s/%(uploader|unknown)s/%(upload_date|unknown)s_%(id)s_%(title).180B.%(ext)s",
+    "--output", $OutputTemplateForYtDlp,
 
     "--verbose"
 )
