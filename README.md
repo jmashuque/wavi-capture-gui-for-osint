@@ -111,7 +111,7 @@ Required files/tools:
 - `ffmpeg.exe`
 - `ffprobe.exe`
 - `deno.exe`
-- Python 3 with Tkinter
+- Python 3
 - Windows PowerShell
 
 `deno.exe` should be beside `yt-dlp.exe`. `gallery-dl.exe` can be beside the app or selected manually in the Image Capture tab. The app creates temporary handoff files under its own `gui-temp` folder and removes them after use.
@@ -157,8 +157,7 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
    script-ytdlp.ps1
    script-gallerydl.ps1
    README.md
-   VERSION.txt
-   VERIFY_HASHES.txt
+   LICENSE
    ```
 
 5. Install Python 3 if it is not already installed. The easiest user-facing option is the Microsoft Store Python 3 package. If your organization uses Software Center, Company Portal, Intune, winget, or another approved source, use that instead.
