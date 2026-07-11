@@ -2,6 +2,8 @@
 
 !gui.py
 !script-gallerydl.ps1
+!script-webcapture.ps1
+!script-webcapture.ts
 !script-ytdlp.ps1
 !README.md
 !LICENSE
@@ -14,3 +16,4 @@
 !screenshots/main3.png
 !screenshots/main4.png
 !screenshots/main5.png
+!screenshots/main6.png

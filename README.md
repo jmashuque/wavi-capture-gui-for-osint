@@ -1,6 +1,6 @@
-# AVI Capture GUI for OSINT
+# WAVI Capture GUI for OSINT
 
-A portable Windows GUI for approved audio/video/image capture workflows using `yt-dlp`, `gallery-dl`, and companion PowerShell scripts.
+A portable Windows GUI for approved audio/video/image and rendered webpage capture workflows using `yt-dlp`, `gallery-dl`, Deno, installed Chromium browsers, and companion scripts.
 
 ## Table of Contents
 
@@ -13,6 +13,7 @@ A portable Windows GUI for approved audio/video/image capture workflows using `y
 - [Basic Usage](#basic-usage)
   - [Setup and Staging](#setup-and-staging)
   - [Start a Capture](#start-a-capture)
+  - [Capture a Webpage](#capture-a-webpage)
   - [Use the Job Queue](#use-the-job-queue)
   - [Resume Interrupted Captures](#resume-interrupted-captures)
   - [Preview Audio/Video Links](#preview-audiovideo-links)
@@ -21,6 +22,7 @@ A portable Windows GUI for approved audio/video/image capture workflows using `y
   - [Portable Layout](#portable-layout)
   - [Audio/Video Capture](#audiovideo-capture)
   - [Image Capture](#image-capture)
+  - [Webpage Capture](#webpage-capture)
   - [Job Queue, Persistence, and Recovery](#job-queue-persistence-and-recovery)
   - [Domain Presets, Proxy, VPN, and Archives](#domain-presets-proxy-vpn-and-archives)
   - [Update Checks](#update-checks)
@@ -31,12 +33,13 @@ A portable Windows GUI for approved audio/video/image capture workflows using `y
 
 ## Overview
 
-`Audio/Video/Image Capture GUI for OSINT` (`AVI Capture GUI for OSINT`) is a local, portable interface for repeatable capture work in managed environments.
+`Webpage/Audio/Video/Image Capture GUI for OSINT` (`WAVI Capture GUI for OSINT`) is a local, portable interface for repeatable capture work in managed environments.
 
-The app has five main tabs:
+The app has six main tabs:
 
 - **Audio/Video Capture** for `yt-dlp` captures.
 - **Image Capture** for `gallery-dl` captures.
+- **Webpage Capture** for extension-free full-page or visible-viewport PNG captures, with optional PDF output, using Deno and an isolated Edge/Chrome profile.
 - **Job Queue** for staged, concurrent, and recoverable jobs.
 - **Audio/Video Preview** for metadata, thumbnails, playlist/context review, and queueing from preview results.
 - **Case Browser** for local review, thumbnails, metadata, and hash verification.
@@ -46,28 +49,20 @@ The app does not bundle capture tools or make authorization decisions. Tools, cr
 ## Screenshots
 
 <p align="center">
-  <img src="/screenshots/main1.png" alt="audio/video capture tab" width="720">
+  <img src="/screenshots/main1.png" alt="audio/video capture tab" width="31%">
+  <img src="/screenshots/main2.png" alt="image capture tab" width="31%">
+  <img src="/screenshots/main3.png" alt="webpage capture tab" width="31%">
 </p>
 
 <p align="center">
-  <img src="/screenshots/main2.png" alt="image capture tab" width="720">
-</p>
-
-<p align="center">
-  <img src="/screenshots/main3.png" alt="job queue tab" width="720">
-</p>
-
-<p align="center">
-  <img src="/screenshots/main4.png" alt="audio/video preview tab" width="720">
-</p>
-
-<p align="center">
-  <img src="/screenshots/main5.png" alt="case browser tab" width="720">
+  <img src="/screenshots/main4.png" alt="job queue tab" width="31%">
+  <img src="/screenshots/main5.png" alt="audio/video preview tab" width="31%">
+  <img src="/screenshots/main6.png" alt="case browser tab" width="31%">
 </p>
 
 ## Intended Users
 
-This app is intended for investigators, analysts, and support staff who need a consistent way to collect approved audio/video, image, gallery, or metadata output without manually rebuilding command-line arguments for every case.
+This app is intended for investigators, analysts, and support staff who need a consistent way to collect approved audio/video, image, gallery, rendered webpage, or metadata output without manually rebuilding command-line arguments for every case.
 
 It is designed for local Windows use. Keep the app folder and case output on local storage during active captures, then move or archive cases through approved evidence-handling processes.
 
@@ -79,6 +74,8 @@ The app helps users:
 - run preflight checks for required local tools
 - capture audio/video with `yt-dlp`
 - capture image/gallery content with `gallery-dl`
+- capture full-page or visible-viewport webpage PNGs through an isolated installed Edge/Chrome browser
+- record webpage capture metadata, redirects, dimensions, warnings, hashes, and segmented fallbacks for oversized pages
 - organize output into case folders
 - apply case names, filename templates, cookies, proxy settings, pacing, archive, and metadata options
 - queue multiple jobs and recover interrupted work when Job Persistence is enabled
@@ -89,10 +86,10 @@ The app helps users:
 
 The app does not:
 
-- include or auto-install `yt-dlp`, `gallery-dl`, FFmpeg/FFprobe, Deno, Python, or PowerShell
+- include or auto-install `yt-dlp`, `gallery-dl`, FFmpeg/FFprobe, Deno, Edge/Chrome, Python, or PowerShell
 - bypass endpoint security, firewalls, website controls, access restrictions, login requirements, bot challenges, or rate limits
 - decide whether a capture is legal, approved, proportionate, or in scope
-- collect passwords, automate sign-ins, or solve interactive challenges
+- collect passwords, automate sign-ins, use the normal browser profile, extract browser cookies, or solve interactive challenges
 - guarantee that any source platform is supported
 - analyze evidence, identify people, assess authenticity, or determine evidentiary value
 - upload, sync, or retain cases outside the selected local output paths
@@ -106,6 +103,8 @@ Required files/tools:
 - `gui.py`
 - `script-ytdlp.ps1`
 - `script-gallerydl.ps1`
+- `script-webcapture.ps1`
+- `script-webcapture.ts`
 - `yt-dlp.exe`
 - `gallery-dl.exe`
 - `ffmpeg.exe`
@@ -113,12 +112,13 @@ Required files/tools:
 - `deno.exe`
 - Python 3
 - Windows PowerShell
+- Microsoft Edge or Google Chrome installed locally for Webpage Capture
 
-`deno.exe` should be beside `yt-dlp.exe`. `gallery-dl.exe` can be beside the app or selected manually in the Image Capture tab. The app creates temporary handoff files under its own `gui-temp` folder and removes them after use.
+`deno.exe` should be beside `yt-dlp.exe`. `gallery-dl.exe` can be beside the app or selected manually in the Image Capture tab. Webpage Capture uses the installed Edge or Chrome executable selected in its tab; the browser itself is not bundled. The app creates temporary handoff files and isolated browser profiles under its own `gui-temp` folder and removes them after use.
 
 Recommended source pages:
 
-- AVI Capture GUI releases: <https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest>
+- WAVI Capture GUI releases: <https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest>
 - Python: <https://apps.microsoft.com/detail/9PNRBTZXMB4Z>
 - yt-dlp releases: <https://github.com/yt-dlp/yt-dlp/releases>
 - yt-dlp nightly builds: <https://github.com/yt-dlp/yt-dlp-nightly-builds/releases>
@@ -142,7 +142,7 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
    C:\AVI-Capture-GUI
    ```
 
-2. Download the latest AVI Capture GUI release ZIP from:
+2. Download the latest WAVI Capture GUI release ZIP from:
 
    ```text
    https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest
@@ -156,6 +156,8 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
    gui.py
    script-ytdlp.ps1
    script-gallerydl.ps1
+   script-webcapture.ps1
+   script-webcapture.ts
    README.md
    LICENSE
    ```
@@ -180,6 +182,8 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
      gui.py
      script-ytdlp.ps1
      script-gallerydl.ps1
+     script-webcapture.ps1
+     script-webcapture.ts
      yt-dlp.exe
      gallery-dl.exe
      deno.exe
@@ -214,6 +218,7 @@ Keep this folder together. `deno.exe` should be beside `yt-dlp.exe`. Keep the ap
 
    - **Audio/Video Capture** for video, audio, and supported media posts handled by `yt-dlp`.
    - **Image Capture** for image links, galleries, albums, and supported photo-post sources handled by `gallery-dl`.
+   - **Webpage Capture** for public HTTP/HTTPS webpages rendered by an isolated installed Edge or Chrome browser.
 
 4. Confirm the tool paths shown on the tab. If a path is blank or points to the wrong folder, use the browse button beside that field.
 
@@ -229,11 +234,29 @@ Keep this folder together. `deno.exe` should be beside `yt-dlp.exe`. Keep the ap
 
 The URL box takes priority over input files. Clear the URL box if you want the selected input file to be used instead.
 
+### Capture a Webpage
+
+Use **Webpage Capture** for a rendered webpage screenshot and optional PDF without a browser extension.
+
+1. Open **Webpage Capture**.
+2. Confirm the **Script Path**, **Deno Path**, and **Browser Path** fields. Use **Auto-detect** for Edge or Chrome when needed.
+3. Enter a case name and filename template. Both fields include an **Insert Tag** menu, and the tab shows resolved case/output examples below the fields.
+4. Open **Capture Options** to choose full-page or visible-viewport PNG mode, viewport dimensions, page-load timing, lazy-load scrolling, and Webpage Capture concurrency. Close the panel to return to the main workflow.
+5. Open **PDF Options** when you also want PDF output. Enable **Create PDF with PNG**, choose a **PDF Source**, then adjust landscape/portrait, paper size, scale, margins, and optional headers/footers. **Live Page (searchable)** uses Chromium's normal `Page.printToPDF` output and exposes page ranges, CSS page-size preference, backgrounds, and **Live Page Layout** choices (**Keep site print layout**, **Remove fixed/sticky positioning**, or **Hide likely top navigation**). **Captured PNG (visual match)** builds an image-only PDF from the saved PNG capture so sticky headers or print CSS no longer repeat over content. By default, the header shows the final URL and UTC capture timestamp.
+6. Enter the Output Root and one or more public `http://` or `https://` URLs.
+7. Run **Preflight Check**. This creates a new temporary browser profile, launches the browser in headless mode, and tests the loopback DevTools connection.
+8. Click **Start Capture**.
+9. Review the PNG, optional PDF, `.webcapture.json` sidecar, run log, and SHA256 manifest in the case folder.
+
+Each run uses a unique browser profile under `gui-temp`. Webpage Capture does not open or read the user's normal Edge/Chrome profile, browser cookie database, saved passwords, or existing signed-in session. This first version is intended for public pages and does not automate login, consent banners, CAPTCHAs, or other page interactions.
+
+Very tall pages may be written as numbered PNG segments instead of one oversized PNG. The JSON sidecar records the segment positions and hashes.
+
 ### Use the Job Queue
 
 Use **Job Queue** when you want to prepare several captures before running them.
 
-1. Add work from **Audio/Video Capture**, **Image Capture**, or **Audio/Video Preview**.
+1. Add work from **Audio/Video Capture**, **Image Capture**, **Webpage Capture**, or **Audio/Video Preview**.
 2. Review the queued jobs.
 3. Start the full queue, checked jobs, or highlighted jobs from the right-click menu.
 4. Leave the app open while the queue runs.
@@ -254,7 +277,7 @@ To resume it:
 
 Direct captures are also saved as running recovery jobs only when **Job Persistence** is enabled. If Job Persistence is disabled, direct captures are not saved to the queue and cannot be resumed from the app after a close or crash.
 
-Audio/Video jobs continue from the first URL that was not fully marked complete. Image jobs resubmit the original URLs and rely on gallery-dl archive skipping to avoid repeating completed items.
+Audio/Video and Webpage Capture jobs continue from the first URL that was not fully marked complete. Image jobs resubmit the original URLs and rely on gallery-dl archive skipping to avoid repeating completed items.
 
 ### Preview Audio/Video Links
 
@@ -290,6 +313,7 @@ Keep these files together unless paths are intentionally changed in the GUI:
 gui.py
 script-ytdlp.ps1
 script-gallerydl.ps1
+script-webcapture.ts
 yt-dlp.exe
 gallery-dl.exe
 deno.exe
@@ -334,9 +358,52 @@ Useful advanced controls include:
 
 The image filename template is relative to the case `media` folder. Case/context tags resolve when the job is created. gallery-dl item tags resolve per downloaded item.
 
+### Webpage Capture
+
+Webpage Capture uses `script-webcapture.ps1`, `script-webcapture.ts`, `deno.exe`, and an installed Chromium-based Microsoft Edge or Google Chrome browser. It communicates with the newly launched browser over the loopback Chrome DevTools Protocol connection and does not require a browser extension, Selenium, WebDriver, Playwright, Puppeteer, or downloaded packages.
+
+The tab follows the same compact options workflow as the other capture tabs:
+
+- **Capture Options** opens a collapsible overlay for PNG mode, viewport size, load timing, lazy-load scrolling, and concurrency.
+- **PDF Options** opens a compact tabbed overlay with **Source & Output**, **Page Layout**, and **Header & Footer** sections. The Close button remains in a fixed footer so it stays visible on shorter displays. The overlay supports two PDF sources: **Live Page (searchable)** for Chromium `Page.printToPDF` output and **Captured PNG (visual match)** for image-based PDF output built from the captured PNG. Live Page also includes layout choices for handling repeated fixed or sticky webpage overlays.
+- Opening either options panel closes the other; the arrow indicator changes while a panel is open, and closing a panel saves the current settings.
+- A semicolon-delimited summary appears beside the two buttons and includes the active capture, scrolling, concurrency, and PDF settings.
+- **Case Name** and **Filename Template** provide **Insert Tag** menus. The filename preview reflects full-page versus viewport naming and shows the optional PDF filename when PDF output is enabled.
+
+The first-version security boundary is intentionally narrow:
+
+- public `http://` and `https://` pages only
+- a unique app-owned `--user-data-dir` beneath `gui-temp` for every run
+- no access to normal Edge/Chrome profiles or AppData browser databases
+- no cookie extraction, DPAPI decryption, password access, or automatic sign-in
+- remote debugging bound only to `127.0.0.1`/localhost
+- no `--no-sandbox`, certificate-error bypass, security disabling, or LAN-exposed debugging port
+- Deno receives only the subprocess, loopback-network, and selected app/case path permissions needed for the run
+
+Full-page mode waits for the page load event, allows an additional settling delay, optionally scrolls in bounded steps to trigger lazy content, measures the page, and uses the browser's DevTools screenshot function. Visible-viewport mode captures only the configured viewport. Optional PDF output now has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. For this mode, Deno temporarily serves the generated image-only document and PNG slices from a randomized endpoint bound only to `127.0.0.1`; the endpoint is shut down immediately after PDF creation and does not upload the images externally. If a page exceeds the configured safe single-image dimensions or pixel count, the helper captures numbered vertical PNG segments, records them in the sidecar, and can use those same segments as the source for Captured PNG PDF output.
+
+Typical output is:
+
+```text
+<case>\
+  media\
+    web\
+      <name>.png
+      <name>_print.pdf
+      <name>.webcapture.json
+  logs\
+    web-capture_<timestamp>.log
+  manifests\
+    sha256-manifest-web_<timestamp>.csv
+```
+
+The JSON sidecar records the requested and final URLs, redirect chain, main-document status and headers, page title, browser/version, viewport and content dimensions, timing, scrolling result, PDF settings, the selected PDF capture mode, any live-webpage behavior results, paginated-PNG PDF layout details when used, console/page warnings, output files, and SHA256 hashes. When PDF output is requested but the browser cannot create it, the URL is left incomplete for queue/recovery purposes rather than being marked fully successful. The screenshot is a rendered visual capture of what the selected browser presented at the recorded time; it is not a server-side archive or an authenticity determination.
+
+Browser automation can still be blocked by enterprise Edge/Chrome policy, Defender for Endpoint, WDAC/AppLocker, ASR, or Controlled Folder Access. The tab's preflight is designed to test the isolated-profile and loopback-debugging workflow before a capture starts.
+
 ### Job Queue, Persistence, and Recovery
 
-The Job Queue runs staged work, manages concurrent captures, and resumes interrupted jobs. It supports both `yt-dlp` and `gallery-dl` jobs.
+The Job Queue runs staged work, manages concurrent captures, and resumes interrupted jobs. It supports `yt-dlp`, `gallery-dl`, and Webpage Capture jobs.
 
 **Job Persistence** controls whether queue state is saved to `gui-jobs.json`. When it is enabled, queued jobs and direct captures are saved while they run. If a running job is still present when the app reopens, it is treated as interrupted and can be continued from the Job Queue. When Job Persistence is disabled, direct captures are not recoverable through the app after a close or crash.
 
@@ -344,11 +411,12 @@ Recovery behavior is engine-specific:
 
 - **Audio/Video Capture (`yt-dlp`)** records completed URL markers. Continuing an interrupted job submits the first incomplete URL and anything after it.
 - **Image Capture (`gallery-dl`)** uses archive-backed retry. Continuing an interrupted image job resubmits the original URLs and lets the case archive, or the image universal archive when enabled, skip completed items.
+- **Webpage Capture** records completed URL markers. Continuing an interrupted job starts with the first webpage URL not marked complete.
 
 Concurrent queue behavior:
 
-- Audio/Video and Image Capture have separate concurrent-capture limits.
-- `yt-dlp` and `gallery-dl` jobs may run at the same time when their domains do not collide.
+- Audio/Video, Image Capture, and Webpage Capture have separate concurrent-capture limits.
+- `yt-dlp`, `gallery-dl`, and Webpage Capture jobs may run at the same time when their domains do not collide.
 - Same-domain concurrent jobs trigger a collision prompt so users can continue, wait, or cancel.
 
 Each recoverable job can write `manifests/gui-job-recovery-<job-id>.json` under the case folder. These files explain what the app tried to resume; they are not a replacement for the normal case manifest or review notes.
@@ -356,7 +424,7 @@ Each recoverable job can write `manifests/gui-job-recovery-<job-id>.json` under 
 ### Domain Presets, Proxy, VPN, and Archives
 
 - **Domain Presets** can apply capture settings automatically to matching Audio/Video or Image Capture URLs.
-- **Proxy Options** are app-level and can be passed to both capture scripts.
+- **Proxy Options** are app-level and can be passed to the capture scripts and Webpage Capture. The first Webpage Capture version supports only proxies that do not require credentials.
 - **Check VPN** is disabled by default and warns before capture when enabled and the selected adapter does not look connected.
 - **Universal Download Archive** uses separate app-level archive files:
   - `universal-download-archive.txt` for Audio/Video Capture
@@ -382,7 +450,7 @@ Common state files:
 
 - `gui-settings.json` for settings, profiles, app settings, and domain presets
 - `gui-jobs.json` for persisted queue jobs when Job Persistence is enabled
-- `gui-url-box.txt` and `gui-image-url-box.txt` when URL Box Persistence is enabled
+- `gui-url-box.txt`, `gui-image-url-box.txt`, and `gui-web-url-box.txt` when URL Box Persistence is enabled
 - `universal-download-archive.txt` and `universal-gallerydl-archive.sqlite3` when universal archives are enabled
 - case-level `manifests/gui-job-recovery-<job-id>.json` files for recovery details
 
@@ -407,17 +475,28 @@ The app does not collect credentials or automate website logins.
 
 ## Limitations
 
-- Source support depends on the installed `yt-dlp` and `gallery-dl` versions and the source platform.
+- Source support depends on the installed `yt-dlp` and `gallery-dl` versions, the installed Edge/Chrome version, browser policy, and the source platform.
 - Preview metadata and thumbnails are best-effort and may be incomplete, stale, unavailable, or slow.
-- Large playlists, large galleries, and large cases may take time to capture, scan, cache, export, or verify.
+- Large playlists, large galleries, very tall/dynamic webpages, and large cases may take time to capture, scan, cache, export, or verify.
 - Universal archive skips can reflect captures from other cases by design.
 - Browser impersonation depends on the installed `yt-dlp` build and may be blocked by endpoint policy.
+- Webpage Capture may be blocked when browser remote debugging, developer tools, Deno child-process launches, loopback automation, or writes to the selected Output Root are restricted by enterprise policy.
+- Infinite feeds, virtualized lists, canvas/WebGL content, animations, autoplaying video, bot challenges, login/MFA flows, and pages that detect headless automation may be incomplete or unavailable.
+- Webpage Capture does not automatically dismiss banners, expand controls, accept consent, or interact with page content.
 - Proxy/VPN behavior depends on local routing, policy, and source-platform handling.
 - Case Browser thumbnails and media details generally require FFmpeg/FFprobe.
 - Manifest verification checks file hashes only; it does not assess authenticity, context, or legal sufficiency.
 - The app is not a substitute for authorization, evidence-handling policy, or analyst judgment.
 
 ## Changelog
+
+### v2.2026.0711 - WAVI and Webpage Capture
+
+- Renamed the app to **WAVI Capture GUI for OSINT**, with the full name **Webpage/Audio/Video/Image Capture GUI for OSINT**.
+- Added a full **Webpage Capture** workflow using Deno and an isolated Edge/Chrome profile for full-page or viewport PNG captures.
+- Added optional PDF output with **Live Page** and **Captured PNG** modes, configurable page layout, margins, headers, and footers.
+- Integrated Webpage Capture with preflight checks, case naming, filename templates, Job Queue persistence/recovery, manifests, and metadata sidecars.
+- Improved handling of very long webpages with segmented PNG capture and reliable image-based PDF generation.
 
 ### v1.2026.0628 - Stability, Recovery, and Large Capture Polish
 

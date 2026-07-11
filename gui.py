@@ -28,8 +28,8 @@ from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
-APP_TITLE = "AVI Capture GUI for OSINT"
-APP_VERSION = "v1.2026.0628"
+APP_TITLE = "WAVI Capture GUI for OSINT"
+APP_VERSION = "v2.2026.0711"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 980
@@ -40,7 +40,7 @@ APP_WINDOW_SCREEN_MARGIN_HEIGHT = 120
 URL_ROW_MIN_HEIGHT = 215
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/avi-capture-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 28
+SETTINGS_SCHEMA_VERSION = 32
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -48,12 +48,24 @@ SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
 JOBS_FILE = os.path.join(ROOT, "gui-jobs.json")
 URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-url-box.txt")
 IMAGE_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-image-url-box.txt")
+WEB_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-web-url-box.txt")
 UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-download-archive.txt")
 IMAGE_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-gallerydl-archive.sqlite3")
 GUI_TEMP_DIR = os.path.join(ROOT, "gui-temp")
 DEBUG_LOG_FILE = os.path.join(ROOT, "gui-debug.log")
 JOBS_FILE_VERSION = 2
 DEFAULT_PROFILE_NAME = "Default"
+
+DEFAULT_WEB_PDF_HEADER_TEMPLATE = (
+    '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
+    'display:flex; justify-content:space-between; box-sizing:border-box;">'
+    '<span>%final_url%</span><span>Captured: %capture_utc%</span></div>'
+)
+DEFAULT_WEB_PDF_FOOTER_TEMPLATE = (
+    '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
+    'display:flex; justify-content:flex-end; box-sizing:border-box;">'
+    '<span class="pageNumber"></span>/<span class="totalPages"></span></div>'
+)
 
 DEFAULTS = {
     "script_path": os.path.join(ROOT, "script-ytdlp.ps1"),
@@ -79,6 +91,40 @@ DEFAULTS = {
     "image_retries": "4",
     "image_timeout": "30",
     "image_concurrent_captures": "1",
+    "web_script_path": os.path.join(ROOT, "script-webcapture.ps1"),
+    "web_deno_path": os.path.join(ROOT, "deno.exe"),
+    "web_browser_path": "",
+    "web_input_file": os.path.join(ROOT, "web-urls.txt"),
+    "web_case_name": "Case-%datetime%",
+    "web_filename_template": "%datetime%_%domain%_%title%",
+    "web_output_root": os.path.join(ROOT, "Investigations"),
+    "web_capture_mode": "full_page",
+    "web_viewport_width": "1440",
+    "web_viewport_height": "900",
+    "web_page_load_timeout": "45",
+    "web_additional_wait": "2",
+    "web_lazy_scroll": True,
+    "web_scroll_wait_ms": "400",
+    "web_max_scroll_seconds": "60",
+    "web_stable_height_checks": "3",
+    "web_concurrent_captures": "1",
+    "web_create_pdf": False,
+    "web_pdf_landscape": False,
+    "web_pdf_print_background": True,
+    "web_pdf_display_header_footer": True,
+    "web_pdf_scale": "1.0",
+    "web_pdf_paper_width_in": "8.5",
+    "web_pdf_paper_height_in": "11",
+    "web_pdf_margin_top_in": "0.5",
+    "web_pdf_margin_bottom_in": "0.5",
+    "web_pdf_margin_left_in": "0.4",
+    "web_pdf_margin_right_in": "0.4",
+    "web_pdf_page_ranges": "",
+    "web_pdf_prefer_css_page_size": False,
+    "web_pdf_header_template": DEFAULT_WEB_PDF_HEADER_TEMPLATE,
+    "web_pdf_footer_template": DEFAULT_WEB_PDF_FOOTER_TEMPLATE,
+    "web_pdf_page_behavior": "preserve_layout",
+    "web_pdf_capture_mode": "live_webpage",
     "input_file": os.path.join(ROOT, "urls.txt"),
     "case_name": "Case-%datetime%",
     "filename_template": "%extractor%/%uploader%/%upload_date%_%id%_%title%.%ext%",
@@ -339,6 +385,7 @@ def fresh_add_output_roots_from_settings(output_roots, settings):
         return
     fresh_add_output_root(output_roots, settings.get("output_root"))
     fresh_add_output_root(output_roots, settings.get("image_output_root"))
+    fresh_add_output_root(output_roots, settings.get("web_output_root"))
 
 
 def collect_fresh_output_roots_from_settings():
@@ -505,6 +552,7 @@ def run_fresh_startup_cleanup_if_requested():
         JOBS_FILE,
         URL_BOX_PERSISTENCE_FILE,
         IMAGE_URL_BOX_PERSISTENCE_FILE,
+        WEB_URL_BOX_PERSISTENCE_FILE,
         UNIVERSAL_ARCHIVE_FILE,
         IMAGE_UNIVERSAL_ARCHIVE_FILE,
         DEBUG_LOG_FILE,
@@ -1680,6 +1728,30 @@ GALLERYDL_FILENAME_TAGS = [
     ("%url%", "{url}", "https-example"),
 ]
 
+WEB_CASE_NAME_TAGS = [
+    "%date%",
+    "%time%",
+    "%datetime%",
+    "%utcdatetime%",
+    "%domains%",
+    "%year%",
+    "%month%",
+    "%day%",
+    "%hour%",
+    "%minute%",
+    "%second%",
+]
+
+WEB_FILENAME_TAGS = [
+    ("%date%", "20260710"),
+    ("%time%", "223000"),
+    ("%datetime%", "20260710-223000"),
+    ("%domain%", "example.com"),
+    ("%title%", "Sample Page Title"),
+    ("%index%", "001"),
+    ("%mode%", "full-page"),
+]
+
 
 def filename_template_has_ext_placeholder(template):
     text = str(template or "").lower()
@@ -2080,7 +2152,24 @@ def query_capture_tool_versions_for_log():
 
 
 def query_capture_tool_versions_for_job(settings):
-    if str(settings.get("engine") or "yt-dlp").lower() == "gallery-dl":
+    engine = str(settings.get("engine") or "yt-dlp").lower()
+    if engine == "web-capture":
+        script_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
+        helper_path = resolve_web_helper_script_path(script_path)
+        deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+        browser_path = resolve_web_browser_path(settings.get("web_browser_path", ""))
+        return {
+            "app": APP_VERSION,
+            "engine": "web-capture",
+            "powershell_script": script_path,
+            "helper_script": helper_path,
+            "deno_path": deno_path,
+            "deno": get_tool_first_line([deno_path, "--version"]) if deno_path else {"version": "not configured", "ok": False},
+            "browser_path": browser_path,
+            "browser": get_web_browser_version_info(browser_path),
+        }
+
+    if engine == "gallery-dl":
         script_path = settings.get("image_script_path", "")
         gallery_path = settings.get("gallery_dl_path", "")
         return {
@@ -2124,11 +2213,19 @@ def query_capture_tool_versions_for_job(settings):
 def log_capture_tool_versions(versions):
     append_log("Tool and script versions:\n")
     append_log(f"  App: {versions.get('app', APP_VERSION)}\n")
-    append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
     if versions.get("engine") == "gallery-dl":
+        append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
         append_log(f"  gallery-dl path: {versions.get('gallery_dl_path', '')}\n")
         append_log(f"  gallery-dl: {versions.get('gallery_dl', {}).get('version', 'unavailable')}\n\n")
         return
+    if versions.get("engine") == "web-capture":
+        append_log(f"  Web helper script: {versions.get('helper_script', '')}\n")
+        append_log(f"  Deno path: {versions.get('deno_path', '')}\n")
+        append_log(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
+        append_log(f"  Browser path: {versions.get('browser_path', '')}\n")
+        append_log(f"  Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n\n")
+        return
+    append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
     append_log(f"  yt-dlp path: {versions.get('yt_dlp_path', '')}\n")
     append_log(f"  yt-dlp: {versions.get('yt_dlp', {}).get('version', 'unavailable')}\n")
     append_log(f"  FFmpeg path: {versions.get('ffmpeg_path', '')}\n")
@@ -2276,7 +2373,7 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         return fallback
 
     lines = [
-        "AVI Capture GUI for OSINT - Case Summary",
+        "WAVI Capture GUI for OSINT - Case Summary",
         "",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"App version: {APP_VERSION}",
@@ -2481,8 +2578,32 @@ def get_command_option_value(cmd, option_name):
     return ""
 
 
+def cleanup_web_capture_temp_from_config(config_path):
+    if not config_path or not os.path.isfile(config_path):
+        return
+    try:
+        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        profile_root = str(config.get("profile_root", "") or "")
+        run_root = os.path.dirname(profile_root) if profile_root else ""
+        web_temp_root = os.path.join(GUI_TEMP_DIR, "web-capture")
+        if run_root and is_path_under_folder(run_root, web_temp_root):
+            for attempt in range(8):
+                try:
+                    if os.path.isdir(run_root):
+                        shutil.rmtree(run_root)
+                    break
+                except Exception:
+                    if attempt < 7:
+                        time.sleep(0.2)
+    except Exception:
+        pass
+
+
 def cleanup_command_input_file_if_temp(cmd):
     cleanup_gui_temp_file(get_command_option_value(cmd, "-InputFile"))
+    config_path = get_command_option_value(cmd, "--config") or get_command_option_value(cmd, "-ConfigPath")
+    cleanup_web_capture_temp_from_config(config_path)
+    cleanup_gui_temp_file(config_path)
 
 
 
@@ -2813,6 +2934,50 @@ def initialize_image_url_box_from_persistence_and_input_files():
 
 def handle_image_input_file_var_changed(*args):
     auto_populate_image_url_box_from_input_files_if_empty()
+
+
+def web_url_box_text_is_empty():
+    try:
+        return url_text_widget_is_empty(web_urls_text)
+    except Exception:
+        return True
+
+
+def set_web_url_box_text_silent(content):
+    set_url_text_widget_silent(web_urls_text, content)
+
+
+def load_web_url_box_persistence_if_enabled():
+    return load_url_box_persistence_file(WEB_URL_BOX_PERSISTENCE_FILE, set_web_url_box_text_silent, web_append_log, "Webpage URL Box")
+
+
+def save_web_url_box_persistence_if_enabled():
+    try:
+        save_url_box_persistence_file(WEB_URL_BOX_PERSISTENCE_FILE, web_urls_text, web_append_log, "Webpage URL Box")
+    except Exception:
+        pass
+
+
+def read_valid_web_input_files_for_url_box_silent():
+    return read_valid_input_files_for_url_box_paths(get_existing_web_input_file_paths())
+
+
+def auto_populate_web_url_box_from_input_files_if_empty():
+    if web_url_box_text_is_empty():
+        content, _path_label = read_valid_web_input_files_for_url_box_silent()
+        if content:
+            set_web_url_box_text_silent(content)
+            return True
+    return False
+
+
+def initialize_web_url_box_from_persistence_and_input_files():
+    load_web_url_box_persistence_if_enabled()
+    auto_populate_web_url_box_from_input_files_if_empty()
+
+
+def handle_web_input_file_var_changed(*args):
+    auto_populate_web_url_box_from_input_files_if_empty()
 
 
 def save_urls_to_input_file():
@@ -3889,8 +4054,11 @@ def validate_queue_job_inputs(job):
     settings = job.get("settings", {})
     urls = get_queue_job_run_urls(job)
 
-    if str(job.get("engine") or settings.get("engine") or "yt-dlp").lower() == "gallery-dl":
+    engine = str(job.get("engine") or settings.get("engine") or "yt-dlp").lower()
+    if engine == "gallery-dl":
         return validate_gallery_queue_job_inputs(job)
+    if engine == "web-capture":
+        return validate_web_queue_job_inputs(job)
 
     script_path = settings.get("script_path", "").strip()
     yt_dlp_path = settings.get("yt_dlp_path", "").strip()
@@ -3937,8 +4105,11 @@ def get_expected_run_paths_for_values(output_root, resolved_case_name):
 
 def build_powershell_command_for_job(job):
     settings = job.get("settings", {})
-    if str(job.get("engine") or settings.get("engine") or "yt-dlp").lower() == "gallery-dl":
+    engine = str(job.get("engine") or settings.get("engine") or "yt-dlp").lower()
+    if engine == "gallery-dl":
         return build_gallery_powershell_command_for_job(job)
+    if engine == "web-capture":
+        return build_web_capture_command_for_job(job)
 
     input_path = create_url_input_file_from_lines(get_queue_job_run_urls(job))
     resolved_case_name = job.get("resolved_case_name", "").strip()
@@ -4419,6 +4590,40 @@ def get_settings_dict():
         "image_retries": normalize_positive_int_string(image_retries_var.get(), DEFAULTS["image_retries"]),
         "image_timeout": normalize_positive_int_string(image_timeout_var.get(), DEFAULTS["image_timeout"]),
         "image_concurrent_captures": str(image_concurrent_captures_var.get()).strip() or DEFAULTS["image_concurrent_captures"],
+        "web_script_path": web_script_path_var.get().strip(),
+        "web_deno_path": web_deno_path_var.get().strip(),
+        "web_browser_path": web_browser_path_var.get().strip(),
+        "web_input_file": web_input_file_var.get().strip(),
+        "web_case_name": web_case_name_var.get().strip(),
+        "web_filename_template": web_filename_template_var.get().strip(),
+        "web_output_root": web_output_root_var.get().strip(),
+        "web_capture_mode": web_capture_mode_var.get(),
+        "web_viewport_width": normalize_positive_int_string(web_viewport_width_var.get(), DEFAULTS["web_viewport_width"]),
+        "web_viewport_height": normalize_positive_int_string(web_viewport_height_var.get(), DEFAULTS["web_viewport_height"]),
+        "web_page_load_timeout": normalize_positive_int_string(web_page_load_timeout_var.get(), DEFAULTS["web_page_load_timeout"]),
+        "web_additional_wait": normalize_nonnegative_int_string(web_additional_wait_var.get(), DEFAULTS["web_additional_wait"]),
+        "web_lazy_scroll": bool(web_lazy_scroll_var.get()),
+        "web_scroll_wait_ms": normalize_positive_int_string(web_scroll_wait_ms_var.get(), DEFAULTS["web_scroll_wait_ms"]),
+        "web_max_scroll_seconds": normalize_positive_int_string(web_max_scroll_seconds_var.get(), DEFAULTS["web_max_scroll_seconds"]),
+        "web_stable_height_checks": normalize_positive_int_string(web_stable_height_checks_var.get(), DEFAULTS["web_stable_height_checks"]),
+        "web_concurrent_captures": str(web_concurrent_captures_var.get()).strip() or DEFAULTS["web_concurrent_captures"],
+        "web_create_pdf": bool(web_create_pdf_var.get()),
+        "web_pdf_landscape": bool(web_pdf_landscape_var.get()),
+        "web_pdf_print_background": bool(web_pdf_print_background_var.get()),
+        "web_pdf_display_header_footer": bool(web_pdf_display_header_footer_var.get()),
+        "web_pdf_scale": normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS["web_pdf_scale"]),
+        "web_pdf_paper_width_in": normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS["web_pdf_paper_width_in"]),
+        "web_pdf_paper_height_in": normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS["web_pdf_paper_height_in"]),
+        "web_pdf_margin_top_in": normalize_nonnegative_float_string(web_pdf_margin_top_in_var.get(), DEFAULTS["web_pdf_margin_top_in"]),
+        "web_pdf_margin_bottom_in": normalize_nonnegative_float_string(web_pdf_margin_bottom_in_var.get(), DEFAULTS["web_pdf_margin_bottom_in"]),
+        "web_pdf_margin_left_in": normalize_nonnegative_float_string(web_pdf_margin_left_in_var.get(), DEFAULTS["web_pdf_margin_left_in"]),
+        "web_pdf_margin_right_in": normalize_nonnegative_float_string(web_pdf_margin_right_in_var.get(), DEFAULTS["web_pdf_margin_right_in"]),
+        "web_pdf_page_ranges": web_pdf_page_ranges_var.get().strip(),
+        "web_pdf_prefer_css_page_size": bool(web_pdf_prefer_css_page_size_var.get()),
+        "web_pdf_header_template": get_web_pdf_header_template_value(),
+        "web_pdf_footer_template": get_web_pdf_footer_template_value(),
+        "web_pdf_page_behavior": web_pdf_page_behavior_var.get() if web_pdf_page_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"],
+        "web_pdf_capture_mode": web_pdf_capture_mode_var.get() if web_pdf_capture_mode_var.get() in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"],
     }
 
 
@@ -4591,6 +4796,57 @@ def apply_settings_dict(settings):
     image_concurrent_captures_var.set(str(settings.get("image_concurrent_captures", DEFAULTS["image_concurrent_captures"]) or DEFAULTS["image_concurrent_captures"]))
     if image_concurrent_captures_var.get() not in {"1", "2", "3", "4"}:
         image_concurrent_captures_var.set(DEFAULTS["image_concurrent_captures"])
+
+    loaded_web_script_path = str(settings.get("web_script_path", DEFAULTS["web_script_path"]) or DEFAULTS["web_script_path"])
+    if os.path.basename(loaded_web_script_path).lower() == "script-webcapture.ts":
+        migrated_wrapper_path = os.path.join(os.path.dirname(os.path.abspath(loaded_web_script_path)), "script-webcapture.ps1")
+        if os.path.isfile(migrated_wrapper_path):
+            loaded_web_script_path = migrated_wrapper_path
+    web_script_path_var.set(loaded_web_script_path)
+    web_deno_path_var.set(settings.get("web_deno_path", DEFAULTS["web_deno_path"]))
+    web_browser_path_var.set(settings.get("web_browser_path", DEFAULTS["web_browser_path"]) or detect_web_browser_path())
+    web_input_file_var.set(settings.get("web_input_file", DEFAULTS["web_input_file"]))
+    web_case_name_var.set(settings.get("web_case_name", DEFAULTS["web_case_name"]))
+    web_filename_template_var.set(settings.get("web_filename_template", DEFAULTS["web_filename_template"]))
+    web_output_root_var.set(settings.get("web_output_root", DEFAULTS["web_output_root"]))
+    saved_web_mode = settings.get("web_capture_mode", DEFAULTS["web_capture_mode"])
+    web_capture_mode_var.set(saved_web_mode if saved_web_mode in {"full_page", "viewport"} else DEFAULTS["web_capture_mode"])
+    web_viewport_width_var.set(normalize_positive_int_string(settings.get("web_viewport_width", DEFAULTS["web_viewport_width"]), DEFAULTS["web_viewport_width"]))
+    web_viewport_height_var.set(normalize_positive_int_string(settings.get("web_viewport_height", DEFAULTS["web_viewport_height"]), DEFAULTS["web_viewport_height"]))
+    web_page_load_timeout_var.set(normalize_positive_int_string(settings.get("web_page_load_timeout", DEFAULTS["web_page_load_timeout"]), DEFAULTS["web_page_load_timeout"]))
+    web_additional_wait_var.set(normalize_nonnegative_int_string(settings.get("web_additional_wait", DEFAULTS["web_additional_wait"]), DEFAULTS["web_additional_wait"]))
+    web_lazy_scroll_var.set(bool(settings.get("web_lazy_scroll", DEFAULTS["web_lazy_scroll"])))
+    web_scroll_wait_ms_var.set(normalize_positive_int_string(settings.get("web_scroll_wait_ms", DEFAULTS["web_scroll_wait_ms"]), DEFAULTS["web_scroll_wait_ms"]))
+    web_max_scroll_seconds_var.set(normalize_positive_int_string(settings.get("web_max_scroll_seconds", DEFAULTS["web_max_scroll_seconds"]), DEFAULTS["web_max_scroll_seconds"]))
+    web_stable_height_checks_var.set(normalize_positive_int_string(settings.get("web_stable_height_checks", DEFAULTS["web_stable_height_checks"]), DEFAULTS["web_stable_height_checks"]))
+    web_concurrent_captures_var.set(str(settings.get("web_concurrent_captures", DEFAULTS["web_concurrent_captures"]) or DEFAULTS["web_concurrent_captures"]))
+    if web_concurrent_captures_var.get() not in {"1", "2"}:
+        web_concurrent_captures_var.set(DEFAULTS["web_concurrent_captures"])
+    web_create_pdf_var.set(bool(settings.get("web_create_pdf", DEFAULTS["web_create_pdf"])))
+    web_pdf_landscape_var.set(bool(settings.get("web_pdf_landscape", DEFAULTS["web_pdf_landscape"])))
+    web_pdf_print_background_var.set(bool(settings.get("web_pdf_print_background", DEFAULTS["web_pdf_print_background"])))
+    web_pdf_display_header_footer_var.set(bool(settings.get("web_pdf_display_header_footer", DEFAULTS["web_pdf_display_header_footer"])))
+    web_pdf_scale_var.set(normalize_positive_float_string(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"]), DEFAULTS["web_pdf_scale"]))
+    web_pdf_paper_width_in_var.set(normalize_positive_float_string(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"]), DEFAULTS["web_pdf_paper_width_in"]))
+    web_pdf_paper_height_in_var.set(normalize_positive_float_string(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"]), DEFAULTS["web_pdf_paper_height_in"]))
+    web_pdf_margin_top_in_var.set(normalize_nonnegative_float_string(settings.get("web_pdf_margin_top_in", DEFAULTS["web_pdf_margin_top_in"]), DEFAULTS["web_pdf_margin_top_in"]))
+    web_pdf_margin_bottom_in_var.set(normalize_nonnegative_float_string(settings.get("web_pdf_margin_bottom_in", DEFAULTS["web_pdf_margin_bottom_in"]), DEFAULTS["web_pdf_margin_bottom_in"]))
+    web_pdf_margin_left_in_var.set(normalize_nonnegative_float_string(settings.get("web_pdf_margin_left_in", DEFAULTS["web_pdf_margin_left_in"]), DEFAULTS["web_pdf_margin_left_in"]))
+    web_pdf_margin_right_in_var.set(normalize_nonnegative_float_string(settings.get("web_pdf_margin_right_in", DEFAULTS["web_pdf_margin_right_in"]), DEFAULTS["web_pdf_margin_right_in"]))
+    web_pdf_page_ranges_var.set(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]))
+    web_pdf_prefer_css_page_size_var.set(bool(settings.get("web_pdf_prefer_css_page_size", DEFAULTS["web_pdf_prefer_css_page_size"])))
+    set_web_pdf_header_template_value(settings.get("web_pdf_header_template", DEFAULTS["web_pdf_header_template"]))
+    set_web_pdf_footer_template_value(settings.get("web_pdf_footer_template", DEFAULTS["web_pdf_footer_template"]))
+    saved_web_pdf_behavior = settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"])
+    web_pdf_page_behavior_var.set(saved_web_pdf_behavior if saved_web_pdf_behavior in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"])
+    saved_web_pdf_capture_mode = settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"])
+    web_pdf_capture_mode_var.set(saved_web_pdf_capture_mode if saved_web_pdf_capture_mode in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"])
+    try:
+        update_web_pdf_options_state()
+        update_web_case_folder_preview()
+        update_web_options_summary()
+    except Exception:
+        pass
     try:
         update_image_options_summary()
         update_image_case_folder_preview()
@@ -6316,6 +6572,15 @@ def configure_image_capture_tab_row_weights():
         pass
 
 
+def configure_web_capture_tab_row_weights():
+    """Keep Webpage Capture tab vertical sizing assigned to the URL and log rows."""
+    try:
+        web_capture_tab.rowconfigure(11, weight=0, minsize=URL_ROW_MIN_HEIGHT)
+        web_capture_tab.rowconfigure(15, weight=1, minsize=0)
+    except Exception:
+        pass
+
+
 def refresh_capture_tab_layout_after_visibility_changes():
     """Refresh capture tab row weights without resizing the main window.
 
@@ -6325,13 +6590,14 @@ def refresh_capture_tab_layout_after_visibility_changes():
     """
     configure_capture_tab_row_weights()
     configure_image_capture_tab_row_weights()
+    configure_web_capture_tab_row_weights()
 
 
 def update_vpn_section_visibility():
     try:
         enabled = bool(check_vpn_var.get())
 
-        for frame_name in ("vpn_frame", "image_vpn_frame"):
+        for frame_name in ("vpn_frame", "image_vpn_frame", "web_vpn_frame"):
             frame = globals().get(frame_name)
             if frame is None:
                 continue
@@ -6370,9 +6636,14 @@ def toggle_url_box_persistence_setting():
     if saved and url_box_persistence_var.get():
         save_url_box_persistence_if_enabled()
         save_image_url_box_persistence_if_enabled()
+        save_web_url_box_persistence_if_enabled()
         append_log(f"URL box contents saved to: {URL_BOX_PERSISTENCE_FILE}\n")
         try:
             image_append_log(f"Image URL box contents saved to: {IMAGE_URL_BOX_PERSISTENCE_FILE}\n")
+        except Exception:
+            pass
+        try:
+            web_append_log(f"Webpage URL box contents saved to: {WEB_URL_BOX_PERSISTENCE_FILE}\n")
         except Exception:
             pass
 
@@ -7480,9 +7751,20 @@ def get_image_concurrent_capture_limit(settings=None):
         return 1
 
 
+def get_web_concurrent_capture_limit(settings=None):
+    try:
+        value = settings.get("web_concurrent_captures", DEFAULTS["web_concurrent_captures"]) if isinstance(settings, dict) else web_concurrent_captures_var.get()
+        return max(1, min(2, int(str(value).strip())))
+    except Exception:
+        return 1
+
+
 def get_engine_concurrent_capture_limit(engine, settings=None):
-    if str(engine or "").strip().lower() == "gallery-dl":
+    engine_name = str(engine or "").strip().lower()
+    if engine_name == "gallery-dl":
         return get_image_concurrent_capture_limit(settings)
+    if engine_name == "web-capture":
+        return get_web_concurrent_capture_limit(settings)
     return get_concurrent_capture_limit(settings)
 
 
@@ -7517,10 +7799,16 @@ def get_running_job_count_for_engine(engine):
         image_direct_active = image_running_process is not None and image_running_process.poll() is None
     except Exception:
         image_direct_active = False
+    try:
+        web_direct_active = web_running_process is not None and web_running_process.poll() is None
+    except Exception:
+        web_direct_active = False
 
     if engine_name == "yt-dlp" and av_direct_active and not active_av_direct_recovery_job_id:
         count += 1
     elif engine_name == "gallery-dl" and image_direct_active and not active_image_direct_recovery_job_id:
+        count += 1
+    elif engine_name == "web-capture" and web_direct_active and not active_web_direct_recovery_job_id:
         count += 1
 
     return count
@@ -7559,6 +7847,19 @@ def get_ephemeral_active_direct_jobs():
             "status": "running",
             "domains": list(active_image_direct_domains),
             "resolved_case_name": active_image_direct_case_name or "running direct image capture",
+            "allow_domain_collision": False,
+        })
+
+    try:
+        web_direct_active = web_running_process is not None and web_running_process.poll() is None
+    except Exception:
+        web_direct_active = False
+    if web_direct_active and not active_web_direct_recovery_job_id and active_web_direct_domains:
+        jobs.append({
+            "engine": "web-capture",
+            "status": "running",
+            "domains": list(active_web_direct_domains),
+            "resolved_case_name": active_web_direct_case_name or "running direct webpage capture",
             "allow_domain_collision": False,
         })
 
@@ -7771,7 +8072,7 @@ def make_job_id():
 
 def get_job_case_folder(job):
     settings = job.get("settings", {})
-    output_root = settings.get("output_root", "")
+    output_root = get_job_output_root_for_recovery(job)
     resolved_case_name = job.get("resolved_case_name") or settings.get("case_name", "")
     return os.path.join(output_root, resolved_case_name) if output_root and resolved_case_name else ""
 
@@ -7862,7 +8163,7 @@ def normalize_loaded_queue_job(raw_job):
         settings_schema_version = 0
 
     engine = str(raw_job.get("engine") or settings.get("engine") or "yt-dlp").strip().lower()
-    if engine not in {"yt-dlp", "gallery-dl"}:
+    if engine not in {"yt-dlp", "gallery-dl", "web-capture"}:
         engine = "yt-dlp"
 
     job = {
@@ -8616,6 +8917,11 @@ def summarize_current_job_source_for_dialog(kind):
             input_paths = parse_image_input_file_paths()
             existing_paths = get_existing_image_input_file_paths()
             label = "Image Capture"
+        elif kind == "web":
+            urls = get_web_url_list()
+            input_paths = parse_web_input_file_paths()
+            existing_paths = get_existing_web_input_file_paths()
+            label = "Webpage Capture"
         else:
             urls = get_current_url_lines_for_queue()
             input_paths = parse_input_file_paths()
@@ -8627,6 +8933,9 @@ def summarize_current_job_source_for_dialog(kind):
             try:
                 if kind == "image":
                     if not image_urls_text.get("1.0", "end").strip() and existing_paths:
+                        source = "Input File(s)"
+                elif kind == "web":
+                    if not web_urls_text.get("1.0", "end").strip() and existing_paths:
                         source = "Input File(s)"
                 else:
                     if not urls_text.get("1.0", "end").strip() and existing_paths:
@@ -8653,18 +8962,28 @@ def open_add_current_as_job_dialog():
         image_count = len(get_image_url_list())
     except Exception:
         image_count = 0
+    try:
+        web_count = len(get_web_url_list())
+    except Exception:
+        web_count = 0
 
     default_choice = "av"
     try:
         active_context = get_active_capture_tab_context()
         if active_context == "image":
             default_choice = "image"
+        elif active_context == "web":
+            default_choice = "web"
         elif active_context == "av":
             default_choice = "av"
+        elif web_count and not av_count and not image_count:
+            default_choice = "web"
         elif image_count and not av_count:
             default_choice = "image"
     except Exception:
-        if image_count and not av_count:
+        if web_count and not av_count and not image_count:
+            default_choice = "web"
+        elif image_count and not av_count:
             default_choice = "image"
 
     dialog = tk.Toplevel(root)
@@ -8688,9 +9007,11 @@ def open_add_current_as_job_dialog():
 
     av_text = summarize_current_job_source_for_dialog("av")
     image_text = summarize_current_job_source_for_dialog("image")
+    web_text = summarize_current_job_source_for_dialog("web")
 
     ttk.Radiobutton(frame, text=av_text, variable=choice_var, value="av").grid(row=1, column=0, sticky="w", pady=(0, 4))
-    ttk.Radiobutton(frame, text=image_text, variable=choice_var, value="image").grid(row=2, column=0, sticky="w", pady=(0, 10))
+    ttk.Radiobutton(frame, text=image_text, variable=choice_var, value="image").grid(row=2, column=0, sticky="w", pady=(0, 4))
+    ttk.Radiobutton(frame, text=web_text, variable=choice_var, value="web").grid(row=3, column=0, sticky="w", pady=(0, 10))
 
     ttk.Label(
         frame,
@@ -8700,10 +9021,10 @@ def open_add_current_as_job_dialog():
         ),
         wraplength=460,
         justify="left",
-    ).grid(row=3, column=0, sticky="ew", pady=(0, 10))
+    ).grid(row=4, column=0, sticky="ew", pady=(0, 10))
 
     buttons = ttk.Frame(frame)
-    buttons.grid(row=4, column=0, sticky="e")
+    buttons.grid(row=5, column=0, sticky="e")
 
     result = {"added": False}
 
@@ -8717,6 +9038,15 @@ def open_add_current_as_job_dialog():
                 result["added"] = add_image_urls_to_queue_as_job(urls)
             except Exception as e:
                 messagebox.showerror("Add Image Capture job failed", str(e), parent=dialog)
+                return
+        elif selected == "web":
+            try:
+                urls = get_web_url_list()
+                if not urls:
+                    raise ValueError("No Webpage Capture URLs are available. Add URLs to the Webpage Capture URL box or select Input File(s).")
+                result["added"] = add_web_urls_to_queue_as_job(urls)
+            except Exception as e:
+                messagebox.showerror("Add Webpage Capture job failed", str(e), parent=dialog)
                 return
         else:
             try:
@@ -9770,8 +10100,11 @@ def get_job_engine(job):
 
 def get_job_output_root_for_recovery(job):
     settings = (job or {}).get("settings", {}) if isinstance((job or {}).get("settings", {}), dict) else {}
-    if get_job_engine(job) == "gallery-dl":
+    engine = get_job_engine(job)
+    if engine == "gallery-dl":
         return settings.get("image_output_root") or settings.get("output_root") or (job or {}).get("output_root", "")
+    if engine == "web-capture":
+        return settings.get("web_output_root") or settings.get("output_root") or (job or {}).get("output_root", "")
     return settings.get("output_root") or (job or {}).get("output_root", "")
 
 
@@ -9798,6 +10131,8 @@ def get_job_archive_files_for_recovery(job):
         case_archive = os.path.join(paths.get("manifests_folder", ""), "gallery-dl-archive.sqlite3") if paths else ""
         universal = IMAGE_UNIVERSAL_ARCHIVE_FILE if app_universal_archive_enabled() and str(settings.get("image_archive_mode", DEFAULTS.get("image_archive_mode", "use"))).lower() == "use" else ""
         return {"case_archive": case_archive, "universal_archive": universal}
+    if get_job_engine(job) == "web-capture":
+        return {"case_archive": "", "universal_archive": ""}
     universal = UNIVERSAL_ARCHIVE_FILE if app_universal_archive_enabled() and str(settings.get("archive_mode", DEFAULTS.get("archive_mode", "use"))).lower() == "use" else ""
     return {"case_archive": paths.get("download_archive", "") if paths else "", "universal_archive": universal}
 
@@ -10656,6 +10991,9 @@ def disable_start_controls_for_shutdown():
         "image_start_button",
         "image_start_menu_button",
         "image_stop_button",
+        "web_start_button",
+        "web_start_menu_button",
+        "web_stop_button",
     ]:
         try:
             widget = globals().get(widget_name)
@@ -10971,7 +11309,7 @@ def fetch_latest_app_release():
 
 def open_about_dialog():
     dialog = tk.Toplevel(root)
-    dialog.title("About Audio/Video/Image Capture GUI for OSINT")
+    dialog.title("About Webpage/Audio/Video/Image Capture GUI for OSINT")
     dialog.resizable(False, False)
     dialog.transient(root)
     dialog.grab_set()
@@ -10981,7 +11319,7 @@ def open_about_dialog():
 
     ttk.Label(
         frame,
-        text="Audio/Video/Image Capture GUI for OSINT",
+        text="Webpage/Audio/Video/Image Capture GUI for OSINT",
         font=("Segoe UI", 12, "bold"),
     ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
@@ -10993,9 +11331,9 @@ def open_about_dialog():
     ttk.Label(
         frame,
         text=(
-            "A portable Windows GUI for running approved audio/video and image capture workflows "
+            "A portable Windows GUI for running approved webpage, audio, video, and image capture workflows "
             "for OSINT-style collection and review.\n\n"
-            "This app does not bundle yt-dlp, gallery-dl, FFmpeg, Deno, or other binaries. "
+            "This app does not bundle yt-dlp, gallery-dl, FFmpeg, Deno, Edge/Chrome, or other binaries. "
             "Use official, signed, organization-approved binaries where required."
         ),
         wraplength=520,
@@ -18438,6 +18776,7 @@ def on_close():
     queue_active = False
     direct_av_active = False
     direct_image_active = False
+    direct_web_active = False
 
     try:
         queue_active = bool(job_queue_running or any(process is not None and process.poll() is None for process in job_queue_running_processes.values()))
@@ -18457,6 +18796,12 @@ def on_close():
         log_debug_exception("Could not determine Image direct process state during shutdown", e)
         direct_image_active = False
 
+    try:
+        direct_web_active = bool(web_running_process is not None and web_running_process.poll() is None)
+    except Exception as e:
+        log_debug_exception("Could not determine Webpage direct process state during shutdown", e)
+        direct_web_active = False
+
     if queue_active:
         if not messagebox.askyesno(
             "Job queue running",
@@ -18464,7 +18809,7 @@ def on_close():
         ):
             return
 
-    if direct_av_active or direct_image_active:
+    if direct_av_active or direct_image_active or direct_web_active:
         if not messagebox.askyesno(
             "Capture running",
             "A direct capture is still running. Stop active process tree(s), save interrupted recovery jobs where available, and exit?",
@@ -18493,7 +18838,7 @@ def on_close():
         except Exception as e:
             log_debug_exception("Queue shutdown handling failed", e)
 
-    if direct_av_active or direct_image_active:
+    if direct_av_active or direct_image_active or direct_web_active:
         try:
             mark_running_queue_jobs_interrupted("App closed while direct capture was running.")
         except Exception as e:
@@ -18505,6 +18850,9 @@ def on_close():
         if direct_image_active:
             terminate_process_tree(image_running_process, label="direct Image Capture")
 
+        if direct_web_active:
+            terminate_process_tree(web_running_process, label="direct Webpage Capture")
+
     try:
         flush_log_queues_now()
     except Exception as e:
@@ -18513,6 +18861,7 @@ def on_close():
     try:
         save_url_box_persistence_if_enabled()
         save_image_url_box_persistence_if_enabled()
+        save_web_url_box_persistence_if_enabled()
         flush_settings_autosave()
         flush_job_queue_state_save()
         save_settings(show_popup=False, log_saved=False)
@@ -18534,6 +18883,1176 @@ def on_close():
         root.destroy()
     except Exception as e:
         log_debug_exception("Root destroy failed during shutdown", e)
+
+
+
+# ---------------- Webpage Capture / Deno + Chromium CDP ----------------
+
+
+def normalize_nonnegative_int_string(value, default_value="0"):
+    try:
+        number = int(str(value).strip())
+        if number < 0:
+            raise ValueError
+        return str(number)
+    except Exception:
+        return str(default_value)
+
+
+def normalize_nonnegative_float_string(value, default_value="0"):
+    try:
+        number = float(str(value).strip())
+        if number < 0:
+            raise ValueError
+        return str(number)
+    except Exception:
+        return str(default_value)
+
+
+def normalize_positive_float_string(value, default_value="1.0"):
+    try:
+        number = float(str(value).strip())
+        if number <= 0:
+            raise ValueError
+        return str(number)
+    except Exception:
+        return str(default_value)
+
+
+def get_web_pdf_header_template_value():
+    try:
+        return web_pdf_header_text.get("1.0", "end").strip()
+    except Exception:
+        try:
+            return str(web_pdf_header_template_var.get()).strip()
+        except Exception:
+            return str(DEFAULT_WEB_PDF_HEADER_TEMPLATE)
+
+
+def get_web_pdf_footer_template_value():
+    try:
+        return web_pdf_footer_text.get("1.0", "end").strip()
+    except Exception:
+        try:
+            return str(web_pdf_footer_template_var.get()).strip()
+        except Exception:
+            return str(DEFAULT_WEB_PDF_FOOTER_TEMPLATE)
+
+
+def set_web_pdf_header_template_value(value):
+    value = str(value or "")
+    try:
+        web_pdf_header_template_var.set(value)
+    except Exception:
+        pass
+    try:
+        previous_state = str(web_pdf_header_text.cget("state"))
+        if previous_state == "disabled":
+            web_pdf_header_text.configure(state="normal")
+        replace_text_widget_content(web_pdf_header_text, value)
+        if previous_state == "disabled":
+            web_pdf_header_text.configure(state="disabled")
+    except Exception:
+        pass
+
+
+def set_web_pdf_footer_template_value(value):
+    value = str(value or "")
+    try:
+        web_pdf_footer_template_var.set(value)
+    except Exception:
+        pass
+    try:
+        previous_state = str(web_pdf_footer_text.cget("state"))
+        if previous_state == "disabled":
+            web_pdf_footer_text.configure(state="normal")
+        replace_text_widget_content(web_pdf_footer_text, value)
+        if previous_state == "disabled":
+            web_pdf_footer_text.configure(state="disabled")
+    except Exception:
+        pass
+
+
+def sync_web_pdf_templates_from_widgets(schedule_autosave=False):
+    try:
+        web_pdf_header_template_var.set(get_web_pdf_header_template_value())
+    except Exception:
+        pass
+    try:
+        web_pdf_footer_template_var.set(get_web_pdf_footer_template_value())
+    except Exception:
+        pass
+    if schedule_autosave:
+        try:
+            schedule_settings_autosave()
+        except Exception:
+            pass
+
+
+def detect_web_browser_path():
+    candidates = []
+    for env_name, relative_paths in (
+        ("PROGRAMFILES(X86)", [os.path.join("Microsoft", "Edge", "Application", "msedge.exe")]),
+        ("PROGRAMFILES", [
+            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        ]),
+        ("LOCALAPPDATA", [
+            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        ]),
+    ):
+        base = os.environ.get(env_name, "")
+        if base:
+            candidates.extend(os.path.join(base, relative) for relative in relative_paths)
+
+    for name in ("msedge.exe", "msedge", "chrome.exe", "chrome", "chromium.exe", "chromium"):
+        resolved = shutil.which(name)
+        if resolved:
+            candidates.append(resolved)
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            normalized = os.path.abspath(candidate)
+        except Exception:
+            normalized = candidate
+        key = os.path.normcase(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(normalized):
+            return normalized
+    return ""
+
+
+def resolve_web_browser_path(configured_path=None):
+    value = str(configured_path or "").strip()
+    if value and os.path.isfile(value):
+        return os.path.abspath(value)
+    return detect_web_browser_path()
+
+
+def resolve_web_deno_path(configured_path=None):
+    value = str(configured_path or "").strip()
+    if value and os.path.isfile(value):
+        return os.path.abspath(value)
+    detected = resolve_deno_executable_for_gui()
+    return detected if detected and os.path.isfile(detected) else value or detected
+
+
+def resolve_web_wrapper_script_path(configured_path=None):
+    value = str(configured_path or "").strip()
+    if os.path.basename(value).lower() == "script-webcapture.ts":
+        migrated = os.path.join(os.path.dirname(os.path.abspath(value)), "script-webcapture.ps1")
+        if os.path.isfile(migrated):
+            return migrated
+    if value and os.path.isfile(value):
+        return os.path.abspath(value)
+    return value
+
+
+def resolve_web_helper_script_path(wrapper_path=None):
+    wrapper = resolve_web_wrapper_script_path(wrapper_path)
+    base_folder = os.path.dirname(os.path.abspath(wrapper)) if wrapper else ROOT
+    return os.path.join(base_folder, "script-webcapture.ts")
+
+
+def get_web_browser_version_info(browser_path):
+    browser_path = str(browser_path or "").strip()
+    if not browser_path or not os.path.isfile(browser_path):
+        return {"version": "not configured", "ok": False, "exit_code": None}
+
+    if os.name == "nt":
+        info = get_tool_first_line([
+            "powershell.exe", "-NoProfile", "-Command",
+            "(Get-Item -LiteralPath $args[0]).VersionInfo.ProductVersion", browser_path,
+        ], timeout=15)
+        if info.get("ok") and info.get("version"):
+            return info
+
+    return {
+        "version": f"{os.path.basename(browser_path)} (version confirmed during Webpage Capture preflight/run)",
+        "ok": True,
+        "exit_code": 0,
+    }
+
+
+def web_append_log(text):
+    try:
+        append_to_log_widget(web_log_box, text)
+    except Exception:
+        try:
+            append_log(text)
+        except Exception:
+            pass
+
+
+def web_set_status(text):
+    try:
+        web_status_var.set(text)
+    except Exception:
+        pass
+
+
+def parse_web_input_file_paths(value=None):
+    return parse_delimited_file_paths(web_input_file_var.get() if value is None else value)
+
+
+def get_existing_web_input_file_paths(value=None):
+    return existing_file_paths(parse_web_input_file_paths(value))
+
+
+def get_web_url_source_text():
+    return get_url_source_text_from_widget(
+        web_urls_text,
+        get_existing_web_input_file_paths(),
+        normalize_files=False,
+        log_errors=True,
+    )
+
+
+def get_web_url_list():
+    return get_url_list_from_widget(web_urls_text, get_existing_web_input_file_paths(), log_errors=True)
+
+
+def set_web_url_box_urls(urls):
+    set_text_widget_url_lines(web_urls_text, urls)
+
+
+def load_web_urls_from_input_file(replace=True):
+    paths = get_existing_web_input_file_paths()
+    if not paths:
+        messagebox.showwarning("Input File(s)", "No valid Webpage Capture Input File(s) were selected.")
+        return
+    urls = read_urls_from_input_paths(paths, log_errors=True)
+    if replace:
+        set_web_url_box_urls(urls)
+        web_append_log(f"\nLoaded {len(urls)} webpage URL(s) from Input File(s).\n")
+    else:
+        current = web_urls_text.get("1.0", "end").strip()
+        addition = "\n".join(urls).strip()
+        replace_text_widget_content(web_urls_text, ((current + "\n") if current else "") + addition)
+        web_append_log(f"\nAppended {len(urls)} webpage URL(s) from Input File(s).\n")
+
+
+def save_web_urls_to_input_file():
+    content = web_urls_text.get("1.0", "end").strip()
+    if not content:
+        messagebox.showwarning("No URLs", "The Webpage Capture URL box is empty.")
+        return
+    path = web_input_file_var.get().strip()
+    if not path:
+        path = filedialog.asksaveasfilename(
+            title="Save Webpage Capture URLs",
+            initialdir=ROOT,
+            initialfile="web-urls.txt",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        Path(path).write_text(content + "\n", encoding="utf-8")
+        web_input_file_var.set(path)
+        web_append_log(f"\nSaved Webpage Capture URL box to: {path}\n")
+    except Exception as e:
+        messagebox.showerror("Save failed", str(e))
+
+
+def clear_web_urls():
+    web_urls_text.delete("1.0", "end")
+    web_append_log("\nCleared Webpage Capture URL box.\n")
+
+
+def remove_duplicate_web_urls_from_box():
+    source_text = get_web_url_source_text()
+    if not source_text.strip():
+        messagebox.showwarning("No URLs", "No Webpage Capture URL text or input file contents were found.")
+        return
+    output_urls, duplicate_count = deduplicate_urls_from_source_text(source_text)
+    set_web_url_box_urls(output_urls)
+    messagebox.showinfo("Duplicates Removed", f"Unique URLs kept: {len(output_urls)}\nDuplicates removed: {duplicate_count}")
+    web_append_log(f"\nRemoved {duplicate_count} duplicate webpage URL(s); kept {len(output_urls)} unique URL(s).\n")
+
+
+def validate_web_urls_in_box(normalize=False):
+    source = get_web_url_source_text()
+    if not source.strip():
+        messagebox.showwarning("No URLs", "No Webpage Capture URL text or input file contents were found.")
+        return
+    analysis = analyze_url_source_text(source)
+    if normalize:
+        set_web_url_box_urls(analysis["valid_urls"])
+    messages = build_url_validation_messages(analysis, normalized=normalize)
+    messagebox.showinfo("Webpage URL Validation", "\n".join(messages))
+
+
+def get_web_settings_dict():
+    browser_path = resolve_web_browser_path(web_browser_path_var.get())
+    deno_path = resolve_web_deno_path(web_deno_path_var.get())
+    return {
+        "engine": "web-capture",
+        "web_script_path": web_script_path_var.get().strip(),
+        "web_deno_path": deno_path,
+        "web_browser_path": browser_path,
+        "web_input_file": web_input_file_var.get().strip(),
+        "case_name": web_case_name_var.get().strip(),
+        "web_case_name": web_case_name_var.get().strip(),
+        "web_filename_template": web_filename_template_var.get().strip(),
+        "output_root": web_output_root_var.get().strip(),
+        "web_output_root": web_output_root_var.get().strip(),
+        "web_capture_mode": web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport"} else DEFAULTS["web_capture_mode"],
+        "web_viewport_width": normalize_positive_int_string(web_viewport_width_var.get(), DEFAULTS["web_viewport_width"]),
+        "web_viewport_height": normalize_positive_int_string(web_viewport_height_var.get(), DEFAULTS["web_viewport_height"]),
+        "web_page_load_timeout": normalize_positive_int_string(web_page_load_timeout_var.get(), DEFAULTS["web_page_load_timeout"]),
+        "web_additional_wait": normalize_nonnegative_int_string(web_additional_wait_var.get(), DEFAULTS["web_additional_wait"]),
+        "web_lazy_scroll": bool(web_lazy_scroll_var.get()),
+        "web_scroll_wait_ms": normalize_positive_int_string(web_scroll_wait_ms_var.get(), DEFAULTS["web_scroll_wait_ms"]),
+        "web_max_scroll_seconds": normalize_positive_int_string(web_max_scroll_seconds_var.get(), DEFAULTS["web_max_scroll_seconds"]),
+        "web_stable_height_checks": normalize_positive_int_string(web_stable_height_checks_var.get(), DEFAULTS["web_stable_height_checks"]),
+        "web_concurrent_captures": str(web_concurrent_captures_var.get()).strip() or DEFAULTS["web_concurrent_captures"],
+        "web_create_pdf": bool(web_create_pdf_var.get()),
+        "web_pdf_landscape": bool(web_pdf_landscape_var.get()),
+        "web_pdf_print_background": bool(web_pdf_print_background_var.get()),
+        "web_pdf_display_header_footer": bool(web_pdf_display_header_footer_var.get()),
+        "web_pdf_scale": normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS["web_pdf_scale"]),
+        "web_pdf_paper_width_in": normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS["web_pdf_paper_width_in"]),
+        "web_pdf_paper_height_in": normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS["web_pdf_paper_height_in"]),
+        "web_pdf_margin_top_in": normalize_nonnegative_float_string(web_pdf_margin_top_in_var.get(), DEFAULTS["web_pdf_margin_top_in"]),
+        "web_pdf_margin_bottom_in": normalize_nonnegative_float_string(web_pdf_margin_bottom_in_var.get(), DEFAULTS["web_pdf_margin_bottom_in"]),
+        "web_pdf_margin_left_in": normalize_nonnegative_float_string(web_pdf_margin_left_in_var.get(), DEFAULTS["web_pdf_margin_left_in"]),
+        "web_pdf_margin_right_in": normalize_nonnegative_float_string(web_pdf_margin_right_in_var.get(), DEFAULTS["web_pdf_margin_right_in"]),
+        "web_pdf_page_ranges": web_pdf_page_ranges_var.get().strip(),
+        "web_pdf_prefer_css_page_size": bool(web_pdf_prefer_css_page_size_var.get()),
+        "web_pdf_header_template": get_web_pdf_header_template_value(),
+        "web_pdf_footer_template": get_web_pdf_footer_template_value(),
+        "web_pdf_page_behavior": web_pdf_page_behavior_var.get() if web_pdf_page_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"],
+        "web_pdf_capture_mode": web_pdf_capture_mode_var.get() if web_pdf_capture_mode_var.get() in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"],
+    }
+
+
+def get_web_proxy_server_for_browser():
+    proxy_url = get_proxy_url_for_command()
+    if not proxy_url:
+        return ""
+    parsed = urlsplit(proxy_url)
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "Webpage Capture does not support authenticated proxy credentials in this first version. "
+            "Disable the app proxy or use an approved unauthenticated proxy for this capture."
+        )
+    return proxy_url
+
+
+def get_resolved_web_case_name(now=None, domains=None):
+    now = now or datetime.now()
+    if domains is None:
+        domains = sorted({domain for domain in (get_url_domain_key(url) for url in get_web_url_list()) if domain})
+    return safe_case_name(render_case_name_template(
+        web_case_name_var.get().strip(),
+        now=now,
+        domains=domains,
+        presets=[],
+        playlist="",
+    ))
+
+
+def render_web_filename_template_example(template, now=None, resolved_case_name=None, capture_mode=None):
+    template = str(template or "").strip()
+    if not template:
+        raise ValueError("Filename Template cannot be blank.")
+
+    now_utc = now or datetime.now(timezone.utc)
+    if getattr(now_utc, "tzinfo", None) is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    sample_values = {
+        "%date%": now_utc.strftime("%Y%m%d"),
+        "%time%": now_utc.strftime("%H%M%S"),
+        "%datetime%": now_utc.strftime("%Y%m%d-%H%M%S"),
+        "%domain%": "example.com",
+        "%title%": "Sample Page Title",
+        "%index%": "001",
+        "%mode%": "viewport" if capture_mode == "viewport" else "full-page",
+        "%case%": safe_case_name(str(resolved_case_name or "Case-Sample")),
+    }
+    rendered = template
+    for tag, value in sample_values.items():
+        rendered = rendered.replace(tag, value)
+    rendered = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", rendered)
+    rendered = re.sub(r"\s+", " ", rendered).strip().rstrip(". ")
+    return rendered or "webpage-capture"
+
+
+def update_web_filename_template_preview(*args):
+    try:
+        resolved_case = get_resolved_web_case_name(now=datetime.now())
+        capture_mode = web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport"} else "full_page"
+        example = render_web_filename_template_example(
+            web_filename_template_var.get(),
+            now=datetime.now(timezone.utc),
+            resolved_case_name=resolved_case,
+            capture_mode=capture_mode,
+        )
+        png_suffix = "_viewport.png" if capture_mode == "viewport" else "_full.png"
+        examples = [f"{example}{png_suffix}"]
+        if web_create_pdf_var.get():
+            examples.append(f"{example}_print.pdf")
+        web_filename_template_preview_var.set(f"Resolved output example(s): {'; '.join(examples)}")
+    except Exception as e:
+        try:
+            web_filename_template_preview_var.set(f"Resolved file name example: unavailable ({e})")
+        except Exception:
+            pass
+
+
+def insert_web_case_name_tag(tag):
+    try:
+        web_case_name_entry.insert("insert", tag)
+        web_case_name_entry.focus_set()
+    except Exception:
+        current = web_case_name_var.get()
+        web_case_name_var.set(f"{current}{tag}")
+
+
+def insert_web_filename_template_tag(tag):
+    try:
+        web_filename_template_entry.insert("insert", tag)
+        web_filename_template_entry.focus_set()
+    except Exception:
+        current = web_filename_template_var.get()
+        web_filename_template_var.set(f"{current}{tag}")
+
+
+def update_web_case_folder_preview(*args):
+    try:
+        output_root = web_output_root_var.get().strip()
+        resolved_name = get_resolved_web_case_name(now=datetime.now())
+        if not output_root:
+            web_case_folder_preview_var.set("Resolved case folder: Output Root is blank")
+            return
+        if not resolved_name:
+            web_case_folder_preview_var.set("Resolved case folder: Case name is blank after resolving template")
+            return
+        case_folder = os.path.join(output_root, resolved_name)
+        if case_folder_is_populated(case_folder):
+            web_case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [existing case files]")
+        elif os.path.isdir(case_folder):
+            web_case_folder_preview_var.set(f"Resolved case folder: {case_folder}  [folder exists]")
+        else:
+            web_case_folder_preview_var.set(f"Resolved case folder: {case_folder}")
+    except Exception as e:
+        try:
+            web_case_folder_preview_var.set(f"Resolved case folder: unavailable ({e})")
+        except Exception:
+            pass
+
+
+def get_web_pdf_capture_mode_label(value=None):
+    capture_mode = str(value if value is not None else web_pdf_capture_mode_var.get()).strip()
+    mapping = {
+        "live_webpage": "Live page",
+        "paginated_png": "Captured PNG",
+    }
+    return mapping.get(capture_mode, mapping[DEFAULTS["web_pdf_capture_mode"]])
+
+
+def get_web_pdf_page_behavior_label(value=None):
+    behavior = str(value if value is not None else web_pdf_page_behavior_var.get()).strip()
+    mapping = {
+        "preserve_layout": "Preserve layout",
+        "neutralize_fixed_sticky": "Neutralize fixed/sticky",
+        "hide_likely_navigation_overlays": "Hide likely navigation overlays",
+    }
+    return mapping.get(behavior, mapping[DEFAULTS["web_pdf_page_behavior"]])
+
+
+def update_web_options_summary(*args):
+    try:
+        capture_mode = "Full page PNG" if web_capture_mode_var.get() == "full_page" else "Visible viewport PNG"
+        lazy_text = "Off"
+        if web_lazy_scroll_var.get():
+            lazy_text = (
+                f"On ({normalize_positive_int_string(web_scroll_wait_ms_var.get(), DEFAULTS['web_scroll_wait_ms'])}ms; "
+                f"{normalize_positive_int_string(web_max_scroll_seconds_var.get(), DEFAULTS['web_max_scroll_seconds'])}s max; "
+                f"{normalize_positive_int_string(web_stable_height_checks_var.get(), DEFAULTS['web_stable_height_checks'])} stable)"
+            )
+
+        if web_create_pdf_var.get():
+            pdf_parts = [
+                get_web_pdf_capture_mode_label(),
+                "Landscape" if web_pdf_landscape_var.get() else "Portrait",
+                f"{normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS['web_pdf_paper_width_in'])}×"
+                f"{normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS['web_pdf_paper_height_in'])}in",
+                f"scale {normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS['web_pdf_scale'])}",
+            ]
+            if web_pdf_print_background_var.get() and web_pdf_capture_mode_var.get() == "live_webpage":
+                pdf_parts.append("backgrounds")
+            if web_pdf_display_header_footer_var.get():
+                pdf_parts.append("headers/footers")
+            if web_pdf_prefer_css_page_size_var.get() and web_pdf_capture_mode_var.get() == "live_webpage":
+                pdf_parts.append("CSS page size")
+            if web_pdf_capture_mode_var.get() == "live_webpage":
+                pdf_parts.append(get_web_pdf_page_behavior_label())
+            page_ranges = web_pdf_page_ranges_var.get().strip()
+            if page_ranges and web_pdf_capture_mode_var.get() == "live_webpage":
+                pdf_parts.append(f"pages {page_ranges}")
+            pdf_text = ", ".join(pdf_parts)
+        else:
+            pdf_text = "Off"
+
+        parts = [
+            f"Mode: {capture_mode}",
+            f"Viewport: {normalize_positive_int_string(web_viewport_width_var.get(), DEFAULTS['web_viewport_width'])}×"
+            f"{normalize_positive_int_string(web_viewport_height_var.get(), DEFAULTS['web_viewport_height'])}",
+            f"Load: {normalize_positive_int_string(web_page_load_timeout_var.get(), DEFAULTS['web_page_load_timeout'])}s + "
+            f"{normalize_nonnegative_int_string(web_additional_wait_var.get(), DEFAULTS['web_additional_wait'])}s wait",
+            f"Lazy scroll: {lazy_text}",
+            f"Concurrent: {get_web_concurrent_capture_limit()}",
+            f"PDF: {pdf_text}",
+        ]
+        web_options_summary_var.set("; ".join(parts))
+    except Exception:
+        pass
+
+
+def update_web_capture_options_state(*args):
+    state = "normal" if web_lazy_scroll_var.get() else "disabled"
+    for widget in globals().get("web_lazy_scroll_widgets", []):
+        try:
+            widget.configure(state=state)
+        except Exception:
+            pass
+    update_web_options_summary()
+
+
+def update_web_pdf_options_state(*args):
+    enabled = bool(web_create_pdf_var.get())
+    state = "normal" if enabled else "disabled"
+    for widget in globals().get("web_pdf_option_widgets", []):
+        try:
+            widget.configure(state=state)
+        except Exception:
+            pass
+
+    live_capture_mode = str(web_pdf_capture_mode_var.get()).strip() == "live_webpage"
+    live_state = "normal" if enabled and live_capture_mode else "disabled"
+    for widget in globals().get("web_pdf_live_widgets", []):
+        try:
+            widget.configure(state=live_state)
+        except Exception:
+            pass
+
+    header_footer_state = "normal" if enabled and web_pdf_display_header_footer_var.get() else "disabled"
+    for widget in globals().get("web_pdf_header_footer_widgets", []):
+        try:
+            widget.configure(state=header_footer_state)
+        except Exception:
+            pass
+    update_web_options_summary()
+
+
+def hide_web_capture_options_panel(save=False):
+    try:
+        if web_capture_options_panel.winfo_ismapped():
+            web_capture_options_panel.grid_remove()
+    except Exception:
+        pass
+    try:
+        web_capture_options_button.config(text="Capture Options ▾")
+    except Exception:
+        pass
+    if save:
+        update_web_options_summary()
+        schedule_settings_autosave()
+
+
+def hide_web_pdf_options_panel(save=False):
+    try:
+        if web_pdf_options_panel.winfo_ismapped():
+            sync_web_pdf_templates_from_widgets(schedule_autosave=False)
+            web_pdf_options_panel.grid_remove()
+    except Exception:
+        pass
+    try:
+        web_pdf_options_button.config(text="PDF Options ▾")
+    except Exception:
+        pass
+    if save:
+        update_web_options_summary()
+        schedule_settings_autosave()
+
+
+def toggle_web_capture_options_panel():
+    if web_capture_options_panel.winfo_ismapped():
+        hide_web_capture_options_panel(save=True)
+        return
+    hide_web_pdf_options_panel(save=True)
+    update_web_capture_options_state()
+    web_capture_options_panel.grid(
+        row=8,
+        column=0,
+        columnspan=4,
+        rowspan=8,
+        sticky="nsew",
+        padx=0,
+        pady=(8, 0),
+    )
+    web_capture_options_panel.tkraise()
+    web_capture_options_button.config(text="Capture Options ▴")
+
+
+def close_web_capture_options_panel():
+    hide_web_capture_options_panel(save=True)
+
+
+def toggle_web_pdf_options_panel():
+    if web_pdf_options_panel.winfo_ismapped():
+        hide_web_pdf_options_panel(save=True)
+        return
+    hide_web_capture_options_panel(save=True)
+    update_web_pdf_options_state()
+    web_pdf_options_panel.grid(
+        row=8,
+        column=0,
+        columnspan=4,
+        rowspan=8,
+        sticky="nsew",
+        padx=0,
+        pady=(8, 0),
+    )
+    web_pdf_options_panel.tkraise()
+    web_pdf_options_button.config(text="PDF Options ▴")
+
+
+def close_web_pdf_options_panel():
+    hide_web_pdf_options_panel(save=True)
+
+
+def open_current_web_case_folder():
+    try:
+        folder = os.path.join(web_output_root_var.get().strip(), get_resolved_web_case_name(now=datetime.now()))
+        os.makedirs(folder, exist_ok=True)
+        os.startfile(folder)
+    except Exception as e:
+        messagebox.showerror("Open case folder failed", str(e))
+
+
+def open_web_output_folder():
+    path = web_output_root_var.get().strip()
+    if os.path.isdir(path):
+        os.startfile(path)
+    else:
+        messagebox.showwarning("Folder not found", "Webpage Capture Output Root folder does not exist.")
+
+
+def delete_current_web_case_folder():
+    try:
+        case_folder = os.path.join(web_output_root_var.get().strip(), get_resolved_web_case_name(now=datetime.now()))
+    except Exception as e:
+        messagebox.showerror("Invalid case path", str(e))
+        return
+    if not os.path.isdir(case_folder):
+        messagebox.showinfo("Case folder not found", f"The current Webpage Capture case folder does not exist:\n\n{case_folder}")
+        return
+    if not messagebox.askyesno(
+        "Delete current Webpage Capture case folder?",
+        "This will permanently delete the current Webpage Capture case folder and all files inside it:\n\n"
+        f"{case_folder}\n\nContinue?",
+    ):
+        return
+    try:
+        shutil.rmtree(case_folder)
+        web_append_log(f"\nDeleted Webpage Capture case folder: {case_folder}\n")
+    except Exception as e:
+        messagebox.showerror("Delete failed", str(e))
+
+
+def validate_web_settings_and_urls(settings, urls, resolved_case_name="", preflight_only=False):
+    script_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
+    helper_path = resolve_web_helper_script_path(script_path)
+    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+    browser_path = resolve_web_browser_path(settings.get("web_browser_path", ""))
+    output_root = str(settings.get("web_output_root") or settings.get("output_root") or "").strip()
+
+    if not script_path or not os.path.isfile(script_path):
+        raise ValueError("Webpage Capture PowerShell script path is missing or invalid.")
+    if not helper_path or not os.path.isfile(helper_path):
+        raise ValueError("script-webcapture.ts was not found beside the Webpage Capture PowerShell script.")
+    if not deno_path or not os.path.isfile(deno_path):
+        raise ValueError("Deno path is missing or invalid. Place deno.exe beside the app or select it manually.")
+    if not browser_path or not os.path.isfile(browser_path):
+        raise ValueError("Microsoft Edge or Google Chrome was not found. Select the browser executable manually.")
+    if not preflight_only and not urls:
+        raise ValueError("No Webpage Capture URLs are available. Add URLs to the URL box or select Input File(s).")
+    invalid_urls = [url for url in urls if not str(url).lower().startswith(("http://", "https://"))]
+    if invalid_urls:
+        raise ValueError("Webpage Capture supports only HTTP/HTTPS URLs in this version.")
+    if not preflight_only:
+        if not output_root:
+            raise ValueError("Webpage Capture Output Root cannot be blank.")
+        os.makedirs(output_root, exist_ok=True)
+        if not resolved_case_name:
+            raise ValueError("Webpage Capture Case Name is blank after resolving the template.")
+    template = str(settings.get("web_filename_template", "")).strip()
+    if not template:
+        raise ValueError("Webpage Capture Filename Template cannot be blank.")
+    width = int(settings.get("web_viewport_width", DEFAULTS["web_viewport_width"]))
+    height = int(settings.get("web_viewport_height", DEFAULTS["web_viewport_height"]))
+    if not 320 <= width <= 7680:
+        raise ValueError("Webpage Capture viewport width must be from 320 to 7680 pixels.")
+    if not 240 <= height <= 4320:
+        raise ValueError("Webpage Capture viewport height must be from 240 to 4320 pixels.")
+    if bool(settings.get("web_create_pdf", DEFAULTS["web_create_pdf"])):
+        scale = float(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"]))
+        paper_width = float(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"]))
+        paper_height = float(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"]))
+        margin_top = float(settings.get("web_pdf_margin_top_in", DEFAULTS["web_pdf_margin_top_in"]))
+        margin_bottom = float(settings.get("web_pdf_margin_bottom_in", DEFAULTS["web_pdf_margin_bottom_in"]))
+        margin_left = float(settings.get("web_pdf_margin_left_in", DEFAULTS["web_pdf_margin_left_in"]))
+        margin_right = float(settings.get("web_pdf_margin_right_in", DEFAULTS["web_pdf_margin_right_in"]))
+        if not 0.1 <= scale <= 2.0:
+            raise ValueError("Webpage Capture PDF scale must be from 0.1 to 2.0.")
+        if not 1.0 <= paper_width <= 40.0:
+            raise ValueError("Webpage Capture PDF paper width must be from 1.0 to 40.0 inches.")
+        if not 1.0 <= paper_height <= 40.0:
+            raise ValueError("Webpage Capture PDF paper height must be from 1.0 to 40.0 inches.")
+        if any(value < 0 or value > 5.0 for value in (margin_top, margin_bottom, margin_left, margin_right)):
+            raise ValueError("Webpage Capture PDF margins must be from 0.0 to 5.0 inches.")
+        if margin_top + margin_bottom >= paper_height:
+            raise ValueError("Webpage Capture PDF top and bottom margins must total less than the paper height.")
+        if margin_left + margin_right >= paper_width:
+            raise ValueError("Webpage Capture PDF left and right margins must total less than the paper width.")
+        page_ranges = str(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]) or "").strip()
+        if page_ranges and not re.fullmatch(r"\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*", page_ranges):
+            raise ValueError("Webpage Capture PDF page ranges must use values such as 1-5 or 1,3,5-8.")
+        pdf_page_behavior = str(settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"]) or DEFAULTS["web_pdf_page_behavior"]).strip()
+        if pdf_page_behavior not in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"}:
+            raise ValueError("Webpage Capture PDF page behavior must be a supported choice.")
+        pdf_capture_mode = str(settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"]) or DEFAULTS["web_pdf_capture_mode"]).strip()
+        if pdf_capture_mode not in {"live_webpage", "paginated_png"}:
+            raise ValueError("Webpage Capture PDF capture mode must be a supported choice.")
+    get_web_proxy_server_for_browser()
+    settings["web_script_path"] = script_path
+    settings["web_deno_path"] = deno_path
+    settings["web_browser_path"] = browser_path
+    return True
+
+
+def validate_web_queue_job_inputs(job):
+    settings = job.get("settings", {})
+    urls = get_queue_job_run_urls(job)
+    return validate_web_settings_and_urls(settings, urls, job.get("resolved_case_name", ""), preflight_only=False)
+
+
+def make_web_capture_config(job, preflight_only=False):
+    settings = dict(job.get("settings", {}))
+    urls = [] if preflight_only else get_queue_job_run_urls(job)
+    resolved_case_name = str(job.get("resolved_case_name", "") or "")
+    validate_web_settings_and_urls(settings, urls, resolved_case_name, preflight_only=preflight_only)
+
+    token = f"{job.get('job_id') or 'preflight'}-{secrets.token_hex(6)}"
+    run_root = os.path.join(ensure_gui_temp_dir(), "web-capture", token)
+    profile_root = os.path.join(run_root, "browser-profile")
+    os.makedirs(profile_root, exist_ok=True)
+
+    output_root = str(settings.get("web_output_root") or settings.get("output_root") or "")
+    case_folder = os.path.join(output_root, resolved_case_name) if output_root and resolved_case_name else ""
+    paths = get_expected_run_paths_for_values(output_root, resolved_case_name) if case_folder else {}
+    config = {
+        "schema_version": 1,
+        "app_version": APP_VERSION,
+        "script_path": resolve_web_helper_script_path(settings.get("web_script_path", "")),
+        "wrapper_script_path": resolve_web_wrapper_script_path(settings.get("web_script_path", "")),
+        "job_id": job.get("job_id", ""),
+        "preflight_only": bool(preflight_only),
+        "browser_path": settings.get("web_browser_path", ""),
+        "profile_root": profile_root,
+        "browser_start_timeout_seconds": 25,
+        "urls": urls,
+        "case_folder": case_folder,
+        "case_name": resolved_case_name,
+        "web_media_folder": os.path.join(paths.get("media_folder", ""), "web") if paths else "",
+        "logs_folder": paths.get("logs_folder", ""),
+        "manifests_folder": paths.get("manifests_folder", ""),
+        "capture_mode": settings.get("web_capture_mode", DEFAULTS["web_capture_mode"]),
+        "filename_template": settings.get("web_filename_template", DEFAULTS["web_filename_template"]),
+        "viewport_width": int(settings.get("web_viewport_width", DEFAULTS["web_viewport_width"])),
+        "viewport_height": int(settings.get("web_viewport_height", DEFAULTS["web_viewport_height"])),
+        "page_load_timeout_seconds": int(settings.get("web_page_load_timeout", DEFAULTS["web_page_load_timeout"])),
+        "additional_wait_seconds": int(settings.get("web_additional_wait", DEFAULTS["web_additional_wait"])),
+        "lazy_scroll": bool(settings.get("web_lazy_scroll", DEFAULTS["web_lazy_scroll"])),
+        "scroll_wait_ms": int(settings.get("web_scroll_wait_ms", DEFAULTS["web_scroll_wait_ms"])),
+        "max_scroll_seconds": int(settings.get("web_max_scroll_seconds", DEFAULTS["web_max_scroll_seconds"])),
+        "stable_height_checks": int(settings.get("web_stable_height_checks", DEFAULTS["web_stable_height_checks"])),
+        "create_pdf": bool(settings.get("web_create_pdf", DEFAULTS["web_create_pdf"])),
+        "pdf_landscape": bool(settings.get("web_pdf_landscape", DEFAULTS["web_pdf_landscape"])),
+        "pdf_print_background": bool(settings.get("web_pdf_print_background", DEFAULTS["web_pdf_print_background"])),
+        "pdf_display_header_footer": bool(settings.get("web_pdf_display_header_footer", DEFAULTS["web_pdf_display_header_footer"])),
+        "pdf_scale": float(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"])),
+        "pdf_paper_width_in": float(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"])),
+        "pdf_paper_height_in": float(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"])),
+        "pdf_margin_top_in": float(settings.get("web_pdf_margin_top_in", DEFAULTS["web_pdf_margin_top_in"])),
+        "pdf_margin_bottom_in": float(settings.get("web_pdf_margin_bottom_in", DEFAULTS["web_pdf_margin_bottom_in"])),
+        "pdf_margin_left_in": float(settings.get("web_pdf_margin_left_in", DEFAULTS["web_pdf_margin_left_in"])),
+        "pdf_margin_right_in": float(settings.get("web_pdf_margin_right_in", DEFAULTS["web_pdf_margin_right_in"])),
+        "pdf_page_ranges": str(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]) or "").strip(),
+        "pdf_prefer_css_page_size": bool(settings.get("web_pdf_prefer_css_page_size", DEFAULTS["web_pdf_prefer_css_page_size"])),
+        "pdf_header_template": str(settings.get("web_pdf_header_template", DEFAULTS["web_pdf_header_template"]) or ""),
+        "pdf_footer_template": str(settings.get("web_pdf_footer_template", DEFAULTS["web_pdf_footer_template"]) or ""),
+        "pdf_page_behavior": settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"]),
+        "pdf_capture_mode": settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"]),
+        "maximum_single_dimension": 30000,
+        "maximum_single_pixels": 150000000,
+        "segment_height": 12000,
+        "proxy_server": get_web_proxy_server_for_browser(),
+    }
+    config_path = make_gui_temp_file_path(prefix="avi-capture-gui-web-config-", suffix=".json")
+    Path(config_path).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    register_gui_temp_file(config_path)
+    return config_path, config
+
+
+def build_web_capture_command_for_job(job, preflight_only=False):
+    config_path, _config = make_web_capture_config(job, preflight_only=preflight_only)
+    settings = job.get("settings", {})
+    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+    wrapper_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
+    helper_path = resolve_web_helper_script_path(wrapper_path)
+
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        wrapper_path,
+        "-DenoPath",
+        deno_path,
+        "-ConfigPath",
+        config_path,
+        "-HelperScriptPath",
+        helper_path,
+    ]
+
+
+def run_web_preflight_check():
+    web_preflight_done_var.set(False)
+    web_set_status("Running preflight...")
+    web_append_log("\n========== Webpage Capture Preflight ==========\n")
+    cmd = []
+    try:
+        settings = get_web_settings_dict()
+        job = {
+            "job_id": "preflight",
+            "engine": "web-capture",
+            "settings": settings,
+            "urls": [],
+            "resolved_case_name": "",
+        }
+        validate_web_settings_and_urls(settings, [], "", preflight_only=True)
+        versions = query_capture_tool_versions_for_job(settings)
+        web_append_log(f"PowerShell script: {settings.get('web_script_path', '')}\n")
+        web_append_log(f"TypeScript helper: {resolve_web_helper_script_path(settings.get('web_script_path', ''))}\n")
+        web_append_log(f"Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
+        web_append_log(f"Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n")
+        web_append_log(f"Browser path: {settings.get('web_browser_path', '')}\n")
+        web_append_log("Normal browser profile access: disabled by design\n")
+        web_append_log("Testing isolated profile launch and loopback DevTools connection...\n")
+        cmd = build_web_capture_command_for_job(job, preflight_only=True)
+        process = subprocess.Popen(
+            cmd,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process, label="Webpage Capture preflight")
+            try:
+                output, _ = process.communicate(timeout=5)
+            except Exception:
+                output = ""
+            if output:
+                web_append_log(output)
+            raise
+        if output:
+            web_append_log(output)
+        if process.returncode != 0 or "WEB_CAPTURE_PREFLIGHT_OK" not in output:
+            raise ValueError(
+                "The isolated Edge/Chrome DevTools test failed. Browser remote debugging, Deno child-process execution, "
+                "or local profile creation may be blocked by policy."
+            )
+        web_preflight_done_var.set(True)
+        web_set_status("Preflight passed")
+        web_append_log("Webpage Capture preflight passed.\n")
+        messagebox.showinfo("Webpage Capture preflight", "Preflight passed. The browser launched with an isolated app-owned profile and accepted a loopback DevTools connection.")
+        schedule_settings_autosave()
+        return True
+    except subprocess.TimeoutExpired:
+        web_set_status("Preflight timed out")
+        web_append_log("ERROR: Webpage Capture preflight timed out.\n")
+        messagebox.showerror("Webpage Capture preflight failed", "The browser/Deno compatibility test timed out. Review endpoint policy and the Webpage Capture log.")
+        return False
+    except Exception as e:
+        web_set_status("Preflight failed")
+        web_append_log(f"ERROR: {e}\n")
+        messagebox.showerror("Webpage Capture preflight failed", str(e))
+        return False
+    finally:
+        cleanup_command_input_file_if_temp(cmd)
+
+
+def add_web_urls_to_queue_as_job(urls=None):
+    try:
+        urls = urls if urls is not None else get_web_url_list()
+        clean_urls = []
+        seen = set()
+        for url in urls:
+            cleaned = clean_extracted_url(url)
+            if not cleaned or not cleaned.lower().startswith(("http://", "https://")):
+                continue
+            key = normalize_url_for_compare(cleaned)
+            if key in seen:
+                continue
+            seen.add(key)
+            clean_urls.append(cleaned)
+        if not clean_urls:
+            raise ValueError("No valid HTTP/HTTPS Webpage Capture URLs are available to add to the queue.")
+
+        settings = get_web_settings_dict()
+        domains = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
+        case_template = settings.get("web_case_name", "")
+        resolved_case_name = safe_case_name(render_case_name_template(
+            case_template,
+            now=datetime.now(),
+            domains=domains,
+            presets=[],
+            playlist="",
+        ))
+        if not resolved_case_name:
+            raise ValueError("Webpage Capture Case Name is blank after resolving the template.")
+        job = {
+            "job_id": make_job_id(),
+            "engine": "web-capture",
+            "settings_schema_version": SETTINGS_SCHEMA_VERSION,
+            "status": "pending",
+            "case_template": case_template,
+            "resolved_case_name": resolved_case_name,
+            "urls": clean_urls,
+            "settings": settings,
+            "output_root": settings.get("web_output_root", ""),
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "started": "",
+            "finished": "",
+            "exit_code": "",
+            "completed_urls": 0,
+            "summary": "",
+            "applied_domain_presets": [],
+            "playlist_name": "",
+            "domains": domains,
+            "allow_domain_collision": False,
+            "checked": False,
+            "direct_capture": False,
+            "resume_strategy": "url-level continue",
+        }
+        collisions = find_domain_collisions_for_job(job)
+        if collisions:
+            choice = show_domain_collision_dialog(collisions)
+            if choice == "cancel":
+                return False
+            mark_job_domain_policy(job, choice)
+        job_queue.append(job)
+        save_job_queue_state()
+        refresh_job_queue_window()
+        web_append_log(f"\nAdded Webpage Capture queue job: {resolved_case_name} ({len(clean_urls)} URL(s))\n")
+        return True
+    except Exception as e:
+        messagebox.showerror("Add Webpage Capture job failed", str(e))
+        return False
+
+
+def add_web_job_and_open_queue():
+    if add_web_urls_to_queue_as_job():
+        open_job_queue()
+
+
+def add_web_job_to_queue_and_start():
+    if not job_queue_window_is_open():
+        open_job_queue()
+    if add_web_urls_to_queue_as_job():
+        start_job_queue()
+
+
+def start_web_capture():
+    global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
+
+    queue_has_work = bool(job_queue_running or get_pending_queue_jobs() or get_running_queue_jobs())
+    if queue_has_work or get_web_concurrent_capture_limit() >= 2:
+        if not job_queue_window_is_open():
+            open_job_queue()
+        if add_web_urls_to_queue_as_job():
+            start_job_queue()
+        return
+
+    if web_running_process is not None and web_running_process.poll() is None:
+        messagebox.showwarning("Already running", "A Webpage Capture process is already running.")
+        return
+
+    cmd = []
+    try:
+        urls = get_web_url_list()
+        settings = get_web_settings_dict()
+        domains = sorted({domain for domain in (get_url_domain_key(url) for url in urls) if domain})
+        resolved_case_name = safe_case_name(render_case_name_template(
+            settings.get("web_case_name", ""),
+            now=datetime.now(),
+            domains=domains,
+            presets=[],
+            playlist="",
+        ))
+        validate_web_settings_and_urls(settings, urls, resolved_case_name, preflight_only=False)
+        case_folder = os.path.join(settings.get("web_output_root", ""), resolved_case_name)
+        if not confirm_case_folder_collision(case_folder):
+            return
+        candidate_job = {
+            "engine": "web-capture",
+            "settings": settings,
+            "domains": domains,
+            "resolved_case_name": resolved_case_name,
+            "allow_domain_collision": False,
+        }
+        collisions = find_domain_collisions_for_job(candidate_job, statuses=("running",))
+        if collisions:
+            choice = show_domain_collision_dialog(collisions)
+            if choice == "cancel":
+                return
+            if choice == "wait":
+                if add_web_urls_to_queue_as_job(urls):
+                    start_job_queue()
+                return
+        job = {
+            "job_id": make_job_id(),
+            "engine": "web-capture",
+            "settings": settings,
+            "urls": urls,
+            "resolved_case_name": resolved_case_name,
+            "domains": domains,
+            "case_template": settings.get("web_case_name", ""),
+        }
+        cmd = build_web_capture_command_for_job(job)
+        schedule_settings_autosave()
+    except Exception as e:
+        cleanup_command_input_file_if_temp(cmd)
+        messagebox.showerror("Webpage Capture input error", str(e))
+        return
+
+    if check_vpn_var.get() and last_vpn_status != "connected":
+        if not messagebox.askyesno("VPN not connected", "The VPN does not appear to be connected.\n\nContinue with Webpage Capture anyway?"):
+            cleanup_command_input_file_if_temp(cmd)
+            return
+
+    direct_recovery_job = create_direct_recovery_job(
+        "web-capture", settings, urls, resolved_case_name, settings.get("web_case_name", ""),
+        domains=domains, applied_domain_presets=[], playlist_name="",
+    )
+    recovery_job_id = direct_recovery_job.get("job_id") if direct_recovery_job else ""
+    active_web_direct_recovery_job_id = recovery_job_id or ""
+    active_web_direct_domains = list(domains)
+    active_web_direct_case_name = resolved_case_name
+
+    web_log_box.delete("1.0", "end")
+    web_append_log("Starting Webpage Capture...\n\n")
+    web_append_log(f"Resolved case: {resolved_case_name}\n")
+    web_append_log(f"Browser: {settings.get('web_browser_path', '')}\n")
+    web_append_log("Browser profile: new app-owned temporary profile; normal browser profiles and cookies are not accessed\n")
+    web_append_log(f"Mode: {'Full page PNG' if settings.get('web_capture_mode') == 'full_page' else 'Visible viewport PNG'}\n")
+    web_append_log(f"Create PDF: {'Yes' if settings.get('web_create_pdf') else 'No'}\n")
+    if settings.get('web_create_pdf'):
+        web_append_log(
+            f"PDF: {'Landscape' if settings.get('web_pdf_landscape') else 'Portrait'} | "
+            f"{settings.get('web_pdf_paper_width_in')}x{settings.get('web_pdf_paper_height_in')} in | "
+            f"scale {settings.get('web_pdf_scale')} | "
+            f"headers/footers {'on' if settings.get('web_pdf_display_header_footer') else 'off'} | "
+            f"behavior {get_web_pdf_page_behavior_label(settings.get('web_pdf_page_behavior'))}\n"
+        )
+    web_append_log(f"URLs: {len(urls)}\n")
+    web_append_log("Command:\n" + format_command_for_log(cmd) + "\n\n")
+    if recovery_job_id:
+        web_append_log(f"Recovery job saved to Job Queue: {recovery_job_id}\n")
+    elif not job_persistence_is_enabled():
+        web_append_log("Job Persistence is disabled; this direct Webpage Capture will not be recoverable from the Job Queue.\n")
+
+    web_start_button.config(state="disabled")
+    web_start_menu_button.config(state="disabled")
+    web_stop_button.config(state="normal")
+    web_set_status("Running...")
+
+    def worker():
+        global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
+        exit_code = 1
+        try:
+            process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+            web_running_process = process
+            if process.stdout:
+                for line in process.stdout:
+                    safe_after(0, web_append_log, line)
+                    if recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
+                        safe_after(0, handle_queue_output_line, recovery_job_id, line)
+            exit_code = process.wait()
+            safe_after(0, finish_direct_recovery_job, recovery_job_id, exit_code)
+        except Exception as e:
+            safe_after(0, web_append_log, f"\nERROR: {e}\n")
+        finally:
+            cleanup_command_input_file_if_temp(cmd)
+
+        def finish():
+            global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
+            web_running_process = None
+            active_web_direct_recovery_job_id = ""
+            active_web_direct_domains = []
+            active_web_direct_case_name = ""
+            web_start_button.config(state="normal")
+            web_start_menu_button.config(state="normal")
+            web_stop_button.config(state="disabled")
+            web_set_status("Complete" if exit_code == 0 else "Failed")
+            web_append_log(f"\nWebpage Capture finished with exit code {exit_code}.\n")
+            schedule_case_browser_autoload(delay_ms=250)
+
+        safe_after(0, finish)
+
+    start_daemon_thread("web-capture-worker", worker)
+
+
+def stop_web_capture():
+    global web_running_process
+    if web_running_process is not None and web_running_process.poll() is None:
+        try:
+            mark_running_queue_jobs_interrupted("Stopped by user.")
+            terminate_process_tree(web_running_process, label="direct Webpage Capture")
+            web_append_log("\nStop requested for Webpage Capture process tree.\n")
+        except Exception as e:
+            web_append_log(f"\nStop failed: {e}\n")
+    try:
+        web_stop_button.config(state="disabled")
+    except Exception:
+        pass
+
+
+def show_web_start_capture_menu():
+    try:
+        web_start_capture_menu.tk_popup(web_start_menu_button.winfo_rootx(), web_start_menu_button.winfo_rooty() + web_start_menu_button.winfo_height())
+    finally:
+        try:
+            web_start_capture_menu.grab_release()
+        except Exception:
+            pass
 
 
 def apply_screen_aware_startup_geometry():
@@ -18698,12 +20217,56 @@ image_preflight_done_var = tk.BooleanVar(value=False)
 gallery_dl_version_status_var = tk.StringVar(value="gallery-dl: not checked")
 image_options_summary_var = tk.StringVar(value="")
 image_running_process = None
+
+web_script_path_var = tk.StringVar(value=DEFAULTS["web_script_path"])
+web_deno_path_var = tk.StringVar(value=DEFAULTS["web_deno_path"])
+web_browser_path_var = tk.StringVar(value=DEFAULTS["web_browser_path"] or detect_web_browser_path())
+web_input_file_var = tk.StringVar(value=DEFAULTS["web_input_file"])
+web_case_name_var = tk.StringVar(value=DEFAULTS["web_case_name"])
+web_case_folder_preview_var = tk.StringVar(value="")
+web_filename_template_var = tk.StringVar(value=DEFAULTS["web_filename_template"])
+web_filename_template_preview_var = tk.StringVar(value="")
+web_output_root_var = tk.StringVar(value=DEFAULTS["web_output_root"])
+web_capture_mode_var = tk.StringVar(value=DEFAULTS["web_capture_mode"])
+web_viewport_width_var = tk.StringVar(value=DEFAULTS["web_viewport_width"])
+web_viewport_height_var = tk.StringVar(value=DEFAULTS["web_viewport_height"])
+web_page_load_timeout_var = tk.StringVar(value=DEFAULTS["web_page_load_timeout"])
+web_additional_wait_var = tk.StringVar(value=DEFAULTS["web_additional_wait"])
+web_lazy_scroll_var = tk.BooleanVar(value=DEFAULTS["web_lazy_scroll"])
+web_scroll_wait_ms_var = tk.StringVar(value=DEFAULTS["web_scroll_wait_ms"])
+web_max_scroll_seconds_var = tk.StringVar(value=DEFAULTS["web_max_scroll_seconds"])
+web_stable_height_checks_var = tk.StringVar(value=DEFAULTS["web_stable_height_checks"])
+web_concurrent_captures_var = tk.StringVar(value=DEFAULTS["web_concurrent_captures"])
+web_create_pdf_var = tk.BooleanVar(value=DEFAULTS["web_create_pdf"])
+web_pdf_landscape_var = tk.BooleanVar(value=DEFAULTS["web_pdf_landscape"])
+web_pdf_print_background_var = tk.BooleanVar(value=DEFAULTS["web_pdf_print_background"])
+web_pdf_display_header_footer_var = tk.BooleanVar(value=DEFAULTS["web_pdf_display_header_footer"])
+web_pdf_scale_var = tk.StringVar(value=DEFAULTS["web_pdf_scale"])
+web_pdf_paper_width_in_var = tk.StringVar(value=DEFAULTS["web_pdf_paper_width_in"])
+web_pdf_paper_height_in_var = tk.StringVar(value=DEFAULTS["web_pdf_paper_height_in"])
+web_pdf_margin_top_in_var = tk.StringVar(value=DEFAULTS["web_pdf_margin_top_in"])
+web_pdf_margin_bottom_in_var = tk.StringVar(value=DEFAULTS["web_pdf_margin_bottom_in"])
+web_pdf_margin_left_in_var = tk.StringVar(value=DEFAULTS["web_pdf_margin_left_in"])
+web_pdf_margin_right_in_var = tk.StringVar(value=DEFAULTS["web_pdf_margin_right_in"])
+web_pdf_page_ranges_var = tk.StringVar(value=DEFAULTS["web_pdf_page_ranges"])
+web_pdf_prefer_css_page_size_var = tk.BooleanVar(value=DEFAULTS["web_pdf_prefer_css_page_size"])
+web_pdf_header_template_var = tk.StringVar(value=DEFAULTS["web_pdf_header_template"])
+web_pdf_footer_template_var = tk.StringVar(value=DEFAULTS["web_pdf_footer_template"])
+web_pdf_page_behavior_var = tk.StringVar(value=DEFAULTS["web_pdf_page_behavior"])
+web_pdf_capture_mode_var = tk.StringVar(value=DEFAULTS["web_pdf_capture_mode"])
+web_status_var = tk.StringVar(value="Ready")
+web_preflight_done_var = tk.BooleanVar(value=False)
+web_options_summary_var = tk.StringVar(value="")
+web_running_process = None
 active_av_direct_recovery_job_id = ""
 active_image_direct_recovery_job_id = ""
+active_web_direct_recovery_job_id = ""
 active_av_direct_domains = []
 active_image_direct_domains = []
+active_web_direct_domains = []
 active_av_direct_case_name = ""
 active_image_direct_case_name = ""
+active_web_direct_case_name = ""
 
 
 for option_var in [
@@ -18791,12 +20354,14 @@ app_notebook.pack(fill="both", expand=True)
 
 main = ttk.Frame(app_notebook, padding=8)
 image_capture_tab = ttk.Frame(app_notebook, padding=8)
+web_capture_tab = ttk.Frame(app_notebook, padding=8)
 job_queue_tab = ttk.Frame(app_notebook, padding=0)
 playlist_preview_tab = ttk.Frame(app_notebook, padding=0)
 case_browser_tab = ttk.Frame(app_notebook, padding=0)
 
 app_notebook.add(main, text="Audio/Video Capture")
 app_notebook.add(image_capture_tab, text="Image Capture")
+app_notebook.add(web_capture_tab, text="Webpage Capture")
 app_notebook.add(job_queue_tab, text="Job Queue")
 app_notebook.add(playlist_preview_tab, text="Audio/Video Preview")
 app_notebook.add(case_browser_tab, text="Case Browser")
@@ -18925,6 +20490,8 @@ def get_active_capture_tab_context():
         return "av"
     if tab_text == "Image Capture":
         return "image"
+    if tab_text == "Webpage Capture":
+        return "web"
     return ""
 
 
@@ -18943,7 +20510,19 @@ def refresh_context_capture_menu(event=None):
     except Exception:
         pass
 
-    if context == "image":
+    if context == "web":
+        capture_menu.add_command(label="Preflight Check", command=run_web_preflight_check)
+        capture_menu.add_command(label="Start Capture", command=start_web_capture)
+        capture_menu.add_command(label="Stop Capture", command=stop_web_capture)
+        capture_menu.add_separator()
+        capture_menu.add_command(label="Add Job to Queue", command=add_web_job_and_open_queue)
+        capture_menu.add_command(label="Add Job to Queue and Start", command=add_web_job_to_queue_and_start)
+        capture_menu.add_separator()
+        capture_menu.add_command(label="Open Output Folder", command=open_web_output_folder)
+        capture_menu.add_command(label="Open Current Case Folder", command=open_current_web_case_folder)
+        capture_menu.add_separator()
+        capture_menu.add_command(label="Delete Current Case Folder", command=delete_current_web_case_folder)
+    elif context == "image":
         capture_menu.add_command(label="Preflight Check", command=run_image_preflight_check)
         capture_menu.add_command(label="Start Capture", command=start_image_capture)
         capture_menu.add_command(label="Stop Capture", command=stop_image_capture)
@@ -20646,7 +22225,650 @@ def build_image_capture_tab():
     update_image_options_summary()
 
 
+
 build_image_capture_tab()
+
+
+def build_web_capture_tab():
+    web_capture_tab.columnconfigure(1, weight=1)
+    web_capture_tab.columnconfigure(2, weight=1)
+    web_capture_tab.columnconfigure(3, weight=0)
+    web_capture_tab.rowconfigure(11, minsize=URL_ROW_MIN_HEIGHT, weight=0)
+    web_capture_tab.rowconfigure(15, weight=1)
+
+    def add_file_row(row, label, var, directory=False):
+        ttk.Label(web_capture_tab, text=label).grid(row=row, column=0, sticky="w", pady=1)
+        frame = ttk.Frame(web_capture_tab)
+        frame.grid(row=row, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
+        frame.columnconfigure(0, weight=1)
+        ttk.Entry(frame, textvariable=var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        command = (lambda: browse_folder(var, label)) if directory else (lambda: browse_file(var, label))
+        ttk.Button(frame, text="Browse...", command=command).grid(row=0, column=1, sticky="e")
+        return frame
+
+    add_file_row(0, "Script Path", web_script_path_var)
+    add_file_row(1, "Deno Path", web_deno_path_var)
+
+    ttk.Label(web_capture_tab, text="Browser Path").grid(row=2, column=0, sticky="w", pady=1)
+    browser_frame = ttk.Frame(web_capture_tab)
+    browser_frame.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
+    browser_frame.columnconfigure(0, weight=1)
+    ttk.Entry(browser_frame, textvariable=web_browser_path_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    ttk.Button(
+        browser_frame,
+        text="Browse...",
+        command=lambda: browse_file(web_browser_path_var, "Edge or Chrome Path"),
+    ).grid(row=0, column=1, sticky="e", padx=(0, 6))
+
+    def autodetect_browser():
+        detected = detect_web_browser_path()
+        if detected:
+            web_browser_path_var.set(detected)
+            web_append_log(f"\nDetected browser: {detected}\n")
+        else:
+            messagebox.showwarning(
+                "Browser not found",
+                "Microsoft Edge or Google Chrome was not detected. Select the browser executable manually.",
+            )
+
+    ttk.Button(browser_frame, text="Auto-detect", command=autodetect_browser).grid(row=0, column=2, sticky="e")
+
+    add_file_row(3, "Input File(s)", web_input_file_var)
+
+    ttk.Label(web_capture_tab, text="Case Name").grid(row=4, column=0, sticky="nw", pady=(2, 1))
+    case_frame = ttk.Frame(web_capture_tab)
+    case_frame.grid(row=4, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
+    case_frame.columnconfigure(0, weight=1)
+    global web_case_name_entry
+    web_case_name_entry = ttk.Entry(case_frame, textvariable=web_case_name_var)
+    web_case_name_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    case_menu_button = ttk.Menubutton(case_frame, text="Insert Tag")
+    case_menu = tk.Menu(case_menu_button, tearoff=0)
+    case_menu_button["menu"] = case_menu
+    for tag in WEB_CASE_NAME_TAGS:
+        case_menu.add_command(label=tag, command=lambda value=tag: insert_web_case_name_tag(value))
+    case_menu_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
+    ttk.Button(case_frame, text="Open", command=open_current_web_case_folder).grid(row=0, column=2, sticky="e")
+    ttk.Label(
+        case_frame,
+        textvariable=web_case_folder_preview_var,
+        wraplength=760,
+        justify="left",
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(1, 0))
+
+    ttk.Label(web_capture_tab, text="Filename Template").grid(row=5, column=0, sticky="nw", pady=(2, 1))
+    filename_frame = ttk.Frame(web_capture_tab)
+    filename_frame.grid(row=5, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
+    filename_frame.columnconfigure(0, weight=1)
+    global web_filename_template_entry
+    web_filename_template_entry = ttk.Entry(filename_frame, textvariable=web_filename_template_var)
+    web_filename_template_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    filename_menu_button = ttk.Menubutton(filename_frame, text="Insert Tag")
+    filename_menu = tk.Menu(filename_menu_button, tearoff=0)
+    filename_menu_button["menu"] = filename_menu
+    for tag, _sample in WEB_FILENAME_TAGS:
+        filename_menu.add_command(label=tag, command=lambda value=tag: insert_web_filename_template_tag(value))
+    filename_menu.add_separator()
+    filename_menu.add_command(label="%case%", command=lambda: insert_web_filename_template_tag("%case%"))
+    filename_menu_button.grid(row=0, column=1, sticky="e")
+    ttk.Label(
+        filename_frame,
+        textvariable=web_filename_template_preview_var,
+        wraplength=760,
+        justify="left",
+    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
+
+    add_file_row(6, "Output Root", web_output_root_var, directory=True)
+
+    options = ttk.Frame(web_capture_tab)
+    options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+    options.columnconfigure(2, weight=1)
+    global web_capture_options_button, web_pdf_options_button, web_options_summary_label
+    web_capture_options_button = ttk.Button(
+        options,
+        text="Capture Options ▾",
+        command=toggle_web_capture_options_panel,
+    )
+    web_capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+    web_pdf_options_button = ttk.Button(
+        options,
+        text="PDF Options ▾",
+        command=toggle_web_pdf_options_panel,
+    )
+    web_pdf_options_button.grid(row=0, column=1, sticky="w", padx=(0, 10))
+    web_options_summary_label = ttk.Label(
+        options,
+        textvariable=web_options_summary_var,
+        wraplength=760,
+        justify="left",
+    )
+    web_options_summary_label.grid(row=0, column=2, sticky="ew")
+
+    def update_web_options_summary_wrap(event=None):
+        try:
+            width = max(
+                360,
+                options.winfo_width()
+                - web_capture_options_button.winfo_width()
+                - web_pdf_options_button.winfo_width()
+                - 54,
+            )
+            web_options_summary_label.configure(wraplength=width)
+        except Exception:
+            pass
+
+    options.bind("<Configure>", update_web_options_summary_wrap)
+
+    ttk.Label(
+        web_capture_tab,
+        text=(
+            "Browser isolation: each run uses a new profile under the app-owned gui-temp folder. "
+            "The normal Edge/Chrome profile, stored cookies, passwords, and signed-in sessions are not accessed."
+        ),
+        wraplength=1040,
+        justify="left",
+    ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+
+    global web_vpn_frame, web_vpn_adapter_menu
+    web_vpn_frame = ttk.LabelFrame(web_capture_tab, text="VPN Status", padding=8)
+    web_vpn_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+    web_vpn_frame.columnconfigure(1, weight=1)
+    ttk.Label(web_vpn_frame, text="VPN Adapter").grid(row=0, column=0, sticky="w", padx=(0, 8))
+    web_vpn_adapter_menu = ttk.Combobox(web_vpn_frame, textvariable=vpn_adapter_var, values=[], state="readonly")
+    web_vpn_adapter_menu.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+    web_vpn_adapter_menu.bind("<<ComboboxSelected>>", lambda event: schedule_settings_autosave())
+    vpn_adapter_menus.append(web_vpn_adapter_menu)
+    ttk.Button(web_vpn_frame, text="Refresh Adapters", command=refresh_network_adapters).grid(
+        row=0, column=2, sticky="e", padx=(0, 8)
+    )
+    ttk.Button(web_vpn_frame, text="Check VPN", command=check_vpn_status).grid(row=0, column=3, sticky="e")
+    ttk.Label(web_vpn_frame, textvariable=vpn_status_var).grid(
+        row=1, column=0, columnspan=4, sticky="w", pady=(3, 0)
+    )
+
+    ttk.Label(
+        web_capture_tab,
+        text="Paste public HTTP/HTTPS webpage URLs below, one per line. If this box is used, it overrides Input File(s).",
+    ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 2))
+
+    global web_urls_text
+    web_urls_text = scrolledtext.ScrolledText(web_capture_tab, height=8, wrap="word")
+    web_urls_text.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
+    buttons = ttk.Frame(web_capture_tab)
+    buttons.grid(row=11, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
+    web_actions = (
+        ("Load", lambda: load_web_urls_from_input_file(True)),
+        ("Append", lambda: load_web_urls_from_input_file(False)),
+        ("Save", save_web_urls_to_input_file),
+        ("Clear", clear_web_urls),
+        ("Dedupe", remove_duplicate_web_urls_from_box),
+        ("Validate", lambda: validate_web_urls_in_box(False)),
+        ("Normalize", lambda: validate_web_urls_in_box(True)),
+    )
+    for index, (label, command) in enumerate(web_actions):
+        ttk.Button(buttons, text=label, command=command, width=10).grid(
+            row=index,
+            column=0,
+            sticky="ew",
+            pady=(0 if index == 0 else 6, 0),
+        )
+
+    workflow = ttk.Frame(web_capture_tab)
+    workflow.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(4, 6))
+    for col in (0, 2, 3):
+        workflow.columnconfigure(col, weight=1)
+    tk.Button(
+        workflow,
+        text="✓ Preflight Check",
+        command=run_web_preflight_check,
+        fg="#003366",
+        activeforeground="#003366",
+        **main_action_button_style,
+    ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+    ttk.Checkbutton(
+        workflow,
+        text="Preflight passed",
+        variable=web_preflight_done_var,
+        state="disabled",
+    ).grid(row=0, column=1, sticky="w", padx=(0, 8))
+    split = tk.Frame(workflow, borderwidth=0, highlightthickness=0)
+    split.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+    split.columnconfigure(0, weight=1)
+    global web_start_button, web_start_menu_button, web_start_capture_menu, web_stop_button
+    web_start_button = tk.Button(
+        split,
+        text="▶ Start Capture",
+        command=start_web_capture,
+        fg="green",
+        **main_action_button_style,
+    )
+    web_start_button.grid(row=0, column=0, sticky="ew")
+    web_start_menu_button = tk.Button(
+        split,
+        text="▼",
+        command=show_web_start_capture_menu,
+        fg="green",
+        font=("Segoe UI", 9, "bold"),
+        padx=6,
+        pady=3,
+        relief="raised",
+        borderwidth=2,
+    )
+    web_start_menu_button.grid(row=0, column=1, sticky="ns", padx=(2, 0))
+    web_start_capture_menu = tk.Menu(root, tearoff=0)
+    web_start_capture_menu.add_command(label="Add Job to Queue", command=add_web_job_and_open_queue)
+    web_start_capture_menu.add_command(label="Add Job to Queue and Start", command=add_web_job_to_queue_and_start)
+    web_stop_button = tk.Button(
+        workflow,
+        text="■ Stop",
+        command=stop_web_capture,
+        fg="red",
+        state="disabled",
+        **main_action_button_style,
+    )
+    web_stop_button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+
+    ttk.Label(web_capture_tab, textvariable=web_status_var).grid(
+        row=13, column=0, columnspan=4, sticky="w", pady=(0, 3)
+    )
+    ttk.Label(web_capture_tab, text="Output Log").grid(
+        row=14, column=0, columnspan=4, sticky="w", pady=(0, 2)
+    )
+    global web_log_box
+    web_log_box = scrolledtext.ScrolledText(web_capture_tab, height=14, wrap="word")
+    web_log_box.grid(row=15, column=0, columnspan=4, sticky="nsew")
+
+    update_web_case_folder_preview()
+    update_web_filename_template_preview()
+    update_web_options_summary()
+    update_vpn_section_visibility()
+
+
+build_web_capture_tab()
+
+# Webpage Capture inline option panels mirror the established Image Capture
+# pattern: a compact button/summary row and one raised overlay panel at a time.
+web_capture_options_panel = ttk.LabelFrame(web_capture_tab, text="Capture Options", padding=12)
+web_capture_options_panel.columnconfigure(0, weight=1, uniform="web_capture")
+web_capture_options_panel.columnconfigure(1, weight=1, uniform="web_capture")
+web_capture_options_panel.columnconfigure(2, weight=1, uniform="web_capture")
+
+# Capture mode and viewport settings.
+ttk.Label(
+    web_capture_options_panel,
+    text=(
+        "These settings control the PNG capture, browser viewport, page settling, lazy-load scrolling, "
+        "and Webpage Capture concurrency."
+    ),
+    wraplength=980,
+    justify="left",
+).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+web_mode_frame = ttk.LabelFrame(web_capture_options_panel, text="Capture Mode", padding=8)
+web_mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
+ttk.Radiobutton(
+    web_mode_frame,
+    text="Full-page PNG",
+    variable=web_capture_mode_var,
+    value="full_page",
+    command=update_web_options_summary,
+).pack(anchor="w", pady=2)
+ttk.Radiobutton(
+    web_mode_frame,
+    text="Visible viewport PNG",
+    variable=web_capture_mode_var,
+    value="viewport",
+    command=update_web_options_summary,
+).pack(anchor="w", pady=2)
+
+ttk.Label(
+    web_mode_frame,
+    text="Full-page mode may use numbered vertical segments for exceptionally tall pages.",
+    wraplength=300,
+    justify="left",
+).pack(anchor="w", pady=(6, 0))
+
+web_viewport_frame = ttk.LabelFrame(web_capture_options_panel, text="Viewport", padding=8)
+web_viewport_frame.grid(row=1, column=1, sticky="nsew", padx=6, pady=(0, 8))
+web_viewport_frame.columnconfigure(1, weight=1)
+ttk.Label(web_viewport_frame, text="Width (px)").grid(row=0, column=0, sticky="w", pady=3)
+ttk.Entry(web_viewport_frame, textvariable=web_viewport_width_var, width=12).grid(
+    row=0, column=1, sticky="w", padx=(8, 0), pady=3
+)
+ttk.Label(web_viewport_frame, text="Height (px)").grid(row=1, column=0, sticky="w", pady=3)
+ttk.Entry(web_viewport_frame, textvariable=web_viewport_height_var, width=12).grid(
+    row=1, column=1, sticky="w", padx=(8, 0), pady=3
+)
+ttk.Label(web_viewport_frame, text="Concurrent captures").grid(row=2, column=0, sticky="w", pady=3)
+web_concurrent_captures_menu = ttk.Combobox(
+    web_viewport_frame,
+    textvariable=web_concurrent_captures_var,
+    values=("1", "2"),
+    state="readonly",
+    width=10,
+)
+web_concurrent_captures_menu.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
+
+web_loading_frame = ttk.LabelFrame(web_capture_options_panel, text="Page Loading", padding=8)
+web_loading_frame.grid(row=1, column=2, sticky="nsew", padx=(6, 0), pady=(0, 8))
+web_loading_frame.columnconfigure(1, weight=1)
+ttk.Label(web_loading_frame, text="Load timeout (s)").grid(row=0, column=0, sticky="w", pady=3)
+ttk.Entry(web_loading_frame, textvariable=web_page_load_timeout_var, width=12).grid(
+    row=0, column=1, sticky="w", padx=(8, 0), pady=3
+)
+ttk.Label(web_loading_frame, text="Additional wait (s)").grid(row=1, column=0, sticky="w", pady=3)
+ttk.Entry(web_loading_frame, textvariable=web_additional_wait_var, width=12).grid(
+    row=1, column=1, sticky="w", padx=(8, 0), pady=3
+)
+ttk.Label(
+    web_loading_frame,
+    text="The additional wait occurs after the page load/network-settle stage.",
+    wraplength=300,
+    justify="left",
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+web_lazy_frame = ttk.LabelFrame(web_capture_options_panel, text="Lazy-load Scrolling", padding=8)
+web_lazy_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+for column in range(8):
+    web_lazy_frame.columnconfigure(column, weight=1 if column in (1, 3, 5, 7) else 0)
+
+ttk.Checkbutton(
+    web_lazy_frame,
+    text="Scroll through the page before capture",
+    variable=web_lazy_scroll_var,
+    command=update_web_capture_options_state,
+).grid(row=0, column=0, columnspan=2, sticky="w", padx=(0, 18), pady=3)
+ttk.Label(web_lazy_frame, text="Scroll wait (ms)").grid(row=0, column=2, sticky="e", padx=(0, 5), pady=3)
+web_scroll_wait_entry = ttk.Entry(web_lazy_frame, textvariable=web_scroll_wait_ms_var, width=10)
+web_scroll_wait_entry.grid(row=0, column=3, sticky="w", padx=(0, 18), pady=3)
+ttk.Label(web_lazy_frame, text="Maximum scroll (s)").grid(row=0, column=4, sticky="e", padx=(0, 5), pady=3)
+web_max_scroll_entry = ttk.Entry(web_lazy_frame, textvariable=web_max_scroll_seconds_var, width=10)
+web_max_scroll_entry.grid(row=0, column=5, sticky="w", padx=(0, 18), pady=3)
+ttk.Label(web_lazy_frame, text="Stable-height checks").grid(row=0, column=6, sticky="e", padx=(0, 5), pady=3)
+web_stable_height_entry = ttk.Entry(web_lazy_frame, textvariable=web_stable_height_checks_var, width=8)
+web_stable_height_entry.grid(row=0, column=7, sticky="w", pady=3)
+web_lazy_scroll_widgets = [web_scroll_wait_entry, web_max_scroll_entry, web_stable_height_entry]
+
+ttk.Label(
+    web_lazy_frame,
+    text="Scrolling is bounded by the maximum duration and stable-height checks so infinite feeds cannot run indefinitely.",
+    wraplength=920,
+    justify="left",
+).grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
+
+web_capture_button_frame = ttk.Frame(web_capture_options_panel)
+web_capture_button_frame.grid(row=3, column=0, columnspan=3, sticky="e", pady=(4, 0))
+ttk.Button(
+    web_capture_button_frame,
+    text="Close Capture Options",
+    command=close_web_capture_options_panel,
+).pack(side="right")
+web_capture_options_panel.grid_remove()
+
+# PDF settings use a compact tabbed overlay so the close action remains
+# visible even on shorter displays. The notebook separates source behavior,
+# page geometry, and header/footer templates without changing the underlying
+# Webpage Capture settings or helper configuration.
+web_pdf_options_panel = ttk.LabelFrame(web_capture_tab, text="PDF Options", padding=10)
+web_pdf_options_panel.columnconfigure(0, weight=1)
+
+web_pdf_heading_frame = ttk.Frame(web_pdf_options_panel)
+web_pdf_heading_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+ttk.Checkbutton(
+    web_pdf_heading_frame,
+    text="Create PDF with PNG",
+    variable=web_create_pdf_var,
+    command=update_web_pdf_options_state,
+).grid(row=0, column=0, sticky="w")
+
+web_pdf_option_widgets = []
+web_pdf_live_widgets = []
+web_pdf_header_footer_widgets = []
+
+def register_web_pdf_widget(widget):
+    web_pdf_option_widgets.append(widget)
+    return widget
+
+def register_web_pdf_live_widget(widget):
+    web_pdf_live_widgets.append(widget)
+    return register_web_pdf_widget(widget)
+
+web_pdf_notebook = ttk.Notebook(web_pdf_options_panel)
+web_pdf_notebook.grid(row=1, column=0, sticky="ew")
+
+# General tab: source choice, common output switches, and live-page-only layout handling.
+web_pdf_general_tab = ttk.Frame(web_pdf_notebook, padding=8)
+web_pdf_general_tab.columnconfigure(0, weight=1, uniform="web_pdf_general")
+web_pdf_general_tab.columnconfigure(1, weight=1, uniform="web_pdf_general")
+web_pdf_notebook.add(web_pdf_general_tab, text="Source & Output")
+
+web_pdf_mode_frame = ttk.LabelFrame(web_pdf_general_tab, text="PDF Source", padding=8)
+web_pdf_mode_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+for web_pdf_mode_text, web_pdf_mode_value in (
+    ("Live Page (searchable)", "live_webpage"),
+    ("Captured PNG (visual match)", "paginated_png"),
+):
+    register_web_pdf_widget(ttk.Radiobutton(
+        web_pdf_mode_frame,
+        text=web_pdf_mode_text,
+        variable=web_pdf_capture_mode_var,
+        value=web_pdf_mode_value,
+        command=update_web_pdf_options_state,
+    )).pack(anchor="w", pady=2)
+ttk.Label(
+    web_pdf_mode_frame,
+    text=(
+        "Live Page prints the webpage directly. Captured PNG creates an image-only PDF from the screenshot, "
+        "preventing site navigation and sticky headers from repeating."
+    ),
+    wraplength=420,
+    justify="left",
+).pack(anchor="w", pady=(6, 0))
+
+web_pdf_output_frame = ttk.LabelFrame(web_pdf_general_tab, text="Output", padding=8)
+web_pdf_output_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+web_pdf_output_frame.columnconfigure(0, weight=1)
+web_pdf_output_frame.columnconfigure(1, weight=1)
+web_pdf_landscape_check = register_web_pdf_widget(ttk.Checkbutton(
+    web_pdf_output_frame,
+    text="Landscape",
+    variable=web_pdf_landscape_var,
+    command=update_web_options_summary,
+))
+web_pdf_landscape_check.grid(row=0, column=0, sticky="w", pady=3)
+web_pdf_header_footer_check = register_web_pdf_widget(ttk.Checkbutton(
+    web_pdf_output_frame,
+    text="Include PDF header/footer",
+    variable=web_pdf_display_header_footer_var,
+    command=update_web_pdf_options_state,
+))
+web_pdf_header_footer_check.grid(row=0, column=1, sticky="w", pady=3)
+web_pdf_background_check = register_web_pdf_live_widget(ttk.Checkbutton(
+    web_pdf_output_frame,
+    text="Include site backgrounds",
+    variable=web_pdf_print_background_var,
+    command=update_web_options_summary,
+))
+web_pdf_background_check.grid(row=1, column=0, sticky="w", pady=3)
+web_pdf_css_size_check = register_web_pdf_live_widget(ttk.Checkbutton(
+    web_pdf_output_frame,
+    text="Use site CSS page size",
+    variable=web_pdf_prefer_css_page_size_var,
+    command=update_web_options_summary,
+))
+web_pdf_css_size_check.grid(row=1, column=1, sticky="w", pady=3)
+ttk.Label(
+    web_pdf_output_frame,
+    text="Site backgrounds and CSS page sizing apply only to Live Page PDFs.",
+    wraplength=420,
+    justify="left",
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+web_pdf_behavior_frame = ttk.LabelFrame(web_pdf_general_tab, text="Live Page Layout", padding=8)
+web_pdf_behavior_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+for column in range(3):
+    web_pdf_behavior_frame.columnconfigure(column, weight=1)
+for column, (web_pdf_behavior_text, web_pdf_behavior_value) in enumerate((
+    ("Keep site print layout", "preserve_layout"),
+    ("Remove fixed/sticky positioning", "neutralize_fixed_sticky"),
+    ("Hide likely top navigation", "hide_likely_navigation_overlays"),
+)):
+    register_web_pdf_live_widget(ttk.Radiobutton(
+        web_pdf_behavior_frame,
+        text=web_pdf_behavior_text,
+        variable=web_pdf_page_behavior_var,
+        value=web_pdf_behavior_value,
+        command=update_web_options_summary,
+    )).grid(row=0, column=column, sticky="w", padx=(0, 8), pady=2)
+ttk.Label(
+    web_pdf_behavior_frame,
+    text=(
+        "Live Page only. Remove keeps qualifying fixed/sticky elements once in normal flow; Hide suppresses likely top navigation. "
+        "PNG output is never modified."
+    ),
+    wraplength=920,
+    justify="left",
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+# Page tab: compact paper, scale, page-range, and margin controls.
+web_pdf_page_tab = ttk.Frame(web_pdf_notebook, padding=8)
+web_pdf_page_tab.columnconfigure(0, weight=1, uniform="web_pdf_page")
+web_pdf_page_tab.columnconfigure(1, weight=1, uniform="web_pdf_page")
+web_pdf_notebook.add(web_pdf_page_tab, text="Page Layout")
+
+web_pdf_layout_frame = ttk.LabelFrame(web_pdf_page_tab, text="Paper and Scale", padding=8)
+web_pdf_layout_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+web_pdf_layout_frame.columnconfigure(1, weight=1)
+ttk.Label(web_pdf_layout_frame, text="Scale (0.1–2.0)").grid(row=0, column=0, sticky="w", pady=3)
+web_pdf_scale_entry = register_web_pdf_widget(ttk.Entry(
+    web_pdf_layout_frame, textvariable=web_pdf_scale_var, width=12
+))
+web_pdf_scale_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+ttk.Label(web_pdf_layout_frame, text="Paper width (in)").grid(row=1, column=0, sticky="w", pady=3)
+web_pdf_width_entry = register_web_pdf_widget(ttk.Entry(
+    web_pdf_layout_frame, textvariable=web_pdf_paper_width_in_var, width=12
+))
+web_pdf_width_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+ttk.Label(web_pdf_layout_frame, text="Paper height (in)").grid(row=2, column=0, sticky="w", pady=3)
+web_pdf_height_entry = register_web_pdf_widget(ttk.Entry(
+    web_pdf_layout_frame, textvariable=web_pdf_paper_height_in_var, width=12
+))
+web_pdf_height_entry.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=3)
+ttk.Label(web_pdf_layout_frame, text="Pages (Live Page only)").grid(row=3, column=0, sticky="w", pady=3)
+web_pdf_ranges_entry = register_web_pdf_live_widget(ttk.Entry(
+    web_pdf_layout_frame, textvariable=web_pdf_page_ranges_var, width=20
+))
+web_pdf_ranges_entry.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=3)
+ttk.Label(
+    web_pdf_layout_frame,
+    text="Leave pages blank for all pages. Examples: 1-5 or 1,3,5-8.",
+    wraplength=420,
+    justify="left",
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+web_pdf_margins_frame = ttk.LabelFrame(web_pdf_page_tab, text="Margins (inches)", padding=8)
+web_pdf_margins_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+web_pdf_margins_frame.columnconfigure(1, weight=1)
+for row, (label_text, variable) in enumerate((
+    ("Top", web_pdf_margin_top_in_var),
+    ("Bottom", web_pdf_margin_bottom_in_var),
+    ("Left", web_pdf_margin_left_in_var),
+    ("Right", web_pdf_margin_right_in_var),
+)):
+    ttk.Label(web_pdf_margins_frame, text=label_text).grid(row=row, column=0, sticky="w", pady=3)
+    entry = register_web_pdf_widget(ttk.Entry(web_pdf_margins_frame, textvariable=variable, width=12))
+    entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=3)
+    if label_text == "Top":
+        web_pdf_margin_top_entry = entry
+    elif label_text == "Bottom":
+        web_pdf_margin_bottom_entry = entry
+    elif label_text == "Left":
+        web_pdf_margin_left_entry = entry
+    else:
+        web_pdf_margin_right_entry = entry
+
+# Templates tab: dedicated space for custom HTML without forcing the whole
+# PDF overlay to grow vertically.
+web_pdf_templates_tab = ttk.Frame(web_pdf_notebook, padding=8)
+web_pdf_templates_tab.columnconfigure(0, weight=1)
+web_pdf_templates_tab.columnconfigure(1, weight=1)
+web_pdf_templates_tab.rowconfigure(1, weight=1)
+web_pdf_notebook.add(web_pdf_templates_tab, text="Header & Footer")
+
+ttk.Label(web_pdf_templates_tab, text="Header HTML").grid(row=0, column=0, sticky="w", padx=(0, 6))
+ttk.Label(web_pdf_templates_tab, text="Footer HTML").grid(row=0, column=1, sticky="w", padx=(6, 0))
+web_pdf_header_text = scrolledtext.ScrolledText(web_pdf_templates_tab, height=7, wrap="word")
+web_pdf_header_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(3, 0))
+web_pdf_footer_text = scrolledtext.ScrolledText(web_pdf_templates_tab, height=7, wrap="word")
+web_pdf_footer_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(3, 0))
+web_pdf_header_footer_widgets.extend([web_pdf_header_text, web_pdf_footer_text])
+set_web_pdf_header_template_value(web_pdf_header_template_var.get())
+set_web_pdf_footer_template_value(web_pdf_footer_template_var.get())
+
+ttk.Label(
+    web_pdf_templates_tab,
+    text=(
+        "App placeholders: %requested_url%, %final_url%, %page_title%, %capture_utc%. "
+        "Chromium classes include date, title, url, pageNumber, and totalPages."
+    ),
+    wraplength=920,
+    justify="left",
+).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+def on_web_pdf_template_edit(_event=None):
+    sync_web_pdf_templates_from_widgets(schedule_autosave=True)
+
+for web_pdf_template_widget in (web_pdf_header_text, web_pdf_footer_text):
+    web_pdf_template_widget.bind("<KeyRelease>", on_web_pdf_template_edit)
+    web_pdf_template_widget.bind("<FocusOut>", on_web_pdf_template_edit)
+
+web_pdf_button_frame = ttk.Frame(web_pdf_options_panel)
+web_pdf_button_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+web_pdf_button_frame.columnconfigure(0, weight=1)
+ttk.Button(
+    web_pdf_button_frame,
+    text="Close PDF Options",
+    command=close_web_pdf_options_panel,
+).grid(row=0, column=1, sticky="e")
+web_pdf_options_panel.grid_remove()
+
+for web_option_var in (
+    web_capture_mode_var,
+    web_viewport_width_var,
+    web_viewport_height_var,
+    web_page_load_timeout_var,
+    web_additional_wait_var,
+    web_lazy_scroll_var,
+    web_scroll_wait_ms_var,
+    web_max_scroll_seconds_var,
+    web_stable_height_checks_var,
+    web_concurrent_captures_var,
+    web_create_pdf_var,
+    web_pdf_landscape_var,
+    web_pdf_print_background_var,
+    web_pdf_display_header_footer_var,
+    web_pdf_scale_var,
+    web_pdf_paper_width_in_var,
+    web_pdf_paper_height_in_var,
+    web_pdf_margin_top_in_var,
+    web_pdf_margin_bottom_in_var,
+    web_pdf_margin_left_in_var,
+    web_pdf_margin_right_in_var,
+    web_pdf_page_ranges_var,
+    web_pdf_prefer_css_page_size_var,
+    web_pdf_page_behavior_var,
+    web_pdf_capture_mode_var,
+):
+    web_option_var.trace_add("write", update_web_options_summary)
+
+web_lazy_scroll_var.trace_add("write", update_web_capture_options_state)
+web_create_pdf_var.trace_add("write", update_web_pdf_options_state)
+web_pdf_display_header_footer_var.trace_add("write", update_web_pdf_options_state)
+web_pdf_capture_mode_var.trace_add("write", update_web_pdf_options_state)
+update_web_capture_options_state()
+update_web_pdf_options_state()
+update_web_filename_template_preview()
+update_web_options_summary()
 
 # Image Capture inline option panels. These intentionally mirror the
 # Audio/Video Capture tab pattern: button row on the main tab, collapsible
@@ -21553,11 +23775,18 @@ case_name_var.trace_add("write", update_filename_template_preview)
 filename_template_var.trace_add("write", update_filename_template_preview)
 input_file_var.trace_add("write", handle_input_file_var_changed)
 image_input_file_var.trace_add("write", handle_image_input_file_var_changed)
+web_input_file_var.trace_add("write", handle_web_input_file_var_changed)
 output_root_var.trace_add("write", on_output_root_changed)
 image_case_name_var.trace_add("write", update_image_case_folder_preview)
 image_case_name_var.trace_add("write", update_image_filename_template_preview)
 image_output_root_var.trace_add("write", update_image_case_folder_preview)
 image_filename_template_var.trace_add("write", update_image_filename_template_preview)
+web_case_name_var.trace_add("write", update_web_case_folder_preview)
+web_case_name_var.trace_add("write", update_web_filename_template_preview)
+web_filename_template_var.trace_add("write", update_web_filename_template_preview)
+web_capture_mode_var.trace_add("write", update_web_filename_template_preview)
+web_create_pdf_var.trace_add("write", update_web_filename_template_preview)
+web_output_root_var.trace_add("write", update_web_case_folder_preview)
 update_case_folder_preview()
 update_filename_template_preview()
 
@@ -21583,6 +23812,7 @@ def deferred_job_queue_startup():
 load_settings(show_popup=False, startup=True)
 initialize_url_box_from_persistence_and_input_files()
 initialize_image_url_box_from_persistence_and_input_files()
+initialize_web_url_box_from_persistence_and_input_files()
 start_case_browser_result_poller()
 schedule_case_browser_autoload(delay_ms=400)
 schedule_playlist_preview_autoload(delay_ms=500)
