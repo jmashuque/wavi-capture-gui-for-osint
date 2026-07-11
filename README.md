@@ -118,7 +118,7 @@ Required files/tools:
 
 Recommended source pages:
 
-- WAVI Capture GUI releases: <https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest>
+- WAVI Capture GUI releases: <https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest>
 - Python: <https://apps.microsoft.com/detail/9PNRBTZXMB4Z>
 - yt-dlp releases: <https://github.com/yt-dlp/yt-dlp/releases>
 - yt-dlp nightly builds: <https://github.com/yt-dlp/yt-dlp-nightly-builds/releases>
@@ -139,13 +139,13 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
 1. Create a local folder for the app, such as:
 
    ```text
-   C:\AVI-Capture-GUI
+   C:\WAVI-Capture-GUI
    ```
 
 2. Download the latest WAVI Capture GUI release ZIP from:
 
    ```text
-   https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest
+   https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest
    ```
 
 3. Right-click the downloaded ZIP, choose **Properties**, select **Unblock** if that option appears, then choose **Extract All**. Do not run the app from inside the ZIP.
@@ -178,7 +178,7 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
 7. Confirm the app folder now looks similar to this:
 
    ```text
-   C:\AVI-Capture-GUI\
+   C:\WAVI-Capture-GUI\
      gui.py
      script-ytdlp.ps1
      script-gallerydl.ps1
