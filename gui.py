@@ -13,6 +13,7 @@ import random
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import textwrap
@@ -29,8 +30,8 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v2.2026.0711"
-APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/avi-capture-gui-for-osint/releases/latest"
+APP_VERSION = "v2.2026.0713"
+APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 980
 APP_WINDOW_MIN_WIDTH = 1050
@@ -39,8 +40,8 @@ APP_WINDOW_SCREEN_MARGIN_WIDTH = 80
 APP_WINDOW_SCREEN_MARGIN_HEIGHT = 120
 URL_ROW_MIN_HEIGHT = 215
 
-APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/avi-capture-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 32
+APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
+SETTINGS_SCHEMA_VERSION = 34
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -51,6 +52,7 @@ IMAGE_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-image-url-box.txt")
 WEB_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-web-url-box.txt")
 UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-download-archive.txt")
 IMAGE_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-gallerydl-archive.sqlite3")
+WEB_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-webcapture-archive.sqlite3")
 GUI_TEMP_DIR = os.path.join(ROOT, "gui-temp")
 DEBUG_LOG_FILE = os.path.join(ROOT, "gui-debug.log")
 JOBS_FILE_VERSION = 2
@@ -97,6 +99,9 @@ DEFAULTS = {
     "web_input_file": os.path.join(ROOT, "web-urls.txt"),
     "web_case_name": "Case-%datetime%",
     "web_filename_template": "%datetime%_%domain%_%title%",
+    "web_cookies_file": os.path.join(ROOT, "cookies.txt"),
+    "web_use_cookies_file": False,
+    "web_cookie_scope": "site_only",
     "web_output_root": os.path.join(ROOT, "Investigations"),
     "web_capture_mode": "full_page",
     "web_viewport_width": "1440",
@@ -555,6 +560,10 @@ def run_fresh_startup_cleanup_if_requested():
         WEB_URL_BOX_PERSISTENCE_FILE,
         UNIVERSAL_ARCHIVE_FILE,
         IMAGE_UNIVERSAL_ARCHIVE_FILE,
+        WEB_UNIVERSAL_ARCHIVE_FILE,
+        WEB_UNIVERSAL_ARCHIVE_FILE + "-wal",
+        WEB_UNIVERSAL_ARCHIVE_FILE + "-shm",
+        WEB_UNIVERSAL_ARCHIVE_FILE + "-journal",
         DEBUG_LOG_FILE,
     ]
     file_targets.extend(collect_fresh_atomic_temp_files(output_roots))
@@ -2295,13 +2304,14 @@ def format_universal_archive_skip_record_for_log(record):
     return f"Universal archive skip detected: {prefix}{archive_id} | {url}"
 
 
-def append_universal_archive_skip_summary(skip_records=None, skip_summary=None):
+def append_universal_archive_skip_summary(skip_records=None, skip_summary=None, log_callback=None):
     skip_records = list(skip_records or [])
     skip_summary = skip_summary or {}
     count = len(skip_records) or int(skip_summary.get("count") or 0)
+    writer = log_callback or append_log
 
-    append_log("Universal archive skipped items: ")
-    append_log(f"{count}\n")
+    writer("Universal archive skipped items: ")
+    writer(f"{count}\n")
 
     if count <= 0:
         return
@@ -2309,18 +2319,18 @@ def append_universal_archive_skip_summary(skip_records=None, skip_summary=None):
     for index, record in enumerate(skip_records[:50], start=1):
         archive_id = str(record.get("archive_id") or "").strip() or "unknown archive id"
         url = str(record.get("url") or "").strip()
-        append_log(f"  {index}. {archive_id}")
+        writer(f"  {index}. {archive_id}")
         if url:
-            append_log(f" | {url}")
-        append_log("\n")
+            writer(f" | {url}")
+        writer("\n")
 
     if len(skip_records) > 50:
-        append_log(f"  ... {len(skip_records) - 50} more skipped item(s) not shown.\n")
+        writer(f"  ... {len(skip_records) - 50} more skipped item(s) not shown.\n")
 
     if skip_summary.get("json_path"):
-        append_log(f"Universal archive skip JSON: {skip_summary.get('json_path')}\n")
+        writer(f"Universal archive skip JSON: {skip_summary.get('json_path')}\n")
     if skip_summary.get("csv_path"):
-        append_log(f"Universal archive skip CSV: {skip_summary.get('csv_path')}\n")
+        writer(f"Universal archive skip CSV: {skip_summary.get('csv_path')}\n")
 
 
 def is_case_verification_ignored_path(path):
@@ -4596,6 +4606,9 @@ def get_settings_dict():
         "web_input_file": web_input_file_var.get().strip(),
         "web_case_name": web_case_name_var.get().strip(),
         "web_filename_template": web_filename_template_var.get().strip(),
+        "web_cookies_file": web_cookies_file_var.get().strip(),
+        "web_use_cookies_file": bool(web_use_cookies_file_var.get()),
+        "web_cookie_scope": web_cookie_scope_var.get() if web_cookie_scope_var.get() in {"site_only", "entire_file"} else DEFAULTS["web_cookie_scope"],
         "web_output_root": web_output_root_var.get().strip(),
         "web_capture_mode": web_capture_mode_var.get(),
         "web_viewport_width": normalize_positive_int_string(web_viewport_width_var.get(), DEFAULTS["web_viewport_width"]),
@@ -4805,9 +4818,18 @@ def apply_settings_dict(settings):
     web_script_path_var.set(loaded_web_script_path)
     web_deno_path_var.set(settings.get("web_deno_path", DEFAULTS["web_deno_path"]))
     web_browser_path_var.set(settings.get("web_browser_path", DEFAULTS["web_browser_path"]) or detect_web_browser_path())
+    try:
+        refresh_web_browser_path_choices(select_detected=False, log_result=False)
+    except Exception:
+        pass
     web_input_file_var.set(settings.get("web_input_file", DEFAULTS["web_input_file"]))
     web_case_name_var.set(settings.get("web_case_name", DEFAULTS["web_case_name"]))
     web_filename_template_var.set(settings.get("web_filename_template", DEFAULTS["web_filename_template"]))
+    web_cookies_file_var.set(settings.get("web_cookies_file", DEFAULTS["web_cookies_file"]))
+    web_use_cookies_file_var.set(bool(settings.get("web_use_cookies_file", DEFAULTS["web_use_cookies_file"])))
+    saved_cookie_scope = str(settings.get("web_cookie_scope", DEFAULTS["web_cookie_scope"]) or DEFAULTS["web_cookie_scope"]).strip()
+    web_cookie_scope_var.set(saved_cookie_scope if saved_cookie_scope in {"site_only", "entire_file"} else DEFAULTS["web_cookie_scope"])
+    update_web_cookies_file_control_state()
     web_output_root_var.set(settings.get("web_output_root", DEFAULTS["web_output_root"]))
     saved_web_mode = settings.get("web_capture_mode", DEFAULTS["web_capture_mode"])
     web_capture_mode_var.set(saved_web_mode if saved_web_mode in {"full_page", "viewport"} else DEFAULTS["web_capture_mode"])
@@ -5158,9 +5180,10 @@ def get_app_settings_summary_lines():
         f"Check VPN: {vpn_state}",
         f"Job persistence: {persistence_state}",
         f"URL box persistence: {url_box_state}",
-        f"Universal download archive: {universal_archive_state} (uses separate A/V and Image archives when Archive Mode = Use)",
+        f"Universal download archive: {universal_archive_state} (uses separate A/V, Image, and Webpage archives)",
         f"A/V universal archive file: {UNIVERSAL_ARCHIVE_FILE}",
         f"Image universal archive file: {IMAGE_UNIVERSAL_ARCHIVE_FILE}",
+        f"Webpage universal archive file: {WEB_UNIVERSAL_ARCHIVE_FILE}",
         f"Proxy: {get_proxy_status_summary()}",
     ]
 
@@ -6543,6 +6566,32 @@ def toggle_use_cookies_file_setting():
         append_log(f"Profile setting changed: Use Cookies File {state}\n")
 
 
+def update_web_cookies_file_control_state(*args):
+    """Enable Webpage Capture cookie controls only when cookie use is selected."""
+    try:
+        state = "normal" if web_use_cookies_file_var.get() else "disabled"
+        web_cookies_file_entry.configure(state=state)
+        web_cookies_file_browse_button.configure(state=state)
+        for widget in globals().get("web_cookie_scope_widgets", []):
+            widget.configure(state=state)
+    except Exception:
+        # Settings may load before the Webpage Capture controls are constructed.
+        pass
+    try:
+        web_preflight_done_var.set(False)
+    except Exception:
+        pass
+    try:
+        update_web_options_summary()
+    except Exception:
+        pass
+
+
+def toggle_web_use_cookies_file_setting():
+    update_web_cookies_file_control_state()
+    schedule_settings_autosave()
+
+
 def configure_capture_tab_row_weights():
     """Keep Capture tab vertical sizing assigned to the intended rows.
 
@@ -6575,8 +6624,8 @@ def configure_image_capture_tab_row_weights():
 def configure_web_capture_tab_row_weights():
     """Keep Webpage Capture tab vertical sizing assigned to the URL and log rows."""
     try:
-        web_capture_tab.rowconfigure(11, weight=0, minsize=URL_ROW_MIN_HEIGHT)
-        web_capture_tab.rowconfigure(15, weight=1, minsize=0)
+        web_capture_tab.rowconfigure(12, weight=0, minsize=URL_ROW_MIN_HEIGHT)
+        web_capture_tab.rowconfigure(16, weight=1, minsize=0)
     except Exception:
         pass
 
@@ -6653,51 +6702,79 @@ def toggle_universal_archive_setting():
     saved = save_app_settings(show_popup=False, changed_setting_label=f"Universal Download Archive {state}")
     if saved and universal_archive_enabled_var.get():
         append_log(
-            "Universal archives will be used with Archive Mode = Use:\n"
-            f"Audio/Video: {UNIVERSAL_ARCHIVE_FILE}\n"
-            f"Image: {IMAGE_UNIVERSAL_ARCHIVE_FILE}\n"
+            "Universal archives are enabled:\n"
+            f"Audio/Video (Archive Mode = Use): {UNIVERSAL_ARCHIVE_FILE}\n"
+            f"Image (Archive Mode = Use): {IMAGE_UNIVERSAL_ARCHIVE_FILE}\n"
+            f"Webpage: {WEB_UNIVERSAL_ARCHIVE_FILE}\n"
         )
 
 
 def delete_universal_archive_file():
-    archive_paths = [UNIVERSAL_ARCHIVE_FILE, IMAGE_UNIVERSAL_ARCHIVE_FILE]
-    existing_paths = [path for path in archive_paths if os.path.isfile(path)]
+    archive_groups = [
+        ("Audio/Video", UNIVERSAL_ARCHIVE_FILE, [UNIVERSAL_ARCHIVE_FILE]),
+        ("Image", IMAGE_UNIVERSAL_ARCHIVE_FILE, [IMAGE_UNIVERSAL_ARCHIVE_FILE]),
+        (
+            "Webpage",
+            WEB_UNIVERSAL_ARCHIVE_FILE,
+            [
+                WEB_UNIVERSAL_ARCHIVE_FILE,
+                WEB_UNIVERSAL_ARCHIVE_FILE + "-wal",
+                WEB_UNIVERSAL_ARCHIVE_FILE + "-shm",
+                WEB_UNIVERSAL_ARCHIVE_FILE + "-journal",
+            ],
+        ),
+    ]
+    existing_groups = [
+        (label, primary, files)
+        for label, primary, files in archive_groups
+        if any(os.path.isfile(path) for path in files)
+    ]
 
-    if not existing_paths:
+    if not existing_groups:
         messagebox.showinfo(
             "Universal archives not found",
             "No app-level universal archive files exist yet:\n\n"
             f"Audio/Video: {UNIVERSAL_ARCHIVE_FILE}\n"
-            f"Image: {IMAGE_UNIVERSAL_ARCHIVE_FILE}",
+            f"Image: {IMAGE_UNIVERSAL_ARCHIVE_FILE}\n"
+            f"Webpage: {WEB_UNIVERSAL_ARCHIVE_FILE}",
         )
         return
 
+    display_paths = "\n".join(f"{label}: {primary}" for label, primary, _files in existing_groups)
     confirm = messagebox.askyesno(
         "Delete universal archives?",
         "Delete the app-level universal archive files that currently exist?\n\n"
-        + "\n".join(existing_paths)
-        + "\n\nThis may allow previously captured media/images from other cases to be captured again. Case-specific download archives are not deleted.",
+        + display_paths
+        + "\n\nThis may allow previously captured media, images, and webpages from other cases to be captured again. Case-specific download archives are not deleted.",
     )
 
     if not confirm:
         return
 
-    deleted = []
+    deleted_primary = []
     failed = []
-    for path in existing_paths:
-        try:
-            os.remove(path)
-            deleted.append(path)
-        except Exception as e:
-            failed.append(f"{path}\n  {e}")
+    for label, primary, files in existing_groups:
+        group_failed = []
+        for path in files:
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except Exception as exc:
+                group_failed.append(f"{path}\n  {exc}")
+        if group_failed:
+            failed.extend(group_failed)
+        else:
+            deleted_primary.append(f"{label}: {primary}")
 
-    for path in deleted:
+    for path in deleted_primary:
         append_log(f"\nUniversal archive deleted:\n{path}\n")
 
     if failed:
         messagebox.showerror("Delete failed", "Some universal archive files could not be deleted:\n\n" + "\n\n".join(failed))
     else:
-        messagebox.showinfo("Universal archives deleted", "Deleted:\n\n" + "\n".join(deleted))
+        messagebox.showinfo("Universal archives deleted", "Deleted:\n\n" + "\n".join(deleted_primary))
+
 
 def clear_url_history_files():
     roots = []
@@ -6791,6 +6868,244 @@ def app_universal_archive_enabled():
         return bool(APP_SETTINGS_DEFAULTS.get("universal_archive_enabled", False))
 
 
+def normalize_web_universal_archive_url(url):
+    """Normalize a Webpage Capture URL for stable archive lookup without changing query semantics."""
+    cleaned = clean_extracted_url(url)
+    if not cleaned:
+        return ""
+    try:
+        parsed = urlsplit(cleaned)
+    except Exception:
+        return ""
+
+    scheme = str(parsed.scheme or "").lower()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+
+    hostname = str(parsed.hostname).lower().rstrip(".")
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except Exception:
+        pass
+
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        host_for_netloc = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        netloc = f"{host_for_netloc}:{port}"
+    else:
+        netloc = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+
+    # Preserve the path and query exactly because HTTP servers may treat
+    # trailing slashes, path case, and query order as meaningful. Only an
+    # empty path is normalized to the browser-equivalent root slash.
+    path = parsed.path or "/"
+    return urlunsplit((scheme, netloc, path, parsed.query or "", ""))
+
+
+def _connect_web_universal_archive(create=False):
+    path = WEB_UNIVERSAL_ARCHIVE_FILE
+    if not create and not os.path.isfile(path):
+        return None
+    if create:
+        os.makedirs(os.path.dirname(path) or ROOT, exist_ok=True)
+
+    connection = sqlite3.connect(path, timeout=15.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 15000")
+    if create:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS archive_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS captures (
+                capture_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                requested_url TEXT NOT NULL,
+                requested_normalized TEXT NOT NULL,
+                final_url TEXT NOT NULL,
+                final_normalized TEXT NOT NULL,
+                captured_at_utc TEXT NOT NULL,
+                case_name TEXT NOT NULL DEFAULT '',
+                job_id TEXT NOT NULL DEFAULT '',
+                sidecar_path TEXT NOT NULL DEFAULT '',
+                app_version TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_web_archive_captured_at
+                ON captures(captured_at_utc);
+            CREATE INDEX IF NOT EXISTS idx_web_archive_requested
+                ON captures(requested_normalized);
+            CREATE INDEX IF NOT EXISTS idx_web_archive_final
+                ON captures(final_normalized);
+
+            CREATE TABLE IF NOT EXISTS url_keys (
+                normalized_url TEXT PRIMARY KEY,
+                capture_id INTEGER NOT NULL,
+                url_role TEXT NOT NULL CHECK(url_role IN ('requested', 'final')),
+                FOREIGN KEY(capture_id) REFERENCES captures(capture_id) ON DELETE CASCADE
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO archive_metadata(key, value) VALUES('schema_version', '1') "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        connection.commit()
+    return connection
+
+
+def get_web_universal_archive_skip_map(urls):
+    """Return 1-based URL-indexed matches from the Webpage Capture universal archive."""
+    if not app_universal_archive_enabled():
+        return {}
+
+    connection = _connect_web_universal_archive(create=True)
+    if connection is None:
+        return {}
+    matches = {}
+    try:
+        for index, url in enumerate(list(urls or []), start=1):
+            normalized = normalize_web_universal_archive_url(url)
+            if not normalized:
+                continue
+            row = connection.execute(
+                """
+                SELECT c.capture_id, c.requested_url, c.final_url, c.captured_at_utc,
+                       c.case_name, c.job_id, c.sidecar_path, k.url_role
+                  FROM url_keys AS k
+                  JOIN captures AS c ON c.capture_id = k.capture_id
+                 WHERE k.normalized_url = ?
+                 LIMIT 1
+                """,
+                (normalized,),
+            ).fetchone()
+            if row is None:
+                continue
+            matches[str(index)] = {
+                "archive_id": f"web:{int(row['capture_id'])}",
+                "matched_role": str(row["url_role"] or ""),
+                "captured_at_utc": str(row["captured_at_utc"] or ""),
+                "case_name": str(row["case_name"] or ""),
+                "requested_url": str(row["requested_url"] or ""),
+                "final_url": str(row["final_url"] or ""),
+            }
+    finally:
+        connection.close()
+    return matches
+
+
+def parse_web_universal_archive_record_output_line(line):
+    text = str(line or "").rstrip("\r\n")
+    prefix = "GUI_WEB_UNIVERSAL_ARCHIVE_RECORD\t"
+    if not text.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(text[len(prefix):])
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def inspect_web_universal_archive(create=True):
+    """Validate the Webpage Capture SQLite archive and return non-sensitive counts."""
+    connection = _connect_web_universal_archive(create=create)
+    if connection is None:
+        return {
+            "exists": False,
+            "capture_count": 0,
+            "url_key_count": 0,
+            "integrity": "not created",
+        }
+    try:
+        integrity_row = connection.execute("PRAGMA quick_check").fetchone()
+        integrity = str(integrity_row[0] if integrity_row else "unknown")
+        if integrity.lower() != "ok":
+            raise ValueError(f"SQLite quick check returned: {integrity}")
+        capture_count = int(connection.execute("SELECT COUNT(*) FROM captures").fetchone()[0])
+        url_key_count = int(connection.execute("SELECT COUNT(*) FROM url_keys").fetchone()[0])
+        return {
+            "exists": True,
+            "capture_count": capture_count,
+            "url_key_count": url_key_count,
+            "integrity": integrity,
+        }
+    finally:
+        connection.close()
+
+
+def record_web_universal_archive_capture(payload):
+    """Commit one successful Webpage Capture and its requested/final URL aliases to SQLite."""
+    payload = payload if isinstance(payload, dict) else {}
+    requested_url = clean_extracted_url(payload.get("requested_url", ""))
+    final_url = clean_extracted_url(payload.get("final_url", "")) or requested_url
+    requested_normalized = normalize_web_universal_archive_url(requested_url)
+    final_normalized = normalize_web_universal_archive_url(final_url) or requested_normalized
+    if not requested_normalized:
+        raise ValueError("The Webpage Capture archive record did not contain a valid requested HTTP/HTTPS URL.")
+
+    captured_at_utc = str(payload.get("captured_at_utc") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    case_name = str(payload.get("case_name") or "")
+    job_id = str(payload.get("job_id") or "")
+    sidecar_path = str(payload.get("sidecar_path") or "")
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id:
+        event_seed = "\n".join((requested_normalized, final_normalized, captured_at_utc, case_name, job_id, sidecar_path))
+        event_id = hashlib.sha256(event_seed.encode("utf-8", errors="replace")).hexdigest()
+
+    connection = _connect_web_universal_archive(create=True)
+    try:
+        with connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO captures(
+                    event_id, requested_url, requested_normalized, final_url, final_normalized,
+                    captured_at_utc, case_name, job_id, sidecar_path, app_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id, requested_url, requested_normalized, final_url, final_normalized,
+                    captured_at_utc, case_name, job_id, sidecar_path, APP_VERSION,
+                ),
+            )
+            row = connection.execute(
+                "SELECT capture_id FROM captures WHERE event_id = ? LIMIT 1",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("The Webpage Capture archive record could not be located after insertion.")
+            capture_id = int(row["capture_id"])
+            aliases = [(requested_normalized, "requested")]
+            if final_normalized and final_normalized != requested_normalized:
+                aliases.append((final_normalized, "final"))
+            for normalized_url, role in aliases:
+                connection.execute(
+                    """
+                    INSERT INTO url_keys(normalized_url, capture_id, url_role)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(normalized_url) DO UPDATE SET
+                        capture_id=excluded.capture_id,
+                        url_role=excluded.url_role
+                    """,
+                    (normalized_url, capture_id, role),
+                )
+        try:
+            connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except Exception:
+            pass
+        return f"web:{capture_id}"
+    finally:
+        connection.close()
+
+
 def delete_selected_cookies_file_on_exit():
     if not delete_cookies_on_exit_var.get():
         append_log("\nDelete cookies on exit is disabled. Cookies files were not deleted.\n")
@@ -6799,11 +7114,12 @@ def delete_selected_cookies_file_on_exit():
     cookie_targets = [
         ("Audio/Video Capture", bool(use_cookies_file_var.get()), cookies_file_var.get().strip()),
         ("Image Capture", bool(image_use_cookies_file_var.get()), image_cookies_file_var.get().strip()),
+        ("Webpage Capture", bool(web_use_cookies_file_var.get()), web_cookies_file_var.get().strip()),
     ]
 
     enabled_targets = [(label, path) for label, enabled, path in cookie_targets if enabled]
     if not enabled_targets:
-        append_log("\nCookies file use is disabled for Audio/Video Capture and Image Capture. Delete cookies on exit was skipped.\n")
+        append_log("\nCookies file use is disabled for Audio/Video Capture, Image Capture, and Webpage Capture. Delete cookies on exit was skipped.\n")
         return
 
     seen = set()
@@ -10132,7 +10448,8 @@ def get_job_archive_files_for_recovery(job):
         universal = IMAGE_UNIVERSAL_ARCHIVE_FILE if app_universal_archive_enabled() and str(settings.get("image_archive_mode", DEFAULTS.get("image_archive_mode", "use"))).lower() == "use" else ""
         return {"case_archive": case_archive, "universal_archive": universal}
     if get_job_engine(job) == "web-capture":
-        return {"case_archive": "", "universal_archive": ""}
+        universal = WEB_UNIVERSAL_ARCHIVE_FILE if app_universal_archive_enabled() else ""
+        return {"case_archive": "", "universal_archive": universal}
     universal = UNIVERSAL_ARCHIVE_FILE if app_universal_archive_enabled() and str(settings.get("archive_mode", DEFAULTS.get("archive_mode", "use"))).lower() == "use" else ""
     return {"case_archive": paths.get("download_archive", "") if paths else "", "universal_archive": universal}
 
@@ -10442,6 +10759,18 @@ def run_queue_job(job):
 
             if process.stdout:
                 for line in process.stdout:
+                    archive_payload = parse_web_universal_archive_record_output_line(line)
+                    if archive_payload:
+                        try:
+                            archive_id = record_web_universal_archive_capture(archive_payload)
+                            queue_append_log(
+                                f"Webpage universal archive updated: {archive_id} | "
+                                f"{archive_payload.get('requested_url', '')}\n"
+                            )
+                        except Exception as archive_error:
+                            queue_append_log(f"WARNING: Webpage universal archive update failed: {archive_error}\n")
+                        continue
+
                     skip_record = parse_universal_archive_skip_output_line(line)
                     if skip_record:
                         universal_skip_records.append(skip_record)
@@ -11290,7 +11619,7 @@ def fetch_latest_app_release():
     req = urllib.request.Request(
         APP_GITHUB_LATEST_API_URL,
         headers={
-            "User-Agent": "avi-capture-gui-for-osint",
+            "User-Agent": "wavi-capture-gui-for-osint",
             "Accept": "application/vnd.github+json",
         },
     )
@@ -11333,7 +11662,7 @@ def open_about_dialog():
         text=(
             "A portable Windows GUI for running approved webpage, audio, video, and image capture workflows "
             "for OSINT-style collection and review.\n\n"
-            "This app does not bundle yt-dlp, gallery-dl, FFmpeg, Deno, Edge/Chrome, or other binaries. "
+            "This app does not bundle yt-dlp, gallery-dl, FFmpeg, Deno, Chromium browsers, or other binaries. "
             "Use official, signed, organization-approved binaries where required."
         ),
         wraplength=520,
@@ -11345,7 +11674,7 @@ def open_about_dialog():
         text="Repository:",
     ).grid(row=3, column=0, sticky="w", pady=(0, 2))
 
-    repo_url = "https://github.com/jmashuque/avi-capture-gui-for-osint"
+    repo_url = "https://github.com/jmashuque/wavi-capture-gui-for-osint/"
     repo_label = ttk.Label(
         frame,
         text=repo_url,
@@ -11484,7 +11813,7 @@ def fetch_ytdlp_nightly_releases(limit=20):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "avi-capture-gui-for-osint",
+            "User-Agent": "wavi-capture-gui-for-osint",
             "Accept": "application/vnd.github+json",
         },
     )
@@ -11825,7 +12154,7 @@ def fetch_gallerydl_release_list(limit=20):
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "avi-capture-gui-for-osint",
+            "User-Agent": "wavi-capture-gui-for-osint",
             "Accept": "application/json",
         },
     )
@@ -18989,41 +19318,242 @@ def sync_web_pdf_templates_from_widgets(schedule_autosave=False):
             pass
 
 
-def detect_web_browser_path():
+WEB_BROWSER_STANDARD_PATHS = {
+    "PROGRAMFILES(X86)": (
+        os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Beta", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Dev", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge SxS", "Application", "msedge.exe"),
+        os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Beta", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Dev", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome SxS", "Application", "chrome.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Beta", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Nightly", "Application", "brave.exe"),
+        os.path.join("Vivaldi", "Application", "vivaldi.exe"),
+        os.path.join("Chromium", "Application", "chrome.exe"),
+        os.path.join("Opera", "launcher.exe"),
+        os.path.join("Opera GX", "launcher.exe"),
+        os.path.join("Opera beta", "launcher.exe"),
+        os.path.join("Opera developer", "launcher.exe"),
+    ),
+    "PROGRAMFILES": (
+        os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Beta", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Dev", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge SxS", "Application", "msedge.exe"),
+        os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Beta", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Dev", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome SxS", "Application", "chrome.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Beta", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Nightly", "Application", "brave.exe"),
+        os.path.join("Vivaldi", "Application", "vivaldi.exe"),
+        os.path.join("Chromium", "Application", "chrome.exe"),
+        os.path.join("Opera", "launcher.exe"),
+        os.path.join("Opera GX", "launcher.exe"),
+        os.path.join("Opera beta", "launcher.exe"),
+        os.path.join("Opera developer", "launcher.exe"),
+        os.path.join("Arc", "Arc.exe"),
+    ),
+    "LOCALAPPDATA": (
+        os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Beta", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge Dev", "Application", "msedge.exe"),
+        os.path.join("Microsoft", "Edge SxS", "Application", "msedge.exe"),
+        os.path.join("Google", "Chrome", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Beta", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome Dev", "Application", "chrome.exe"),
+        os.path.join("Google", "Chrome SxS", "Application", "chrome.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Beta", "Application", "brave.exe"),
+        os.path.join("BraveSoftware", "Brave-Browser-Nightly", "Application", "brave.exe"),
+        os.path.join("Vivaldi", "Application", "vivaldi.exe"),
+        os.path.join("Chromium", "Application", "chrome.exe"),
+        os.path.join("Programs", "Opera", "launcher.exe"),
+        os.path.join("Programs", "Opera GX", "launcher.exe"),
+        os.path.join("Programs", "Opera beta", "launcher.exe"),
+        os.path.join("Programs", "Opera developer", "launcher.exe"),
+        os.path.join("Programs", "Arc", "Arc.exe"),
+    ),
+}
+
+WEB_BROWSER_PATH_EXECUTABLES = (
+    "msedge.exe",
+    "chrome.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "chromium.exe",
+    "opera.exe",
+    "launcher.exe",
+    "arc.exe",
+)
+
+
+def _extract_windows_command_executable(command):
+    value = str(command or "").strip()
+    if not value:
+        return ""
+    if value.startswith('"'):
+        closing_quote = value.find('"', 1)
+        if closing_quote > 1:
+            return value[1:closing_quote]
+    match = re.match(r"(?i)^(.+?\.exe)(?:\s|$)", value)
+    return match.group(1).strip('"') if match else ""
+
+
+def _is_reasonable_chromium_browser_path(path):
+    value = str(path or "").strip().strip('"')
+    if not value:
+        return False
+    base_name = os.path.basename(value).lower()
+    if base_name not in WEB_BROWSER_PATH_EXECUTABLES:
+        return False
+    lowered = value.lower().replace("/", "\\")
+    if base_name == "launcher.exe" and "opera" not in lowered:
+        return False
+    return "webview" not in lowered
+
+
+def _read_registered_chromium_browser_paths():
+    if os.name != "nt":
+        return []
+    try:
+        import winreg
+    except Exception:
+        return []
+
+    results = []
+    roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+    views = (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0))
+
+    for root_key in roots:
+        for view_flag in views:
+            for executable_name in WEB_BROWSER_PATH_EXECUTABLES:
+                key_path = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable_name}"
+                try:
+                    with winreg.OpenKey(root_key, key_path, 0, winreg.KEY_READ | view_flag) as key:
+                        value, _value_type = winreg.QueryValueEx(key, "")
+                    if _is_reasonable_chromium_browser_path(value):
+                        results.append(str(value).strip().strip('"'))
+                except OSError:
+                    pass
+
+            start_menu_root = r"Software\Clients\StartMenuInternet"
+            try:
+                with winreg.OpenKey(root_key, start_menu_root, 0, winreg.KEY_READ | view_flag) as key:
+                    index = 0
+                    registered_names = []
+                    while True:
+                        try:
+                            registered_names.append(winreg.EnumKey(key, index))
+                            index += 1
+                        except OSError:
+                            break
+            except OSError:
+                registered_names = []
+
+            for registered_name in registered_names:
+                command_key = rf"{start_menu_root}\{registered_name}\shell\open\command"
+                try:
+                    with winreg.OpenKey(root_key, command_key, 0, winreg.KEY_READ | view_flag) as key:
+                        command, _value_type = winreg.QueryValueEx(key, "")
+                    executable_path = _extract_windows_command_executable(command)
+                    if _is_reasonable_chromium_browser_path(executable_path):
+                        results.append(executable_path)
+                except OSError:
+                    pass
+
+    return results
+
+
+def detect_web_browser_paths(configured_path=None):
+    """Return all detected Chromium-family browser executables in preference order.
+
+    The configured path is retained at the top when it is valid. Detection stays
+    deliberately bounded to standard install locations, Windows browser/App Paths
+    registrations, and PATH so opening the dropdown does not trigger a disk-wide scan.
+    """
     candidates = []
-    for env_name, relative_paths in (
-        ("PROGRAMFILES(X86)", [os.path.join("Microsoft", "Edge", "Application", "msedge.exe")]),
-        ("PROGRAMFILES", [
-            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
-            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
-        ]),
-        ("LOCALAPPDATA", [
-            os.path.join("Microsoft", "Edge", "Application", "msedge.exe"),
-            os.path.join("Google", "Chrome", "Application", "chrome.exe"),
-        ]),
-    ):
+    configured = str(configured_path or "").strip().strip('"')
+    if configured:
+        candidates.append(configured)
+
+    for env_name, relative_paths in WEB_BROWSER_STANDARD_PATHS.items():
         base = os.environ.get(env_name, "")
         if base:
-            candidates.extend(os.path.join(base, relative) for relative in relative_paths)
+            candidates.extend(os.path.join(base, relative_path) for relative_path in relative_paths)
 
-    for name in ("msedge.exe", "msedge", "chrome.exe", "chrome", "chromium.exe", "chromium"):
+    candidates.extend(_read_registered_chromium_browser_paths())
+
+    path_names = (
+        "msedge.exe", "msedge", "chrome.exe", "chrome", "brave.exe", "brave",
+        "vivaldi.exe", "vivaldi", "chromium.exe", "chromium", "opera.exe", "opera",
+        "arc.exe", "arc",
+    )
+    for name in path_names:
         resolved = shutil.which(name)
         if resolved:
             candidates.append(resolved)
 
+    detected = []
     seen = set()
     for candidate in candidates:
         try:
-            normalized = os.path.abspath(candidate)
+            normalized = os.path.abspath(os.path.expandvars(os.path.expanduser(str(candidate).strip().strip('"'))))
         except Exception:
-            normalized = candidate
+            normalized = str(candidate or "").strip().strip('"')
+        if not normalized:
+            continue
         key = os.path.normcase(normalized)
         if key in seen:
             continue
         seen.add(key)
-        if os.path.isfile(normalized):
-            return normalized
-    return ""
+        if os.path.isfile(normalized) and _is_reasonable_chromium_browser_path(normalized):
+            detected.append(normalized)
+    return detected
+
+
+def detect_web_browser_path():
+    detected = detect_web_browser_paths()
+    return detected[0] if detected else ""
+
+
+def refresh_web_browser_path_choices(select_detected=False, log_result=False):
+    current = str(web_browser_path_var.get() or "").strip()
+    detected = detect_web_browser_paths(current)
+    try:
+        web_browser_path_combo.configure(values=detected)
+    except Exception:
+        pass
+
+    current_valid = bool(current and os.path.isfile(current))
+    if select_detected and detected and not current_valid:
+        web_browser_path_var.set(detected[0])
+        current = detected[0]
+
+    if log_result:
+        if detected:
+            web_append_log(
+                f"\nDetected {len(detected)} Chromium browser path"
+                f"{'s' if len(detected) != 1 else ''}. "
+                "Choose one from Browser Path or use Browse for another executable.\n"
+            )
+            for detected_path in detected:
+                web_append_log(f"  {detected_path}\n")
+        else:
+            messagebox.showwarning(
+                "Browser not found",
+                "No supported Chromium browser was detected. Select its executable manually with Browse.",
+            )
+    return detected
+
+
+def browse_web_browser_path():
+    browse_file(web_browser_path_var, "Chromium Browser Path")
+    refresh_web_browser_path_choices(select_detected=False, log_result=False)
 
 
 def resolve_web_browser_path(configured_path=None):
@@ -19201,6 +19731,9 @@ def get_web_settings_dict():
         "case_name": web_case_name_var.get().strip(),
         "web_case_name": web_case_name_var.get().strip(),
         "web_filename_template": web_filename_template_var.get().strip(),
+        "web_cookies_file": web_cookies_file_var.get().strip(),
+        "web_use_cookies_file": bool(web_use_cookies_file_var.get()),
+        "web_cookie_scope": web_cookie_scope_var.get() if web_cookie_scope_var.get() in {"site_only", "entire_file"} else DEFAULTS["web_cookie_scope"],
         "output_root": web_output_root_var.get().strip(),
         "web_output_root": web_output_root_var.get().strip(),
         "web_capture_mode": web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport"} else DEFAULTS["web_capture_mode"],
@@ -19413,6 +19946,11 @@ def update_web_options_summary(*args):
             f"{normalize_nonnegative_int_string(web_additional_wait_var.get(), DEFAULTS['web_additional_wait'])}s wait",
             f"Lazy scroll: {lazy_text}",
             f"Concurrent: {get_web_concurrent_capture_limit()}",
+            (
+                f"Cookies: On ({'Requested site only' if web_cookie_scope_var.get() == 'site_only' else 'Entire file'})"
+                if web_use_cookies_file_var.get()
+                else "Cookies: Off"
+            ),
             f"PDF: {pdf_text}",
         ]
         web_options_summary_var.set("; ".join(parts))
@@ -19494,7 +20032,7 @@ def toggle_web_capture_options_panel():
     hide_web_pdf_options_panel(save=True)
     update_web_capture_options_state()
     web_capture_options_panel.grid(
-        row=8,
+        row=9,
         column=0,
         columnspan=4,
         rowspan=8,
@@ -19517,7 +20055,7 @@ def toggle_web_pdf_options_panel():
     hide_web_capture_options_panel(save=True)
     update_web_pdf_options_state()
     web_pdf_options_panel.grid(
-        row=8,
+        row=9,
         column=0,
         columnspan=4,
         rowspan=8,
@@ -19572,6 +20110,103 @@ def delete_current_web_case_folder():
         messagebox.showerror("Delete failed", str(e))
 
 
+def inspect_netscape_cookie_file(cookie_path):
+    """Validate a Netscape cookies.txt file without retaining cookie names or values."""
+    path = str(cookie_path or "").strip()
+    if not path:
+        raise ValueError("Webpage Capture Cookies File is enabled, but no file was selected.")
+    if not os.path.isfile(path):
+        raise ValueError("Webpage Capture Cookies File is missing or invalid.")
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise ValueError(f"Webpage Capture Cookies File could not be inspected: {exc}") from exc
+    if size <= 0:
+        raise ValueError("Webpage Capture Cookies File is empty.")
+    if size > 64 * 1024 * 1024:
+        raise ValueError("Webpage Capture Cookies File is larger than the 64 MB safety limit.")
+
+    header_seen = False
+    valid_rows = 0
+    usable_rows = 0
+    expired_rows = 0
+    invalid_rows = 0
+    domains = set()
+    now_epoch = int(time.time())
+
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                lowered = line.lower()
+                if lowered.startswith("#") and not lowered.startswith("#httponly_"):
+                    if "http cookie file" in lowered:
+                        header_seen = True
+                    continue
+
+                if lowered.startswith("#httponly_"):
+                    line = line[len("#HttpOnly_"):]
+
+                fields = line.split("\t")
+                if len(fields) < 7:
+                    invalid_rows += 1
+                    continue
+
+                domain_raw = fields[0].strip()
+                include_subdomains = fields[1].strip().upper()
+                cookie_path = fields[2].strip() or "/"
+                secure_value = fields[3].strip().upper()
+                expiry_value = fields[4].strip()
+                cookie_name = fields[5]
+
+                normalized_domain = domain_raw.lstrip(".").lower().rstrip(".")
+                try:
+                    expiry = int(expiry_value or "0")
+                except ValueError:
+                    invalid_rows += 1
+                    continue
+
+                if (
+                    not normalized_domain
+                    or any(token in normalized_domain for token in ("://", "/", "\\", " "))
+                    or include_subdomains not in {"TRUE", "FALSE"}
+                    or secure_value not in {"TRUE", "FALSE"}
+                    or not cookie_path.startswith("/")
+                    or not cookie_name
+                    or expiry < 0
+                ):
+                    invalid_rows += 1
+                    continue
+
+                valid_rows += 1
+                if expiry > 0 and expiry <= now_epoch:
+                    expired_rows += 1
+                    continue
+                usable_rows += 1
+                domains.add(normalized_domain)
+    except OSError as exc:
+        raise ValueError(f"Webpage Capture Cookies File could not be read: {exc}") from exc
+
+    if not header_seen:
+        raise ValueError("Webpage Capture Cookies File is not in Netscape cookies.txt format (header not found).")
+    if valid_rows == 0:
+        raise ValueError("Webpage Capture Cookies File contains no valid Netscape cookie rows.")
+    if usable_rows == 0:
+        raise ValueError("Webpage Capture Cookies File contains no unexpired/session cookies that can be imported.")
+
+    return {
+        "filename": os.path.basename(path),
+        "valid_rows": valid_rows,
+        "usable_rows": usable_rows,
+        "expired_rows": expired_rows,
+        "invalid_rows": invalid_rows,
+        "domain_count": len(domains),
+        "size_bytes": size,
+    }
+
+
 def validate_web_settings_and_urls(settings, urls, resolved_case_name="", preflight_only=False):
     script_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
     helper_path = resolve_web_helper_script_path(script_path)
@@ -19586,7 +20221,12 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     if not deno_path or not os.path.isfile(deno_path):
         raise ValueError("Deno path is missing or invalid. Place deno.exe beside the app or select it manually.")
     if not browser_path or not os.path.isfile(browser_path):
-        raise ValueError("Microsoft Edge or Google Chrome was not found. Select the browser executable manually.")
+        raise ValueError("A compatible Chromium browser was not found. Choose a detected Browser Path or select the executable manually.")
+    if bool(settings.get("web_use_cookies_file", DEFAULTS["web_use_cookies_file"])):
+        inspect_netscape_cookie_file(settings.get("web_cookies_file", ""))
+        cookie_scope = str(settings.get("web_cookie_scope", DEFAULTS["web_cookie_scope"]) or DEFAULTS["web_cookie_scope"]).strip()
+        if cookie_scope not in {"site_only", "entire_file"}:
+            raise ValueError("Webpage Capture Cookie Scope must be Requested site only or Entire cookies file.")
     if not preflight_only and not urls:
         raise ValueError("No Webpage Capture URLs are available. Add URLs to the URL box or select Input File(s).")
     invalid_urls = [url for url in urls if not str(url).lower().startswith(("http://", "https://"))]
@@ -19663,6 +20303,8 @@ def make_web_capture_config(job, preflight_only=False):
     output_root = str(settings.get("web_output_root") or settings.get("output_root") or "")
     case_folder = os.path.join(output_root, resolved_case_name) if output_root and resolved_case_name else ""
     paths = get_expected_run_paths_for_values(output_root, resolved_case_name) if case_folder else {}
+    universal_archive_enabled = bool(app_universal_archive_enabled() and not preflight_only)
+    universal_archive_skips = get_web_universal_archive_skip_map(urls) if universal_archive_enabled else {}
     config = {
         "schema_version": 1,
         "app_version": APP_VERSION,
@@ -19673,6 +20315,14 @@ def make_web_capture_config(job, preflight_only=False):
         "browser_path": settings.get("web_browser_path", ""),
         "profile_root": profile_root,
         "browser_start_timeout_seconds": 25,
+        "use_cookies_file": bool(settings.get("web_use_cookies_file", DEFAULTS["web_use_cookies_file"])),
+        "cookies_file": str(settings.get("web_cookies_file", "") or "").strip(),
+        "cookie_scope": str(settings.get("web_cookie_scope", DEFAULTS["web_cookie_scope"]) or DEFAULTS["web_cookie_scope"]).strip(),
+        "universal_archive": {
+            "enabled": universal_archive_enabled,
+            "filename": os.path.basename(WEB_UNIVERSAL_ARCHIVE_FILE),
+            "skips": universal_archive_skips,
+        },
         "urls": urls,
         "case_folder": case_folder,
         "case_name": resolved_case_name,
@@ -19761,6 +20411,24 @@ def run_web_preflight_check():
         web_append_log(f"Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
         web_append_log(f"Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n")
         web_append_log(f"Browser path: {settings.get('web_browser_path', '')}\n")
+        if settings.get("web_use_cookies_file"):
+            cookie_stats = inspect_netscape_cookie_file(settings.get("web_cookies_file", ""))
+            cookie_scope_label = "Requested site only" if settings.get("web_cookie_scope") == "site_only" else "Entire cookies file"
+            web_append_log(
+                f"Cookies file: enabled ({cookie_stats['usable_rows']} usable cookie row(s) across "
+                f"{cookie_stats['domain_count']} domain(s); {cookie_stats['filename']})\n"
+            )
+            web_append_log(f"Cookie scope: {cookie_scope_label}\n")
+        else:
+            web_append_log("Cookies file: disabled\n")
+        if app_universal_archive_enabled():
+            archive_stats = inspect_web_universal_archive(create=True)
+            web_append_log(
+                f"Universal Webpage archive: enabled ({archive_stats['capture_count']} capture record(s); "
+                f"{archive_stats['url_key_count']} URL key(s); {WEB_UNIVERSAL_ARCHIVE_FILE})\n"
+            )
+        else:
+            web_append_log("Universal Webpage archive: disabled\n")
         web_append_log("Normal browser profile access: disabled by design\n")
         web_append_log("Testing isolated profile launch and loopback DevTools connection...\n")
         cmd = build_web_capture_command_for_job(job, preflight_only=True)
@@ -19786,7 +20454,7 @@ def run_web_preflight_check():
             web_append_log(output)
         if process.returncode != 0 or "WEB_CAPTURE_PREFLIGHT_OK" not in output:
             raise ValueError(
-                "The isolated Edge/Chrome DevTools test failed. Browser remote debugging, Deno child-process execution, "
+                "The isolated Chromium DevTools test failed. Browser remote debugging, Deno child-process execution, "
                 "or local profile creation may be blocked by policy."
             )
         web_preflight_done_var.set(True)
@@ -19971,7 +20639,18 @@ def start_web_capture():
     web_append_log("Starting Webpage Capture...\n\n")
     web_append_log(f"Resolved case: {resolved_case_name}\n")
     web_append_log(f"Browser: {settings.get('web_browser_path', '')}\n")
-    web_append_log("Browser profile: new app-owned temporary profile; normal browser profiles and cookies are not accessed\n")
+    web_append_log("Browser profile: new app-owned temporary profile; normal browser profiles and their stored cookies are not accessed\n")
+    if settings.get("web_use_cookies_file"):
+        cookie_scope_label = "Requested site only" if settings.get("web_cookie_scope") == "site_only" else "Entire cookies file"
+        web_append_log(f"Cookies file: enabled ({os.path.basename(settings.get('web_cookies_file', ''))})\n")
+        web_append_log(f"Cookie scope: {cookie_scope_label}\n")
+    else:
+        web_append_log("Cookies file: disabled\n")
+    web_append_log(
+        f"Universal Webpage archive: {'enabled' if app_universal_archive_enabled() else 'disabled'}"
+        + (f" ({WEB_UNIVERSAL_ARCHIVE_FILE})" if app_universal_archive_enabled() else "")
+        + "\n"
+    )
     web_append_log(f"Mode: {'Full page PNG' if settings.get('web_capture_mode') == 'full_page' else 'Visible viewport PNG'}\n")
     web_append_log(f"Create PDF: {'Yes' if settings.get('web_create_pdf') else 'No'}\n")
     if settings.get('web_create_pdf'):
@@ -19997,16 +20676,50 @@ def start_web_capture():
     def worker():
         global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
         exit_code = 1
+        universal_skip_records = []
+        universal_skip_summary = {}
         try:
             process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             web_running_process = process
             if process.stdout:
                 for line in process.stdout:
+                    archive_payload = parse_web_universal_archive_record_output_line(line)
+                    if archive_payload:
+                        try:
+                            archive_id = record_web_universal_archive_capture(archive_payload)
+                            safe_after(
+                                0,
+                                web_append_log,
+                                f"Webpage universal archive updated: {archive_id} | {archive_payload.get('requested_url', '')}\n",
+                            )
+                        except Exception as archive_error:
+                            safe_after(0, web_append_log, f"WARNING: Webpage universal archive update failed: {archive_error}\n")
+                        continue
+
+                    skip_record = parse_universal_archive_skip_output_line(line)
+                    if skip_record:
+                        universal_skip_records.append(skip_record)
+                        safe_after(0, web_append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        continue
+
+                    skip_summary = parse_universal_archive_skip_summary_line(line)
+                    if skip_summary:
+                        universal_skip_summary = skip_summary
+                        continue
+
                     safe_after(0, web_append_log, line)
                     if recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
                         safe_after(0, handle_queue_output_line, recovery_job_id, line)
             exit_code = process.wait()
             safe_after(0, finish_direct_recovery_job, recovery_job_id, exit_code)
+            if universal_skip_records or universal_skip_summary:
+                safe_after(
+                    0,
+                    append_universal_archive_skip_summary,
+                    universal_skip_records,
+                    universal_skip_summary,
+                    web_append_log,
+                )
         except Exception as e:
             safe_after(0, web_append_log, f"\nERROR: {e}\n")
         finally:
@@ -20226,6 +20939,9 @@ web_case_name_var = tk.StringVar(value=DEFAULTS["web_case_name"])
 web_case_folder_preview_var = tk.StringVar(value="")
 web_filename_template_var = tk.StringVar(value=DEFAULTS["web_filename_template"])
 web_filename_template_preview_var = tk.StringVar(value="")
+web_cookies_file_var = tk.StringVar(value=DEFAULTS["web_cookies_file"])
+web_use_cookies_file_var = tk.BooleanVar(value=DEFAULTS["web_use_cookies_file"])
+web_cookie_scope_var = tk.StringVar(value=DEFAULTS["web_cookie_scope"])
 web_output_root_var = tk.StringVar(value=DEFAULTS["web_output_root"])
 web_capture_mode_var = tk.StringVar(value=DEFAULTS["web_capture_mode"])
 web_viewport_width_var = tk.StringVar(value=DEFAULTS["web_viewport_width"])
@@ -22233,8 +22949,8 @@ def build_web_capture_tab():
     web_capture_tab.columnconfigure(1, weight=1)
     web_capture_tab.columnconfigure(2, weight=1)
     web_capture_tab.columnconfigure(3, weight=0)
-    web_capture_tab.rowconfigure(11, minsize=URL_ROW_MIN_HEIGHT, weight=0)
-    web_capture_tab.rowconfigure(15, weight=1)
+    web_capture_tab.rowconfigure(12, minsize=URL_ROW_MIN_HEIGHT, weight=0)
+    web_capture_tab.rowconfigure(16, weight=1)
 
     def add_file_row(row, label, var, directory=False):
         ttk.Label(web_capture_tab, text=label).grid(row=row, column=0, sticky="w", pady=1)
@@ -22253,25 +22969,25 @@ def build_web_capture_tab():
     browser_frame = ttk.Frame(web_capture_tab)
     browser_frame.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
     browser_frame.columnconfigure(0, weight=1)
-    ttk.Entry(browser_frame, textvariable=web_browser_path_var).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    global web_browser_path_combo
+    web_browser_path_combo = ttk.Combobox(
+        browser_frame,
+        textvariable=web_browser_path_var,
+        state="normal",
+        postcommand=lambda: refresh_web_browser_path_choices(select_detected=False, log_result=False),
+    )
+    web_browser_path_combo.grid(row=0, column=0, sticky="ew", padx=(0, 6))
     ttk.Button(
         browser_frame,
         text="Browse...",
-        command=lambda: browse_file(web_browser_path_var, "Edge or Chrome Path"),
+        command=browse_web_browser_path,
     ).grid(row=0, column=1, sticky="e", padx=(0, 6))
-
-    def autodetect_browser():
-        detected = detect_web_browser_path()
-        if detected:
-            web_browser_path_var.set(detected)
-            web_append_log(f"\nDetected browser: {detected}\n")
-        else:
-            messagebox.showwarning(
-                "Browser not found",
-                "Microsoft Edge or Google Chrome was not detected. Select the browser executable manually.",
-            )
-
-    ttk.Button(browser_frame, text="Auto-detect", command=autodetect_browser).grid(row=0, column=2, sticky="e")
+    ttk.Button(
+        browser_frame,
+        text="Refresh",
+        command=lambda: refresh_web_browser_path_choices(select_detected=True, log_result=True),
+    ).grid(row=0, column=2, sticky="e")
+    refresh_web_browser_path_choices(select_detected=True, log_result=False)
 
     add_file_row(3, "Input File(s)", web_input_file_var)
 
@@ -22318,10 +23034,30 @@ def build_web_capture_tab():
         justify="left",
     ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
 
-    add_file_row(6, "Output Root", web_output_root_var, directory=True)
+    ttk.Label(web_capture_tab, text="Cookies File").grid(row=6, column=0, sticky="w", pady=1)
+    cookies_frame = ttk.Frame(web_capture_tab)
+    cookies_frame.grid(row=6, column=1, columnspan=3, sticky="ew", padx=6, pady=1)
+    cookies_frame.columnconfigure(0, weight=1)
+    global web_cookies_file_entry, web_cookies_file_browse_button
+    web_cookies_file_entry = ttk.Entry(cookies_frame, textvariable=web_cookies_file_var)
+    web_cookies_file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    web_cookies_file_browse_button = ttk.Button(
+        cookies_frame,
+        text="Browse...",
+        command=lambda: browse_file(web_cookies_file_var, "Webpage Capture Cookies File"),
+    )
+    web_cookies_file_browse_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
+    ttk.Checkbutton(
+        cookies_frame,
+        text="Use",
+        variable=web_use_cookies_file_var,
+        command=toggle_web_use_cookies_file_setting,
+    ).grid(row=0, column=2, sticky="e")
+
+    add_file_row(7, "Output Root", web_output_root_var, directory=True)
 
     options = ttk.Frame(web_capture_tab)
-    options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+    options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(4, 3))
     options.columnconfigure(2, weight=1)
     global web_capture_options_button, web_pdf_options_button, web_options_summary_label
     web_capture_options_button = ttk.Button(
@@ -22363,15 +23099,15 @@ def build_web_capture_tab():
         web_capture_tab,
         text=(
             "Browser isolation: each run uses a new profile under the app-owned gui-temp folder. "
-            "The normal Edge/Chrome profile, stored cookies, passwords, and signed-in sessions are not accessed."
+            "Normal browser profiles, stored cookies, passwords, and signed-in sessions are not accessed."
         ),
         wraplength=1040,
         justify="left",
-    ).grid(row=8, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+    ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 3))
 
     global web_vpn_frame, web_vpn_adapter_menu
     web_vpn_frame = ttk.LabelFrame(web_capture_tab, text="VPN Status", padding=8)
-    web_vpn_frame.grid(row=9, column=0, columnspan=4, sticky="ew", pady=(4, 3))
+    web_vpn_frame.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(4, 3))
     web_vpn_frame.columnconfigure(1, weight=1)
     ttk.Label(web_vpn_frame, text="VPN Adapter").grid(row=0, column=0, sticky="w", padx=(0, 8))
     web_vpn_adapter_menu = ttk.Combobox(web_vpn_frame, textvariable=vpn_adapter_var, values=[], state="readonly")
@@ -22388,14 +23124,14 @@ def build_web_capture_tab():
 
     ttk.Label(
         web_capture_tab,
-        text="Paste public HTTP/HTTPS webpage URLs below, one per line. If this box is used, it overrides Input File(s).",
-    ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 2))
+        text="Paste approved HTTP/HTTPS webpage URLs below, one per line. If this box is used, it overrides Input File(s).",
+    ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(4, 2))
 
     global web_urls_text
     web_urls_text = scrolledtext.ScrolledText(web_capture_tab, height=8, wrap="word")
-    web_urls_text.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
+    web_urls_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
     buttons = ttk.Frame(web_capture_tab)
-    buttons.grid(row=11, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
+    buttons.grid(row=12, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
     web_actions = (
         ("Load", lambda: load_web_urls_from_input_file(True)),
         ("Append", lambda: load_web_urls_from_input_file(False)),
@@ -22414,7 +23150,7 @@ def build_web_capture_tab():
         )
 
     workflow = ttk.Frame(web_capture_tab)
-    workflow.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(4, 6))
+    workflow.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(4, 6))
     for col in (0, 2, 3):
         workflow.columnconfigure(col, weight=1)
     tk.Button(
@@ -22469,15 +23205,16 @@ def build_web_capture_tab():
     web_stop_button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
 
     ttk.Label(web_capture_tab, textvariable=web_status_var).grid(
-        row=13, column=0, columnspan=4, sticky="w", pady=(0, 3)
+        row=14, column=0, columnspan=4, sticky="w", pady=(0, 3)
     )
     ttk.Label(web_capture_tab, text="Output Log").grid(
-        row=14, column=0, columnspan=4, sticky="w", pady=(0, 2)
+        row=15, column=0, columnspan=4, sticky="w", pady=(0, 2)
     )
     global web_log_box
     web_log_box = scrolledtext.ScrolledText(web_capture_tab, height=14, wrap="word")
-    web_log_box.grid(row=15, column=0, columnspan=4, sticky="nsew")
+    web_log_box.grid(row=16, column=0, columnspan=4, sticky="nsew")
 
+    update_web_cookies_file_control_state()
     update_web_case_folder_preview()
     update_web_filename_template_preview()
     update_web_options_summary()
@@ -22488,7 +23225,7 @@ build_web_capture_tab()
 
 # Webpage Capture inline option panels mirror the established Image Capture
 # pattern: a compact button/summary row and one raised overlay panel at a time.
-web_capture_options_panel = ttk.LabelFrame(web_capture_tab, text="Capture Options", padding=12)
+web_capture_options_panel = ttk.LabelFrame(web_capture_tab, text="Capture Options", padding=8)
 web_capture_options_panel.columnconfigure(0, weight=1, uniform="web_capture")
 web_capture_options_panel.columnconfigure(1, weight=1, uniform="web_capture")
 web_capture_options_panel.columnconfigure(2, weight=1, uniform="web_capture")
@@ -22498,11 +23235,11 @@ ttk.Label(
     web_capture_options_panel,
     text=(
         "These settings control the PNG capture, browser viewport, page settling, lazy-load scrolling, "
-        "and Webpage Capture concurrency."
+        "Webpage Capture concurrency, and cookie scope."
     ),
     wraplength=980,
     justify="left",
-).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 0))
 
 web_mode_frame = ttk.LabelFrame(web_capture_options_panel, text="Capture Mode", padding=8)
 web_mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
@@ -22523,7 +23260,7 @@ ttk.Radiobutton(
 
 ttk.Label(
     web_mode_frame,
-    text="Full-page mode may use numbered vertical segments for exceptionally tall pages.",
+    text="Very tall pages may be saved as numbered PNG segments.",
     wraplength=300,
     justify="left",
 ).pack(anchor="w", pady=(6, 0))
@@ -22562,7 +23299,7 @@ ttk.Entry(web_loading_frame, textvariable=web_additional_wait_var, width=12).gri
 )
 ttk.Label(
     web_loading_frame,
-    text="The additional wait occurs after the page load/network-settle stage.",
+    text="Additional wait starts after page load and network settling.",
     wraplength=300,
     justify="left",
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -22596,8 +23333,37 @@ ttk.Label(
     justify="left",
 ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(6, 0))
 
+web_cookie_scope_frame = ttk.LabelFrame(web_capture_options_panel, text="Cookie Scope", padding=4)
+web_cookie_scope_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+web_cookie_scope_widgets = []
+web_cookie_scope_site_radio = ttk.Radiobutton(
+    web_cookie_scope_frame,
+    text="Requested site only",
+    variable=web_cookie_scope_var,
+    value="site_only",
+    command=update_web_options_summary,
+)
+web_cookie_scope_site_radio.grid(row=0, column=0, sticky="w", padx=(0, 24), pady=1)
+web_cookie_scope_all_radio = ttk.Radiobutton(
+    web_cookie_scope_frame,
+    text="Entire cookies file",
+    variable=web_cookie_scope_var,
+    value="entire_file",
+    command=update_web_options_summary,
+)
+web_cookie_scope_all_radio.grid(row=0, column=1, sticky="w", pady=1)
+web_cookie_scope_widgets.extend([web_cookie_scope_site_radio, web_cookie_scope_all_radio])
+Tooltip(
+    web_cookie_scope_site_radio,
+    "Loads only cookies applicable to the submitted hostname, including valid parent-domain cookies.",
+)
+Tooltip(
+    web_cookie_scope_all_radio,
+    "Loads every valid cookie from the selected file into the isolated temporary browser. This improves redirect and SSO compatibility but may make authenticated cookies available to additional matching domains contacted during capture.",
+)
+
 web_capture_button_frame = ttk.Frame(web_capture_options_panel)
-web_capture_button_frame.grid(row=3, column=0, columnspan=3, sticky="e", pady=(4, 0))
+web_capture_button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(0, 0))
 ttk.Button(
     web_capture_button_frame,
     text="Close Capture Options",
@@ -22833,6 +23599,9 @@ ttk.Button(
 web_pdf_options_panel.grid_remove()
 
 for web_option_var in (
+    web_use_cookies_file_var,
+    web_cookies_file_var,
+    web_cookie_scope_var,
     web_capture_mode_var,
     web_viewport_width_var,
     web_viewport_height_var,
@@ -22866,6 +23635,7 @@ web_create_pdf_var.trace_add("write", update_web_pdf_options_state)
 web_pdf_display_header_footer_var.trace_add("write", update_web_pdf_options_state)
 web_pdf_capture_mode_var.trace_add("write", update_web_pdf_options_state)
 update_web_capture_options_state()
+update_web_cookies_file_control_state()
 update_web_pdf_options_state()
 update_web_filename_template_preview()
 update_web_options_summary()

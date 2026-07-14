@@ -6,7 +6,7 @@
     Validates the generated Webpage Capture configuration and launches the
     TypeScript helper through Deno with narrowly scoped permissions.
 
-    The script does not read the user's normal Edge or Chrome profile. The
+    The script does not read the user's normal browser profile. The
     browser path and unique app-owned profile path come from the generated
     JSON configuration created by gui.py.
 #>
@@ -103,13 +103,28 @@ try {
         throw 'The Webpage Capture configuration does not contain an isolated profile path.'
     }
 
-    $resolvedBrowser = Resolve-RequiredFile -LiteralPath ([string]$config.browser_path) -Label 'Edge/Chrome browser'
+    $resolvedBrowser = Resolve-RequiredFile -LiteralPath ([string]$config.browser_path) -Label 'Chromium browser'
     $profileRoot = Resolve-AbsolutePath -LiteralPath ([string]$config.profile_root)
+
+    $useCookiesFile = $false
+    $resolvedCookiesFile = ''
+    if ($null -ne $config.PSObject.Properties['use_cookies_file']) {
+        $useCookiesFile = [bool]$config.use_cookies_file
+    }
+    if ($useCookiesFile) {
+        if ($null -eq $config.PSObject.Properties['cookies_file'] -or [string]::IsNullOrWhiteSpace([string]$config.cookies_file)) {
+            throw 'Webpage Capture cookie-file use is enabled, but the configuration does not contain a cookies file path.'
+        }
+        $resolvedCookiesFile = Resolve-RequiredFile -LiteralPath ([string]$config.cookies_file) -Label 'Webpage Capture cookies file'
+    }
 
     $readPaths = New-Object System.Collections.Generic.List[string]
     $writePaths = New-Object System.Collections.Generic.List[string]
     [void]$readPaths.Add($resolvedConfig)
     [void]$readPaths.Add($profileRoot)
+    if ($useCookiesFile) {
+        [void]$readPaths.Add($resolvedCookiesFile)
+    }
     [void]$writePaths.Add($profileRoot)
 
     if ($config.case_folder -and -not [string]::IsNullOrWhiteSpace([string]$config.case_folder)) {
@@ -141,6 +156,12 @@ try {
     Write-Output "Deno executable: $resolvedDeno"
     Write-Output "Browser executable: $resolvedBrowser"
     Write-Output "Isolated profile: $profileRoot"
+    if ($useCookiesFile) {
+        Write-Output "Cookies file: enabled ($([System.IO.Path]::GetFileName($resolvedCookiesFile)))"
+    }
+    else {
+        Write-Output 'Cookies file: disabled'
+    }
 
     & $resolvedDeno @denoArguments
     $exitCode = $LASTEXITCODE
