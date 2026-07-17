@@ -41,7 +41,7 @@ The app has six main tabs:
 
 - **Audio/Video Capture** for `yt-dlp` captures.
 - **Image Capture** for `gallery-dl` captures.
-- **Webpage Capture** for extension-free full-page or visible-viewport PNG captures, with optional PDF output, using Deno and an isolated Chromium-browser profile.
+- **Webpage Capture** for extension-free full-page, initial-viewport, or combined PNG/JPEG/WebP captures, with optional PDF output, using Deno and an isolated Chromium-browser profile.
 - **Job Queue** for staged, concurrent, and recoverable jobs.
 - **Audio/Video Preview** for metadata, thumbnails, playlist/context review, and queueing from preview results.
 - **Case Browser** for local review, thumbnails, metadata, and hash verification.
@@ -76,7 +76,7 @@ The app helps users:
 - run preflight checks for required local tools
 - capture audio/video with `yt-dlp`
 - capture image/gallery content with `gallery-dl`
-- capture full-page or visible-viewport webpage PNGs through an isolated installed Chromium-family browser
+- capture full-page, initial-viewport, or combined webpage images as PNG, JPEG, or WebP through an isolated installed Chromium-family browser
 - record webpage capture metadata, redirects, dimensions, warnings, hashes, and segmented fallbacks for oversized pages
 - organize output into case folders
 - apply case names, filename templates, cookies, proxy settings, pacing, archive, and metadata options
@@ -132,52 +132,32 @@ Use approved releases for your environment. For FFmpeg, the Gyan.dev release ess
 
 ## Basic Usage
 
-This section is for normal users who only need to stage the app and run approved captures. Most users should not need to change Advanced Options.
+This section covers the normal first-run workflow. Start with the defaults, run **Preflight Check**, and change advanced options only when the capture requires them.
 
 ### Setup and Staging
 
-Do this once before the first capture, or whenever you are preparing a fresh copy of the app. Use organization-approved download locations or staged files when your environment provides them.
+Do this once before the first capture, or whenever you prepare a fresh copy of WAVI.
 
-1. Create a local folder for the app, such as:
+1. Create a local folder, for example:
 
    ```text
    C:\WAVI-Capture-GUI
    ```
 
-2. Download the latest WAVI Capture GUI release ZIP from:
+2. Download and extract the latest WAVI release. If Windows shows an **Unblock** checkbox in the ZIP file's **Properties**, select it before extracting. Do not run WAVI from inside the ZIP.
 
-   ```text
-   https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest
-   ```
+3. Install Python 3 through an organization-approved source.
 
-3. Right-click the downloaded ZIP, choose **Properties**, select **Unblock** if that option appears, then choose **Extract All**. Do not run the app from inside the ZIP.
+4. Place the approved capture tools beside the app files unless your team provides a different staged path:
 
-4. Move or extract the app files into the local app folder. The folder should contain at least:
+   | Tool | Required file |
+   |---|---|
+   | yt-dlp | `yt-dlp.exe` |
+   | gallery-dl | `gallery-dl.exe` |
+   | Deno | `deno.exe` |
+   | FFmpeg | `ffmpeg.exe` and `ffprobe.exe` |
 
-   ```text
-   gui.py
-   script-ytdlp.ps1
-   script-gallerydl.ps1
-   script-webcapture.ps1
-   script-webcapture.ts
-   README.md
-   LICENSE
-   ```
-
-5. Install Python 3 if it is not already installed. The easiest user-facing option is the Microsoft Store Python 3 package. If your organization uses Software Center, Company Portal, Intune, winget, or another approved source, use that instead.
-
-6. Download the required capture tools and place the executable files in the same app folder unless your team gives you a different staged folder:
-
-   | Tool | What to place in the app folder | Source page |
-   |---|---|---|
-   | yt-dlp | `yt-dlp.exe` | <https://github.com/yt-dlp/yt-dlp/releases> |
-   | gallery-dl | `gallery-dl.exe` | <https://codeberg.org/mikf/gallery-dl/releases> |
-   | Deno | `deno.exe` | <https://github.com/denoland/deno/releases> |
-   | FFmpeg | `ffmpeg.exe` and `ffprobe.exe` | <https://www.gyan.dev/ffmpeg/builds/> |
-
-   For FFmpeg, download a Windows release build, open the ZIP, then copy `ffmpeg.exe` and `ffprobe.exe` from the `bin` folder into the app folder.
-
-7. Confirm the app folder now looks similar to this:
+5. Confirm the folder looks similar to this:
 
    ```text
    C:\WAVI-Capture-GUI\
@@ -186,6 +166,11 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
      script-gallerydl.ps1
      script-webcapture.ps1
      script-webcapture.ts
+     README.md
+     CHANGELOG.md
+     VERSION.txt
+     VERIFY_HASHES.txt
+     LICENSE
      yt-dlp.exe
      gallery-dl.exe
      deno.exe
@@ -193,99 +178,86 @@ Do this once before the first capture, or whenever you are preparing a fresh cop
      ffprobe.exe
    ```
 
-Keep this folder together. `deno.exe` should be beside `yt-dlp.exe`. Keep the app on a local drive during active captures instead of running it from inside the ZIP, email attachment, browser download preview, or network share.
+6. Keep the app and active case output on a local drive. Avoid running from an email attachment, browser preview, synced folder, or network share.
+
+`deno.exe` should normally be beside `yt-dlp.exe`. Webpage Capture also needs a compatible installed Chromium-family browser, such as Microsoft Edge, Google Chrome, Brave, Vivaldi, Chromium, or Opera.
 
 ### Start a Capture
 
-1. Open the app folder in File Explorer.
-
-2. Start the GUI. Use one of these methods:
-
-   - If `.py` files already open with Python, double-click `gui.py`.
-   - If double-clicking does not work, click the File Explorer address bar, type `powershell`, and press **Enter**. In the PowerShell window that opens, run:
+1. Open the WAVI folder and start `gui.py`.
+   - Double-click it when `.py` files already open with Python.
+   - Otherwise, click the File Explorer address bar, type `powershell`, press **Enter**, and run:
 
      ```powershell
      py .\gui.py
      ```
 
-   - If Windows says `py` is not recognized, try:
+   - If `py` is unavailable, try `python .\gui.py`. If neither works, Python is not installed or is not available to your user session.
 
-     ```powershell
-     python .\gui.py
-     ```
+2. Select the appropriate tab:
+   - **Audio/Video Capture** for video, audio, channels, playlists, and supported media posts.
+   - **Image Capture** for image posts, galleries, albums, and supported collections.
+   - **Webpage Capture** for a rendered screenshot and optional PDF of an approved webpage.
 
-   - If both commands fail, Python is not installed or is not available to the user session. Install Python through an approved source or ask IT to stage it.
+3. Check the main fields:
+   - **Output Root** is the parent folder where case folders will be created.
+   - **Case Name** becomes the case subfolder.
+   - **Filename Template** controls names and subfolders inside the case.
+   - The optional `%engine%` tag resolves to `audio-video`, `image`, or `webpage`, allowing shared Output Roots or templates to identify the capture source. Existing defaults do not use this tag.
+   - The **URL box** accepts one URL per line.
+   - **Input File(s)** accepts text files containing one URL per line.
 
-3. Choose the correct tab:
+4. Paste the approved URL or URLs. The URL box takes priority over Input File(s); clear the URL box when you intend to use selected files.
 
-   - **Audio/Video Capture** for video, audio, and supported media posts handled by `yt-dlp`.
-   - **Image Capture** for image links, galleries, albums, and supported photo-post sources handled by `gallery-dl`.
-   - **Webpage Capture** for approved HTTP/HTTPS webpages rendered by an isolated installed Chromium-family browser.
+   Every capture tab has the same twelve URL-box tools:
 
-4. Confirm the tool paths shown on the tab. If a path is blank or points to the wrong folder, use the browse button beside that field.
+   - **Load**, **Append**, **Save**, **Clear**, and **Copy** manage the URL text.
+   - **Failed** shows failed URLs from the current Output Root that match the current URL set; the button changes to **All** so the original set can be restored.
+   - **Group** organizes URLs under domain headings, and **Statistics** shows totals by domain.
+   - **Normalize**, **Duplicates**, and **Validate** clean or inspect the URL source.
+   - **Strip** removes parameter-like `&name=value` suffixes. Use it only when those trailing parameters are unwanted, because removing them can change which webpage or media item is requested.
 
-5. Enter or keep the case name. The app resolves the final case folder before capture.
+5. Run **Preflight Check**. Fix any failed item before continuing.
 
-6. Paste approved URLs into the URL box, or select an input file containing one URL per line.
+6. Click **Start Capture** and leave WAVI open until the run finishes.
 
-7. Run **Preflight Check**. Fix any missing tool or folder warning before starting the capture.
-
-8. Click **Start Capture**.
-
-9. Leave the app open until the capture finishes, then review the output log and case folder.
-
-The URL box takes priority over input files. Clear the URL box if you want the selected input file to be used instead.
+7. Review the output log, then open the case folder and confirm the expected files, logs, and manifest are present. After a successful run, the main **Copy Case Summary** button copies a plain-text record of the case paths, file counts, tool versions, and effective capture options. Use its **▼** menu to copy or export the case's captured URLs or failed URLs. URL lists are filtered to the current capture engine and case name. WAVI refuses oversized clipboard copies instead of truncating them; use **Export** for a complete large list.
 
 ### Capture Audio or Video
 
-Use **Audio/Video Capture** for supported video, audio, media posts, channels, and playlists handled by `yt-dlp`.
+For a first capture, keep the defaults unless the source is a playlist or you specifically need audio-only, metadata-only, or a different format.
 
-1. Open **Audio/Video Capture** and confirm the **Script Path**, **yt-dlp Path**, **FFmpeg Folder**, and Output Root. Deno should normally be beside `yt-dlp.exe`.
-2. Enter a case name and filename template. The resolved case folder is shown before capture, and the output template controls the organization and names of files below the case `media` folder.
-3. Paste one or more approved URLs, or select input files containing one URL per line. For a playlist or multi-item source, open **Capture Options** and deliberately enable playlist/multi-item handling; normal capture remains single-item by default.
-4. In **Capture Options**, choose the capture mode, source scope, format strategy, maximum resolution, archive behaviour, date filters, and any playlist limits or ordering. Metadata-only is useful when the media itself is not required; media-only ignores metadata options.
-5. Use **Metadata Options** to select separate sidecar artifacts or supported metadata to embed in the final media container. Separate sidecars are generally easier to inspect, hash, and preserve independently.
-6. Open **Advanced Options** for title keyword filters, impersonation, failure handling, and queue concurrency. Use **Pacing Options** for request delays, retries, bandwidth/throttling controls, partial-file handling, fragment concurrency, and HTTP chunking.
-7. To use an approved Netscape-format cookies file, select it in **Cookies File** and enable **Use**. Cookies are passed to `yt-dlp`; they do not guarantee access to private, expired, challenge-protected, or unsupported content.
-8. Run **Preflight Check**, then select **Start Capture**. Review the live log for unsupported URLs, skipped archive entries, authentication warnings, or post-processing failures.
-9. Review the captured media, selected metadata artifacts, run log, and SHA256 manifest in the case folder. Use **Audio/Video Preview** first when you need to inspect metadata, thumbnails, or playlist/context entries before capture.
+1. Open **Audio/Video Capture** and confirm the paths to the PowerShell script, `yt-dlp.exe`, and the FFmpeg folder.
+2. Choose an Output Root and case name, then paste the approved URL.
+3. For one video or media post, keep **Single item only**. For an approved playlist, channel, or multi-item page, open **Capture Options** and select **Include playlist / multi-item source**.
+4. Run **Preflight Check**, then start the capture.
+5. Review the media under the case `media` folder, the run log under `logs`, and the SHA256 manifest under `manifests`.
 
-The case download archive prevents repeated items within that case when archive mode is **Use**. When the app-level **Universal Download Archive** is enabled, completed yt-dlp items can also be skipped across cases. Use **Ignore** or **Force re-capture** deliberately when a fresh copy is required.
+Use **Audio/Video Preview** before capture when you need to inspect a playlist, title, thumbnail, or available metadata. See [Advanced Audio/Video Capture](#audiovideo-capture) for format strategies, sidecars, embeds, filtering, pacing, and archive controls.
 
 ### Capture Images
 
-Use **Image Capture** for supported image posts, galleries, albums, and collections handled by `gallery-dl`.
+A single gallery URL can produce many files. When the size is uncertain, start with a small item limit or range.
 
-1. Open **Image Capture** and confirm the **Script Path**, **gallery-dl Path**, Output Root, case name, and image filename template. The template is relative to the case `media` folder.
-2. Paste approved URLs or choose input files. A gallery URL may produce many items, so confirm the target and expected scope before starting.
-3. Open **Capture Options** to choose normal media capture or metadata-only output, optional metadata/info JSON/tag sidecars, archive behaviour, and item limits or ranges.
-4. Open **Advanced Options** to select a pacing preset, retry count, request timeout, and Image Capture concurrency.
-5. To use an approved Netscape-format cookies file, select it in **Cookies File** and enable **Use**. A valid cookies file may help with an approved authenticated source, but gallery-dl support and site controls still determine the result.
-6. Run **Preflight Check**, then select **Start Capture**. The log identifies unsupported URLs, skipped archived items, download failures, and the final output locations.
-7. Review the downloaded images and sidecars beneath the case `media` folder, the gallery-dl run log under `logs`, and the SHA256 manifest under `manifests`.
+1. Open **Image Capture** and confirm the paths to the PowerShell script and `gallery-dl.exe`.
+2. Choose an Output Root and case name, then paste the approved image or gallery URL.
+3. For a large or unfamiliar gallery, open **Capture Options**, enable **Limit max items**, and begin with a small number such as 10 or 25.
+4. Run **Preflight Check**, then start the capture.
+5. Review the images and sidecars under `media`, the gallery-dl log under `logs`, and the manifest under `manifests`. Use **Copy Case Summary** after a successful run when you need a concise record for case notes or handoff.
 
-Image Capture uses a SQLite archive so completed gallery items can be skipped reliably. The normal case archive is stored with that case; when the app-level **Universal Download Archive** is enabled, the shared Image archive can skip matching items across cases. Choose **Ignore archive** or **Force re-capture** only when you intend to collect the same items again.
+See [Advanced Image Capture](#image-capture) for metadata-only runs, item ranges, archive modes, pacing, retries, timeouts, cookies, and concurrency.
 
 ### Capture a Webpage
 
-Use **Webpage Capture** for a rendered webpage screenshot and optional PDF without a browser extension.
+The default Webpage workflow creates a full-page PNG using a new isolated browser profile. It does not use the normal signed-in browser profile.
 
-1. Open **Webpage Capture**.
-2. Confirm the **Script Path**, **Deno Path**, and **Browser Path** fields. **Browser Path** is an editable dropdown populated with detected Chromium-family browser executables. Open the dropdown to choose a detected path, use **Refresh** to rescan standard install locations, Windows browser registrations, and `PATH`, or use **Browse** for a portable or non-standard installation.
-3. Enter a case name and filename template. Both fields include an **Insert Tag** menu, and the tab shows resolved case/output examples below the fields.
-4. Open **Capture Options** to choose full-page or visible-viewport PNG mode, viewport dimensions, page-load timing, lazy-load scrolling, Webpage Capture concurrency, and cookie scope when a cookies file is enabled. Close the panel to return to the main workflow.
-5. Open **PDF Options** when you also want PDF output. Enable **Create PDF with PNG**, choose a **PDF Source**, then adjust landscape/portrait, paper size, scale, margins, and optional headers/footers. **Live Page (searchable)** uses Chromium's normal `Page.printToPDF` output and exposes page ranges, CSS page-size preference, backgrounds, and **Live Page Layout** choices (**Keep site print layout**, **Remove fixed/sticky positioning**, or **Hide likely top navigation**). **Captured PNG (visual match)** builds an image-only PDF from the saved PNG capture so sticky headers or print CSS no longer repeat over content. By default, the header shows the final URL and UTC capture timestamp.
-6. To use an approved Netscape-format `cookies.txt` file, select it in **Cookies File** and enable **Use**. In **Capture Options > Cookie Scope**, keep **Requested site only** for least-privilege capture or choose **Entire cookies file** when redirects or SSO require cookies from related domains. Webpage Capture reads only the selected file and does not access any normal browser profile.
-7. Enter the Output Root and one or more approved `http://` or `https://` URLs.
-8. Run **Preflight Check**. This validates the selected cookies file when enabled, creates a new temporary browser profile, launches the browser in headless mode, and tests the loopback DevTools connection.
-9. Click **Start Capture**.
-10. Review the PNG, optional PDF, `.webcapture.json` sidecar, run log, and SHA256 manifest in the case folder.
+1. Open **Webpage Capture** and confirm the **Deno Path** and **Browser Path**. Use **Refresh** or **Browse** if the browser path is blank.
+2. Choose an Output Root and case name, then paste an approved `http://` or `https://` URL.
+3. Keep the default Capture Options for the first attempt. Open **PDF Options** only when a PDF is also required.
+4. Run **Preflight Check**. This tests Deno, the selected browser, the isolated temporary profile, and the loopback DevTools connection.
+5. Start the capture and review the image, `.webcapture.json` sidecar, run log, and SHA256 manifest. Review any **Complete with warnings**, **Partial**, or **Failed** classification before treating the capture as complete. After a successful run, **Copy Case Summary** includes the classification totals along with the case paths, tools, and selected Webpage options.
 
-When the app-level **Universal Download Archive** setting is enabled, each successful Webpage Capture records both the submitted URL and its final redirected URL in `universal-webcapture-archive.sqlite3`. A matching URL submitted in a later case is skipped and documented in per-run JSON/CSV skip reports. Disable Universal Download Archive before starting a deliberate re-capture of a webpage that may have changed.
-
-Each run uses a unique browser profile under `gui-temp`. Webpage Capture does not open or read the user's normal browser profile, browser cookie database, saved passwords, or existing signed-in session. An explicitly selected Netscape cookies file can provide approved session cookies, but the app does not automate login, consent banners, CAPTCHAs, MFA, or other page interactions.
-
-Very tall pages may be written as numbered PNG segments instead of one oversized PNG. The JSON sidecar records the segment positions and hashes.
+Webpage Capture does not dismiss banners, sign in, solve MFA/CAPTCHA challenges, or click page controls. An approved Netscape-format cookies file can be selected manually when required, but cookie use remains disabled by default.
 
 ### Use the Job Queue
 
@@ -310,9 +282,7 @@ To resume it:
 3. Use **Continue Checked Interrupted** or right-click the highlighted job and choose **Continue Highlighted Interrupted**.
 4. Leave the app open while the resumed queue job runs.
 
-Direct captures are also saved as running recovery jobs only when **Job Persistence** is enabled. If Job Persistence is disabled, direct captures are not saved to the queue and cannot be resumed from the app after a close or crash.
-
-Audio/Video and Webpage Capture jobs continue from the first URL that was not fully marked complete. Image jobs resubmit the original URLs and rely on gallery-dl archive skipping to avoid repeating completed items.
+Direct captures are saved as running recovery jobs only when **Job Persistence** is enabled. Audio/Video and Webpage jobs continue from the first URL not marked complete. Image jobs resubmit the original URLs and rely on the selected gallery-dl archive to skip completed items.
 
 ### Preview Audio/Video Links
 
@@ -321,9 +291,9 @@ Use **Audio/Video Preview** when you want to inspect media metadata or playlist/
 1. Add URLs to the preview list.
 2. Run Preview for all, selected, or visible rows.
 3. Review metadata, thumbnails, and playlist/context items.
-4. Start or queue the previewed rows you want to capture.
+4. Start or queue the rows you want to capture.
 
-Preview is best-effort. It can be slower or incomplete depending on the site, cookies, network path, and installed `yt-dlp` build.
+Preview is best-effort. It can be incomplete or slow depending on the site, cookies, network path, and installed `yt-dlp` build.
 
 ### Review a Case
 
@@ -334,7 +304,7 @@ Use **Case Browser** to review local case output.
 - Open case folders or individual files.
 - Generate or verify SHA256 manifests.
 
-Case Browser is for local review only. It does not determine evidentiary value.
+Case Browser is for local review only. It does not determine authenticity, context, or evidentiary value.
 
 ## Advanced Usage
 
@@ -366,23 +336,109 @@ Recommended layout:
 
 ### Audio/Video Capture
 
-Audio/Video Capture uses `script-ytdlp.ps1`, `yt-dlp.exe`, and FFmpeg/FFprobe. Deno is available to yt-dlp for supported extractor workflows and should normally be staged beside `yt-dlp.exe`. The tab accepts pasted URLs or one or more input files, resolves the case folder before capture, and writes media beneath the case `media` folder using the selected yt-dlp output template. Case-name tags resolve when a job is created; yt-dlp fields such as extractor, uploader, title, ID, date, and extension resolve for each item.
+Audio/Video Capture uses `script-ytdlp.ps1`, `yt-dlp.exe`, Deno where required by supported extractors, and FFmpeg/FFprobe. The URL box takes priority over selected Input File(s). Output is written beneath `<Output Root>\<Case Name>\media` using the selected template.
 
-**Capture Options** controls the main collection scope and output strategy:
+**Capture mode**
 
-- single-item or playlist/multi-item source handling
-- media with selected sidecars, media with embedded metadata, media-only, or metadata/artifacts-only capture
-- Best, MP4-oriented, audio-only, or low-bandwidth format strategies and maximum resolution
-- case archive use, archive bypass, or deliberate force re-capture
-- date filters, playlist item ranges/order, playlist maximums, and existing-item behaviour
+| Mode | What it does | Typical use |
+|---|---|---|
+| **Download media and selected sidecars** | Downloads media and writes the selected separate metadata files. | Recommended general-purpose capture. |
+| **Media + embedded metadata; ignore sidecars** | Downloads media and applies selected embed options without retaining the normal sidecar set. | A compact playback copy when separate records are not required. |
+| **Media only; ignore metadata options** | Downloads only the media output. | Minimal output when metadata artifacts are deliberately unnecessary. |
+| **Metadata/artifacts only; do not download media** | Runs extraction and writes selected metadata artifacts without downloading the media stream. | Source assessment, scoping, or metadata collection. |
 
-**Metadata Options** separates files written beside the media from data embedded into the final media container. Sidecars can include info JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, comments, and playlist metadata. Supported embed options include metadata, cover art, subtitles, chapters, and info JSON. Availability depends on the source, selected output format, and FFmpeg support.
+Separate sidecars are usually easier to inspect, hash, compare, and preserve than metadata embedded inside a media container.
 
-**Advanced Options** covers title keyword matching/rejection, yt-dlp impersonation targets, stop-versus-continue failure handling, and Audio/Video queue concurrency. **Pacing Options** covers request delays, retry behaviour, download-rate and throttled-rate limits, partial-file retention, concurrent fragments, and HTTP chunk size. Start conservatively; aggressive concurrency or repeated retries can increase rate limiting and make a large job harder to review.
+**Source scope and playlist controls**
 
-When archive mode is **Use**, the case keeps `download-archive.txt`. If the app-level **Universal Download Archive** is enabled, WAVI also uses `universal-download-archive.txt` to avoid recapturing matching yt-dlp items across cases and writes per-run skip details when applicable. Archive skips indicate prior tool records, not that the current case contains a fresh copy. Use archive bypass or force re-capture only when a new collection is required.
+- **Single item only** is the safe default and prevents a submitted page from expanding into an entire playlist or channel.
+- **Include playlist / multi-item source** allows playlist, channel, and other multi-item extraction.
+- **Items** accepts yt-dlp indexes and ranges such as `1:10,30,35:40`.
+- **Order** can be normal, reverse, or random.
+- **Max items** caps the number of playlist entries considered.
+- **Stop when archived item is found** is useful for chronologically ordered recurring sources when an older archived item means the remaining entries were probably captured previously.
+- **Skip after failed items** stops working through a problematic playlist after the selected number of item failures.
 
-Typical case output is organized as:
+Playlist controls are passed only when multi-item scope is enabled. Use **Audio/Video Preview** to inspect and select playlist/context entries when the source structure is uncertain.
+
+**Format strategy**
+
+| Strategy | Behaviour |
+|---|---|
+| `best` | Uses yt-dlp's best available media selection, optionally limited by maximum resolution. |
+| `prefer_mp4` | Prefers MP4 video with M4A audio and merges to MP4, but retains fallback choices when MP4-specific formats are unavailable. |
+| `strict_mp4` | Requires MP4-compatible video/audio choices. This is more predictable for compatibility but can fail on sources without a suitable MP4 combination. |
+| `audio_only` | Selects the best audio and converts/extracts it to M4A. |
+| `low_bandwidth` | Selects a low-quality/low-bandwidth format, still respecting the selected maximum resolution where applicable. |
+
+**Max resolution** limits video height to Best, 2160p, 1440p, 1080p, 720p, or 480p. It does not improve a lower-resolution source. **Generate Windows `.url` shortcuts** creates source-link shortcuts when that additional record is useful.
+
+**Metadata Options**
+
+Sidecar choices include:
+
+- metadata/info JSON
+- source-link files
+- description text
+- thumbnails
+- creator-provided subtitles
+- automatic subtitles
+- comments when supported
+- playlist metadata for multi-item captures
+
+Embed choices include metadata, cover art, subtitles, chapters, and info JSON for compatible media containers. Embedding depends on the selected format, available source metadata, and FFmpeg or mutagen support. Some embeds can modify or remux the final media file, so retain separate sidecars when independent preservation is preferred.
+
+**Archive modes**
+
+- **Use case download archive** records completed yt-dlp item identifiers in the case and skips matching items on later runs.
+- **Ignore archive for this run** does not use the case archive for duplicate avoidance.
+- **Force re-capture** deliberately requests another copy even when the item is already archived.
+
+When app-level **Universal Download Archive** is enabled, WAVI also uses `universal-download-archive.txt` for cross-case skipping. An archive skip confirms a previous archive record; it does not mean the current case contains a fresh copy.
+
+**Dates, title filters, and impersonation**
+
+- **Date after** and **Date before** restrict supported sources by upload date.
+- **Only capture titles matching** and **Reject titles matching** accept comma-separated keywords and build safe case-insensitive title filters.
+- **Impersonate Target** passes a supported yt-dlp impersonation target. Use **Check Targets** first because availability depends on the installed yt-dlp build and local dependencies. Impersonation does not bypass authentication or authorization controls.
+
+**Failure handling and concurrency**
+
+- **Continue after failed URL** processes the remaining submitted URLs.
+- **Stop on first failed URL** ends the run after the first failed URL.
+- **Concurrent Captures** controls separate active Audio/Video queue jobs, from 1 to 4. WAVI still checks for same-domain collisions.
+- **Concurrent Fragments** controls parallel fragment downloads inside one yt-dlp job, from 1 to 8. This is different from queue concurrency and can increase load on the source and local network.
+
+**Pacing and retry behaviour**
+
+| Request-rate preset | Between submitted URLs | yt-dlp request sleep |
+|---|---:|---:|
+| **None** | 0 to 5 seconds | none |
+| **Fast** | 15 to 30 seconds | 2 seconds |
+| **Normal** | 30 to 60 seconds | 5 seconds |
+| **Cautious** | 60 to 120 seconds | 10 seconds |
+
+| Retry profile | Main and fragment retries | Retry sleep window |
+|---|---:|---|
+| **Light** | 3 | exponential, 5 to 60 seconds |
+| **Normal** | 5 | exponential, 10 to 120 seconds |
+| **Aggressive** | 10 | exponential, 10 to 300 seconds |
+
+Additional controls:
+
+- **Download Speed Limit** caps transfer speed for the job.
+- **Throttle Detection** tells yt-dlp to restart a transfer when speed stays below the selected threshold.
+- **HTTP Chunk Size** requests ranged/chunked HTTP transfers and should normally remain off unless a source or network path benefits from it.
+- Retaining partial fragments can help troubleshooting or manual recovery but also leaves incomplete files that must not be mistaken for completed captures.
+
+Increasing retries, concurrency, or fragments can worsen rate limiting. Start with the defaults and change one factor at a time.
+
+**Output records**
+
+- **Case Browser cache** controls whether WAVI prepares hidden thumbnail/media-detail cache files after each URL, after the run, or not at all. `.gui-cache` is excluded from evidence manifests.
+- **File manifest: Full** hashes the current case contents; **This run** limits the manifest to artifacts attributed to the current run.
+
+Typical output:
 
 ```text
 <case>\
@@ -396,26 +452,72 @@ Typical case output is organized as:
   download-archive.txt
 ```
 
-The script can also generate app-supporting thumbnails and FFprobe metadata under the hidden `.gui-cache` folder for Case Browser use. These cache files are excluded from evidence manifests. Audio/Video Preview is a separate best-effort review workflow and does not replace the capture log, source sidecars, or analyst review.
+After a finished Audio/Video run, the **▼** beside **Copy Case Summary** can copy or export captured and failed URLs recorded for that Audio/Video case. The URL actions remain available after a failed run even when no successful summary can be copied.
+
+Cookies, proxy settings, domain presets, VPN checks, and the universal archive are shared/app-level controls described later in this README. A cookies file can provide an approved session, but it does not bypass login, MFA, challenges, extractor limitations, or source restrictions.
 
 ### Image Capture
 
-Image Capture uses `script-gallerydl.ps1` and `gallery-dl.exe`. It is intended for supported image posts, galleries, albums, and collection pages where one submitted URL may resolve to many individual files. The image output template is relative to the case `media` folder. Case/context tags resolve when a job is created, while gallery-dl fields such as category, subcategory, ID, filename, and extension resolve per item.
+Image Capture uses `script-gallerydl.ps1` and `gallery-dl.exe`. It is intended for supported image posts, galleries, albums, and collection pages where one submitted URL may resolve to many files. The URL box takes priority over Input File(s). The image template is relative to the case `media` folder; case tags resolve when the job is created, while gallery-dl fields such as category, subcategory, ID, filename, and extension resolve per item.
 
-The tab provides controls for:
+**Capture mode**
 
-- normal media capture or metadata-only collection
-- gallery-dl metadata, info JSON, and tag sidecars
-- case archive use, archive bypass, or deliberate force re-capture
-- maximum item counts and gallery-dl item ranges
-- pacing presets, retry count, request timeout, and Image Capture concurrent jobs
-- cookies, proxy settings, domain presets, and stable/dev gallery-dl update checks
+- **Download images/files and selected metadata** downloads supported items and writes the enabled sidecars.
+- **Metadata/artifacts only** uses gallery-dl simulation/JSON output without downloading the image files. Use it to test extractor support, inspect scope, or collect available metadata before a larger capture.
 
-Item limits and ranges are especially useful for very large galleries: they reduce accidental over-collection and make a test capture easier to review before committing to the full source. Metadata-only mode can confirm extractor support and capture available records without downloading the image files themselves. Sidecar availability still depends on the site and gallery-dl extractor.
+**Metadata sidecars**
 
-The normal case archive is `manifests\gallery-dl-archive.sqlite3`. When the app-level **Universal Download Archive** is enabled, WAVI instead uses the shared `universal-gallerydl-archive.sqlite3` for cross-case duplicate avoidance. Continuing an interrupted Image job resubmits its original URLs and relies on the active gallery-dl archive to skip completed items. This differs from Audio/Video and Webpage recovery, which can continue from the first URL not marked complete.
+- **Per-file metadata JSON** records metadata associated with individual downloaded items where the extractor supplies it.
+- **Gallery-level info JSON** records broader gallery or source information where supported.
+- **Tags text files** writes available tags in a simple text form.
 
-Typical case output is organized as:
+Sidecar availability and contents depend on the site and its gallery-dl extractor. A checked option does not guarantee that every source provides that data.
+
+**Item limits and ranges**
+
+- **Limit max items** converts the selected number into a range beginning at item 1.
+- **Use item range** accepts gallery-dl range syntax such as `1-25`.
+- When both are enabled and contain values, **item range takes precedence** over maximum items.
+
+Use a small range for unfamiliar or very large galleries. This reduces accidental over-collection and provides a manageable test of the filename template and metadata output.
+
+**Archive modes**
+
+- **Use case gallery-dl archive** records completed items in `manifests\gallery-dl-archive.sqlite3` and skips matching items on later case runs.
+- **Ignore archive for this run** performs the run without archive-based skipping or recording for that run.
+- **Force re-capture** passes gallery-dl's no-skip behaviour so matching files can be collected again deliberately.
+
+When app-level **Universal Download Archive** is enabled, Image Capture uses `universal-gallerydl-archive.sqlite3` for cross-case duplicate avoidance instead of the case archive. Archive records identify prior successful items; they are not substitutes for artifacts in the current case.
+
+**Pacing presets**
+
+| Preset | General sleep | Per-request sleep | HTTP 429 sleep |
+|---|---:|---:|---:|
+| **Fast** | none added | none added | tool default |
+| **Normal** | 1 to 3 seconds | 0.5 to 1.5 seconds | 60 seconds |
+| **Cautious** | 3 to 8 seconds | 1 to 3 seconds | 120 seconds |
+
+Use **Normal** for routine work. **Fast** is useful only when the source and policy permit rapid requests. **Cautious** is preferable for sensitive, unstable, or rate-limited sources.
+
+**Retries, timeout, and concurrency**
+
+- **Retries** controls gallery-dl retry attempts; the default is 4 and the accepted range is 1 to 100.
+- **Timeout seconds** controls the HTTP timeout; the default is 30 seconds and the accepted range is 10 to 900 seconds.
+- **Concurrent captures** controls separate active Image queue jobs, from 1 to 4. It does not split one gallery across multiple workers, and WAVI checks for same-domain collisions.
+
+Raising retries and concurrency can prolong a failing job or increase rate limiting. A larger timeout can help slow servers but also makes unreachable URLs take longer to fail.
+
+**Templates and output organization**
+
+The default template is:
+
+```text
+%category%/%subcategory%/%id%_%filename%.%extension%
+```
+
+Use the preview below the template to confirm the expected relative path before capture. Keep identifiers in the template where possible so similarly named gallery items do not overwrite one another.
+
+Typical output:
 
 ```text
 <case>\
@@ -430,7 +532,11 @@ Typical case output is organized as:
     gallery-dl-sha256-manifest_<timestamp>.csv
 ```
 
-Unsupported-source reports, failed/captured URL tracking, and manifests help explain what gallery-dl attempted, but successful download status still needs to be reviewed in context. A cookies file may provide an approved authenticated session; it does not bypass login requirements, challenges, extractor limitations, or source-platform restrictions.
+Image recovery is archive-backed: continuing an interrupted Image job resubmits the original URLs and relies on the active gallery-dl archive to skip completed items. This differs from Audio/Video and Webpage recovery, which can continue from the first URL not marked complete.
+
+After a successful direct or queued Image capture, **Copy Case Summary** provides a plain-text summary of submitted URLs, case and archive paths, file counts, gallery-dl version, templates, capture mode, metadata outputs, item limits, pacing, retries, timeout, concurrency, cookies, proxy, and VPN state. Its **▼** menu copies or exports Image-only captured and failed URLs for the case; failed-URL actions remain available after an unsuccessful run. Completed queue-job summaries can also be copied from the Job Queue.
+
+Cookies, proxy settings, domain presets, and gallery-dl stable/dev update checks remain available. A cookies file can provide an approved session but cannot bypass login requirements, bot challenges, unsupported extractors, or source restrictions.
 
 ### Webpage Capture
 
@@ -438,11 +544,12 @@ Webpage Capture uses `script-webcapture.ps1`, `script-webcapture.ts`, `deno.exe`
 
 The tab follows the same compact options workflow as the other capture tabs:
 
-- **Capture Options** opens a collapsible overlay for PNG mode, viewport size, load timing, lazy-load scrolling, concurrency, and cookie scope. **Requested site only** imports cookies applicable to the submitted hostname; **Entire cookies file** imports every valid row for redirect and SSO compatibility.
+- The URL box uses the same twelve-button toolbar as Audio/Video and Image Capture: **Load**, **Append**, **Save**, **Clear**, **Strip**, **Copy**, **Failed/All**, **Group**, **Statistics**, **Normalize**, **Duplicates**, and **Validate**. Webpage capture classifications update the shared `gui-captured-urls.txt` and `gui-failed-urls.txt` history files under the selected Output Root, allowing **Failed** to filter the current webpage URL set without reading the output log.
+- **Capture Options** opens a five-tab overlay. The **Capture** tab selects full-page, initial-viewport, or combined output; PNG, JPEG, or WebP encoding; JPEG/WebP quality; capture-stage retries; and concurrency. The **Readiness** tab controls the navigation milestone, maximum navigation duration, network-quiet duration and settling limit, optional CSS-selector and literal-text conditions, a shared condition timeout, an additional final wait, and the action taken when a readiness check times out. The **Scrolling & Stability** tab controls bounded lazy-load scrolling, continued-growth detection and its outcome, safe single-image and segmented-capture limits, segment overlap, final page remeasurement, animation/transition and scrollbar stabilization, and fixed/sticky-element handling. The **Environment & State** tab provides desktop, tablet, mobile, and custom browser-environment presets; viewport, device scale, mobile-layout, touch, and orientation controls; locale, timezone, colour-scheme, and reduced-motion preferences; cache, service-worker, reload, site-storage, and between-URL cookie controls. The **Evidence Outputs** tab adds optional MHTML, final-response HTML, serialized rendered DOM, sanitized network, failed-request, console, and TLS/browser-security reports, plus failure screenshot/metadata collection after a final capture failure. Network evidence omits request bodies, redacts sensitive headers, and can redact query-string values. **Requested site only** imports cookies applicable to the submitted hostname; **Entire cookies file** imports every valid row for redirect and SSO compatibility.
 - **PDF Options** opens a compact tabbed overlay with **Source & Output**, **Page Layout**, and **Header & Footer** sections. The Close button remains in a fixed footer so it stays visible on shorter displays. The overlay supports two PDF sources: **Live Page (searchable)** for Chromium `Page.printToPDF` output and **Captured PNG (visual match)** for image-based PDF output built from the captured PNG. Live Page also includes layout choices for handling repeated fixed or sticky webpage overlays.
 - Opening either options panel closes the other; the arrow indicator changes while a panel is open, and closing a panel saves the current settings.
-- A semicolon-delimited summary appears beside the two buttons and includes the active capture, scrolling, concurrency, cookies-file state, and PDF settings.
-- **Case Name** and **Filename Template** provide **Insert Tag** menus. The filename preview reflects full-page versus viewport naming and shows the optional PDF filename when PDF output is enabled.
+- A semicolon-delimited summary appears beside the two buttons and includes capture mode, image encoding and quality, capture retries, the active readiness strategy, scrolling, concurrency, cookies-file state, and PDF settings.
+- **Case Name** and **Filename Template** provide **Insert Tag** menus, including `%engine%`, which resolves to `webpage` on this tab. The filename preview reflects full-page, initial-viewport, or combined output, uses the selected image extension, and shows the optional PDF filename when PDF output is enabled.
 
 The first-version security boundary is intentionally narrow:
 
@@ -455,7 +562,23 @@ The first-version security boundary is intentionally narrow:
 - no `--no-sandbox`, certificate-error bypass, security disabling, or LAN-exposed debugging port
 - Deno receives only the subprocess, loopback-network, selected app/case paths, and explicitly selected cookies-file read permission needed for the run
 
-Full-page mode waits for the page load event, allows an additional settling delay, optionally scrolls in bounded steps to trigger lazy content, measures the page, and uses the browser's DevTools screenshot function. Visible-viewport mode captures only the configured viewport. Optional PDF output now has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. For this mode, Deno temporarily serves the generated image-only document and PNG slices from a randomized endpoint bound only to `127.0.0.1`; the endpoint is shut down immediately after PDF creation and does not upload the images externally. If a page exceeds the configured safe single-image dimensions or pixel count, the helper captures numbered vertical PNG segments, records them in the sidecar, and can use those same segments as the source for Captured PNG PDF output.
+Before visual capture, Webpage Capture waits for either the DOM-content-loaded event or the full browser load event, according to the selected **Readiness event**. It then performs an optional bounded network-quiet check, waits for any enabled CSS-selector and/or literal-text conditions within one shared timeout, applies the selected timeout action, and finally applies the configured additional wait. A maximum network-settling value of `0` disables that stage. Selector waits can require that the element merely exists or is visibly rendered; text waits can search visible rendered text or complete DOM text. Matching is literal and case-sensitive. Invalid selectors and navigation command failures always fail the URL.
+
+The **Environment & State** tab defaults to **Desktop 1440 × 900**, device scale `1.0`, desktop layout, no touch emulation, landscape orientation, browser-default locale/timezone/colour scheme, and no reduced-motion override. Presets are convenience bundles for viewport, scale, mobile layout, touch, and orientation; changing any of those values makes the selection **Custom**. Tablet and mobile presets do not claim to reproduce a named physical device and do not replace Chromium's normal user agent. The effective preset and every underlying environment value are recorded in the sidecar. Locale accepts BCP 47-style values such as `en-CA`; timezone accepts IANA-style values such as `America/Toronto`.
+
+Before each URL, WAVI applies the selected cache and service-worker policy, optionally clears isolated site storage, optionally clears the isolated browser cookie store, imports the selected Netscape cookies, and then navigates. **Disable browser cache** is enabled by default; service-worker bypass and reload-without-cache are disabled by default. Site-storage handling can keep storage, clear only the requested origin, or clear all origins visited earlier in the same run. Storage clearing excludes cookies and runs before cookie import. **Clear browser cookies before each URL** is enabled by default and applies even when no cookies file is selected; disabling it explicitly allows cookies created by one URL to remain available to later URLs in the same isolated run. Normal browser profiles are never used.
+
+When **Reload once without cache** is enabled, WAVI completes the configured readiness cycle for the initial navigation, reloads the page with Chromium's cache bypass, and performs the readiness cycle again before capture. The sidecar records both cycles, cache and service-worker state, storage origins cleared, whether cookies were cleared before import, and the final effective browser environment.
+
+Full-page mode can scroll in bounded steps to trigger lazy content and stop after stable-height checks, the configured time limit, or a continued-growth cycle limit. If a page keeps growing, WAVI can capture the loaded portion as **Partial**, capture it as **Complete with warnings**, or fail the URL. The helper remeasures the page immediately before capture when enabled. User-configurable single-image height and pixel limits remain bounded by WAVI's hard safety ceilings; pages beyond those limits are captured as numbered vertical segments using the selected segment height, overlap, and maximum count. Reaching the scroll-time or segment-count limit marks the result partial rather than silently treating an incomplete page as a complete capture.
+
+Optional stabilization can disable CSS animations, disable CSS transitions, hide scrollbars, and preserve, neutralize, or hide likely fixed/sticky navigation elements. These changes apply only during visual image capture, are removed afterward, and are recorded as presentation-altering actions. Initial-viewport mode captures the configured viewport before lazy-load scrolling. Combined mode saves both views in the same run. PNG remains the lossless default; JPEG and WebP use the selected quality value and are recorded as lossy in the sidecar. Capture-stage failures can be retried up to two times; each retry re-navigates the URL and rebuilds the temporary page state before another visual-capture attempt.
+
+Optional PDF output has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. This PDF source requires PNG image output; JPEG and WebP remain available with Live Page PDF or without PDF. For this mode, Deno temporarily serves the generated image-only document and PNG slices from a randomized endpoint bound only to `127.0.0.1`; the endpoint is shut down immediately after PDF creation and does not upload the images externally. If segmentation is intentionally bounded, Captured PNG PDF uses only the successfully captured image height rather than generating blank pages for the uncaptured remainder.
+
+The **Evidence Outputs** tab creates supplemental artifacts only when selected. MHTML is generated through Chromium's page-snapshot capability. **Final response HTML** stores the final main-document response body when Chromium still exposes it and the response is HTML; **serialized rendered DOM** records the browser-mutated DOM after readiness and page preparation. The sanitized network report is capped at 5,000 records and the failed-request report at 1,000 records. `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` headers are redacted, request bodies are never recorded, URL fragments and embedded credentials are removed, and query values are redacted by default. Choosing complete query strings is explicit because URLs may contain sensitive tokens or identifiers. Console output is limited to warnings, errors, and uncaught exceptions, capped at 500 entries. Console and exception URLs follow the selected query handling, but page-supplied console message text may itself contain sensitive content and should be reviewed before sharing. TLS/browser-security output records available certificate, protocol, secure-context, mixed-content, and Chromium security-state details without bypassing certificate errors.
+
+**Save failure screenshot and failure metadata** is enabled by default. After the final configured attempt fails, WAVI tries to save the browser's current viewport plus a `.webcapture-failure.json` record containing the URL reached, page title, error, browser details, screenshot result, and available security metadata. Failure evidence does not mark the URL complete. A selected supplemental output that fails is recorded as a requested-artifact failure and leaves the URL incomplete for queue/recovery instead of being silently omitted.
 
 Typical output is:
 
@@ -463,8 +586,18 @@ Typical output is:
 <case>\
   media\
     web\
-      <name>.png
+      <name>_full.png | .jpg | .webp
+      <name>_viewport.png | .jpg | .webp
       <name>_print.pdf
+      <name>.mhtml
+      <name>.response.html
+      <name>.rendered.html
+      <name>.network.json
+      <name>.failed-requests.json
+      <name>.console.json
+      <name>.security.json
+      <name>.failure.png
+      <name>.webcapture-failure.json
       <name>.webcapture.json
   logs\
     web-capture_<timestamp>.log
@@ -472,7 +605,9 @@ Typical output is:
     sha256-manifest-web_<timestamp>.csv
 ```
 
-The JSON sidecar records the requested and final URLs, redirect chain, main-document status and headers, page title, browser/version, viewport and content dimensions, timing, scrolling result, non-sensitive cookie-import counts when enabled, PDF settings, the selected PDF capture mode, any live-webpage behavior results, paginated-PNG PDF layout details when used, console/page warnings, output files, and SHA256 hashes. When PDF output is requested but the browser cannot create it, the URL is left incomplete for queue/recovery purposes rather than being marked fully successful. The screenshot is a rendered visual capture of what the selected browser presented at the recorded time; it is not a server-side archive or an authenticity determination.
+After a successful direct or queued Webpage capture, **Copy Case Summary** provides a plain-text summary of submitted URLs, case paths, file counts, capture-completeness totals, Deno and browser versions, visual output settings, environment, readiness, scrolling, PDF and evidence-output choices, archive state, concurrency, cookies, proxy, and VPN state. Its **▼** menu copies or exports Webpage-only captured and failed URLs for the case; failed-URL actions remain available after an unsuccessful run. Completed queue-job summaries can also be copied from the Job Queue.
+
+The JSON sidecar records the requested and final URLs, redirect chain, main-document status and headers, page title, browser/version, effective environment preset, viewport, device scale, mobile/touch/orientation state, locale, timezone, colour scheme, reduced-motion preference, cache and service-worker policy, storage-clearing actions, between-URL cookie clearing, no-cache reload cycles, viewport and content dimensions, detailed readiness timing and outcomes, readiness timeout actions, selector/text condition results, page measurements before and after scrolling, scrolling termination and growth-limit results, configured and effective segmentation limits, segment overlap and truncation, visual-stabilization actions and affected-element counts, selected image format and quality, capture attempt and prior retry errors, non-sensitive cookie-import counts when enabled, PDF settings, the selected PDF capture mode, any live-webpage behavior results, paginated-PNG PDF layout details when used, requested Evidence Outputs and their completion/errors, available browser security metadata, console/failed-request/network counts, output files, SHA256 hashes, and the final **Complete**, **Complete with warnings**, **Partial**, or **Failed** capture-completeness classification. When PDF output is requested but the browser cannot create it, the URL is left incomplete for queue/recovery purposes rather than being marked fully successful. A partial but successfully bounded visual capture is marked complete for queue/recovery while remaining explicitly classified as partial in the log and sidecar. The screenshot is a rendered visual capture of what the selected browser presented at the recorded time; it is not a server-side archive or an authenticity determination.
 
 Browser automation can still be blocked by enterprise browser policy, Defender for Endpoint, WDAC/AppLocker, ASR, or Controlled Folder Access. The tab's preflight is designed to test the isolated-profile and loopback-debugging workflow before a capture starts.
 
@@ -486,7 +621,7 @@ Recovery behavior is engine-specific:
 
 - **Audio/Video Capture (`yt-dlp`)** records completed URL markers. Continuing an interrupted job submits the first incomplete URL and anything after it.
 - **Image Capture (`gallery-dl`)** uses archive-backed retry. Continuing an interrupted image job resubmits the original URLs and lets the case archive, or the image universal archive when enabled, skip completed items.
-- **Webpage Capture** records completed URL markers. Continuing an interrupted job starts with the first webpage URL not marked complete. When Universal Download Archive is enabled, previously successful submitted or final redirected URLs are also skipped across cases.
+- **Webpage Capture** records completed URL markers and per-URL **Complete**, **Complete with warnings**, **Partial**, or **Failed** classifications in its queue/recovery state. Continuing an interrupted job starts with the first webpage URL not marked complete. When Universal Download Archive is enabled, previously successful submitted or final redirected URLs are also skipped across cases.
 
 Concurrent queue behavior:
 
@@ -530,7 +665,9 @@ Common state files:
 - `universal-download-archive.txt`, `universal-gallerydl-archive.sqlite3`, and `universal-webcapture-archive.sqlite3` when universal archives are enabled
 - case-level `manifests/gui-job-recovery-<job-id>.json` files for recovery details
 
-The **Default** profile loads on startup. Custom profiles can be managed from the Profile menu.
+The **Default** profile is used on first launch. After that, WAVI restores the last selected profile at startup. Capture-setting changes are saved back to the active profile during autosave, when switching profiles, and when the app closes, so custom-profile edits no longer flow into **Default**. Use **Profile > Save Current Settings to Profile...** to create a new profile or deliberately overwrite an existing one.
+
+The last selected main tab, the main window's normal size and position, and whether the window was maximized are app-level settings and are restored at startup. WAVI never reopens minimized. Invalid or off-screen saved geometry is bounded to the current display so the window remains accessible.
 
 `python gui.py --fresh` clears app settings/state files, Job Queue persistence, URL-box persistence, app-owned temp files, the app debug log, universal archives, GUI cache folders under known Output Roots, and narrow app-owned atomic write temp files. It also reads saved Job Queue state before deleting it so older job-only Output Roots can be cleaned. It does not delete captured case folders, media files, cookies, binaries, scripts, case logs, manifests, or case-specific capture archives.
 
@@ -543,9 +680,11 @@ Cookies can help with approved authenticated captures or previews, but they are 
 The app can:
 
 - use a selected cookies file for Audio/Video Capture, Image Capture, Webpage Capture, and Audio/Video Preview when enabled
-- export browser cookies through yt-dlp's supported cookie export flow
+- export Mozilla Firefox cookies through yt-dlp's supported `--cookies-from-browser` flow
 - optionally encrypt or decrypt local cookies files
 - delete selected Audio/Video, Image Capture, and/or Webpage Capture cookies files on exit when configured
+
+The built-in exporter targets Mozilla Firefox only. Run WAVI as the same Windows user who is signed into Firefox, and close Firefox if profile locking prevents export. Chromium-based browser cookie export is not offered because it may require additional system-specific decryption setup. Cookies files produced by compatible browser extensions can still be selected manually.
 
 The app does not collect credentials or automate website logins. Webpage Capture accepts standard Netscape cookies files and records counts rather than cookie names or values. **Requested site only** is the default and imports cookies applicable to the submitted hostname. **Entire cookies file** loads every valid row into the isolated temporary browser for redirect and SSO compatibility, which may make authenticated cookies available to additional matching domains contacted during the capture. Cookies do not include local storage, IndexedDB, service-worker state, device-bound tokens, or every modern partitioned-cookie attribute, so some authenticated sites may still fail.
 
@@ -557,7 +696,7 @@ The app does not collect credentials or automate website logins. Webpage Capture
 - Universal archive skips can reflect captures from other cases by design. For Webpage Capture, the same URL may present changed content later; disable Universal Download Archive when a deliberate fresh capture is required.
 - Browser impersonation depends on the installed `yt-dlp` build and may be blocked by endpoint policy.
 - Webpage Capture may be blocked when browser remote debugging, developer tools, Deno child-process launches, loopback automation, or writes to the selected Output Root are restricted by enterprise policy.
-- Infinite feeds, virtualized lists, canvas/WebGL content, animations, autoplaying video, bot challenges, login/MFA flows, and pages that detect headless automation may be incomplete or unavailable.
+- Infinite feeds, virtualized lists, canvas/WebGL content, animations, autoplaying video, bot challenges, login/MFA flows, and pages that detect headless automation may be incomplete or unavailable. Environment presets are controlled browser emulation settings, not proof of an exact physical device or network location.
 - Webpage Capture does not automatically dismiss banners, expand controls, accept consent, or interact with page content.
 - Proxy/VPN behavior depends on local routing, policy, and source-platform handling.
 - Case Browser thumbnails and media details generally require FFmpeg/FFprobe.
@@ -566,249 +705,4 @@ The app does not collect credentials or automate website logins. Webpage Capture
 
 ## Changelog
 
-### v2.2026.0713 - Webpage Cookies, Archives, and Browser Selection
-
-- Added cookies-file support to Webpage Capture using the isolated temporary browser profile.
-- Added selectable cookie scope for requested-site cookies or the entire cookies file.
-- Extended the Universal Download Archive to Webpage Capture with a separate SQLite archive and skip reports.
-- Replaced Browser Path with an editable dropdown that detects installed Chromium-based browsers and supports manual paths.
-- Updated in-app repository, release, and update-check links for the renamed WAVI project.
-
-### v2.2026.0711 - WAVI and Webpage Capture
-
-- Renamed the app to **WAVI Capture GUI for OSINT**, with the full name **Webpage/Audio/Video/Image Capture GUI for OSINT**.
-- Added a full **Webpage Capture** workflow using Deno and an isolated Edge/Chrome profile for full-page or viewport PNG captures.
-- Added optional PDF output with **Live Page** and **Captured PNG** modes, configurable page layout, margins, headers, and footers.
-- Integrated Webpage Capture with preflight checks, case naming, filename templates, Job Queue persistence/recovery, manifests, and metadata sidecars.
-- Improved handling of very long webpages with segmented PNG capture and reliable image-based PDF generation.
-
-### v1.2026.0628 - Stability, Recovery, and Large Capture Polish
-
-- Improved overall GUI responsiveness, scrolling, shutdown handling, and background task stability.
-- Improved Job Queue performance and recovery clarity, including clearer direct-capture recovery jobs, queue filtering, and better handling of interrupted work.
-- Improved large capture handling for Audio/Video and Image workflows, including more efficient logging, safer state saving, and better performance with large URL lists.
-- Improved Case Browser performance for large folders with compact list handling, safer card rendering, better scrolling, and lazy hover previews for media thumbnails.
-- Improved Audio/Video Preview behavior for large URL lists with clearer safeguards before loading heavy previews.
-- Improved `--fresh` cleanup so it removes more app-created cache, temp, debug, and stale state files without deleting captured case output.
-- Refreshed README setup, launch, recovery, and basic usage guidance for non-technical users.
-- Increased the default GUI height to better fit the current layout.
-- Cleaned up duplicated/internal GUI logic and removed Windows-irrelevant scroll handling.
-
-### v1.2026.0626 - AVI Capture, Image Capture, and Dual-Engine Queueing
-
-- Renamed the app from **yt-dlp GUI for OSINT** to **AVI Capture GUI for OSINT**, with the full name **Audio/Video/Image Capture GUI for OSINT**.
-- Added a full **Image Capture** workflow powered by `gallery-dl`, including its own tab, PowerShell script, URL/input handling, case naming, filename templates, cookies, output root, preflight checks, capture options, and output log.
-- Added `script-gallerydl.ps1` for gallery-dl captures, with app-local temp handling, input/error files, metadata sidecars, item limits, pacing, retries, timeout, archive modes, cookies, and proxy support.
-- Renamed **URL Preview** to **Audio/Video Preview** to separate yt-dlp preview workflows from gallery-dl Image Capture workflows.
-- Expanded the shared **Job Queue** to support both `yt-dlp` and `gallery-dl` jobs, including Add Current selection, highlighted-job actions, persistence, interruption recovery, per-job recovery manifests, and engine-aware resume behavior.
-- Added recoverable direct-capture tracking when Job Persistence is enabled, so interrupted direct Audio/Video and Image captures can be continued from the Job Queue.
-- Added separate universal archive handling for Audio/Video and Image Capture, using `universal-download-archive.txt` for yt-dlp and `universal-gallerydl-archive.sqlite3` for gallery-dl.
-- Added gallery-dl version checking and update support matching the yt-dlp update workflow.
-- Expanded Domain Presets, Proxy Options, VPN checks, case-folder collision checks, and domain-collision detection across both capture workflows.
-- Added separate concurrent-capture settings for Audio/Video and Image Capture, allowing yt-dlp and gallery-dl jobs to run alongside each other while guarding against same-domain concurrent captures.
-- Added Image Capture support to Case Browser, URL history clearing, cookie cleanup, settings/profile persistence, reset-defaults behavior, and README guidance.
-- Cleaned up deprecated code paths and fixed parity/stability issues around queue validation, output-template handling, universal archive state, duplicate helpers, and settings migration.
-
-### v0.2026.0623 - URL Preview Filters and Case Browser Polish
-
-- Added in-memory filters for URL Preview URL rows, playlist/context item rows, and Case Browser file cards, with visible-row counts and clearer empty-state/status messages.
-- Added context-sensitive URL Preview actions that switch from **All** to **Visible** when filters are active and apply only to currently visible rows.
-- Improved case-folder handling so cache-only preview folders do not appear as captured cases or trigger existing-case warnings.
-- Added a URL Preview cache-clearing action for temporary and reusable preview caches.
-
-### v0.2026.0621 - URL Preview, Universal Archive, and Cache Handling
-
-- Replaced **Playlist Preview** with a broader **URL Preview** workflow for metadata preview, thumbnail preview, playlist/context item review, JSON export, and preview-derived start/queue actions.
-- Added profile-level URL Preview options for preview pacing, thumbnail mode, thumbnail rate limiting, cache mode, playlist mode, max items, and preview timeout.
-- Added playlist-aware URL Preview start/queue behavior, including expansion of confirmed playlist/context rows to extracted item URLs and `%playlist%` case-name support.
-- Added optional **Universal Download Archive** skip logging and per-run skip summaries for direct captures and queued jobs.
-- Added temporary and reusable URL Preview thumbnail cache modes, with Output Root `.gui-cache` treated as temporary and cleared by `--fresh`.
-- Improved cache handling so case-level `.gui-cache` folders are hidden from Case Browser and excluded from verification/manifests.
-
-### v0.2026.0616 - Playlist Preview, URL Persistence, and Case Browser Polish
-
-- Added the **Playlist Preview** tab with manual checked/selected preview scans, request pacing, rate-limit/backoff warnings, playlist/item checkmarks, playlist-split queueing, JSON export, and context menus.
-- Added `%playlist%` case-name tag support and automatic playlist-title case naming for Playlist Preview queue jobs.
-- Added app-level **URL Box Persistence**, silent Input File auto-population when the URL box is empty, and `--fresh` cleanup for persisted URL-box state.
-- Changed default app startup behavior so **Check VPN** and **Use Cookies File** are disabled by default.
-- Improved the **Case Browser** with better filename wrapping and dynamic file-card columns that reflow with available pane width.
-- Refreshed README usage sections around the four main tabs while keeping prior changelog entries intact.
-
-### v0.2026.0614 - Tabs, Presets, Proxy, and Output Records
-
-- Added a bottom-tab workflow for **Capture**, **Job Queue**, and **Case Browser**, with Case Browser loading the selected Output Root in the background and supporting Domain sort.
-- Expanded input and queue workflows with multiple Input Files, queue checkmarks, Start Selected, split-and-add-to-queue, persisted jobs, interrupted job handling, and clearer active preset visibility.
-- Reworked Domain Presets so presets use names plus one or more match domains, support priority ordering, import conflict choices, and expose matching preset information in the queue.
-- Added app-level Proxy Options with protocol/address/port/credential fields, optional session-only storage, script-side proxy validation, and masked proxy logging.
-- Added Output Records controls for Case Browser cache timing and file manifest scope; script success now follows yt-dlp results while cache warnings remain non-fatal.
-- Improved responsiveness and cleanup by moving Case Browser scans/cache work off the main UI path, chunking large Case Browser renders, deferring startup work, and removing stale hidden UI/menu code.
-
-### v0.2026.0612 - Queue, URL Workflow, and Advanced Controls
-
-- Added concurrent queue execution with domain-collision checks and queue-aware Start Capture behavior.
-- Added failed/captured URL tracking, URL validation/statistics/grouping tools, and failed URL queueing.
-- Added concurrent fragments, expanded request pacing options, and refined Advanced Options layout.
-- Added Load versus Append URL behavior, duplicate removal, queue horizontal scrolling, and updated case name time tags.
-- Reorganized README usage sections and expanded screenshot references.
-
-### v0.2026.0611 - Job Queue and Summary Refinements
-
-- Added a sequential Job Queue window with queued job controls, URL-based progress, completed-job summary copying, and non-active job clearing.
-- Added a Start Capture split-menu action to add the current configuration to the queue.
-- Changed queued jobs to run from snapshotted job settings without rewriting the visible main GUI fields.
-- Changed the default case name template to `Case-%datetime%`.
-- Updated URL box saving to always prompt with a Save As dialog.
-- Refined case summaries and verification so manifest files are counted in summaries while `.gui-cache` and `manifests` remain outside verification scope.
-
-### v0.2026.0529 - URL Controls, Cookie Scope, Download Limits, and Verification Scope
-
-#### URL Box Workflow
-
-- Added one-word URL box buttons for Load, Save, Clear, and Strip.
-- Changed URL loading so input file contents append to the existing URL box instead of replacing it.
-- Removed URL load, save, and clear commands from the File menu.
-- Refined the optional Strip action to decode common HTML ampersands and remove parameter-like ampersand segments.
-
-#### Cookies and Profiles
-
-- Added a profile-level Use Cookies File setting.
-- Added a Cookies File row checkbox that disables the path field and Browse button when cookies are not in use.
-- Made preflight and capture skip cookies file validation and `-CookiesFile` passing when Use Cookies File is disabled.
-- Changed browser cookie export to use `https://example.com/` as the generic reference URL.
-- Removed the separate Load Default Profile command because Default is already available from the profile selection list.
-
-#### Advanced Capture Controls
-
-- Added an Advanced Options download speed limit control with disabled as the default.
-- Added download speed presets including 500K, 1M, 2M, 5M, 10M, and 50M.
-- Added custom download speed limit support for yt-dlp `--limit-rate` values.
-- Changed yt-dlp nightly build querying from 30 releases to 20 releases.
-
-#### PowerShell Capture Script
-
-- Added PowerShell support for passing yt-dlp `--limit-rate` when a download speed limit is selected.
-- Removed yt-dlp `--sleep-interval` and `--max-sleep-interval` while keeping `--sleep-requests` and the script-level pause between URLs.
-- Added logging for whether a cookies file is provided or disabled.
-
-#### Case Browser Verification
-
-- Excluded `.gui-cache` and `manifests` from SHA256 manifest generation and verification scope.
-- Updated case file verification to ignore `.gui-cache` and `manifests` paths, including older manifests that may reference cache files.
-- Changed Verify Case Files so Output Root cannot be verified directly; users must select a case folder or one of its subfolders.
-
-### v0.2026.0528 - Workflow Polish, Preflight Validation, and Case Browser Refinements
-
-#### App Workflow and Update Checks
-
-- Added Help menu entries for About and Check for Updates.
-- Added GitHub latest-release lookup for app updates without downloading, extracting, replacing, or running files.
-- Updated the app version to `v0.2026.0528`.
-
-#### Case Naming and Case Safety
-
-- Added case name templates with an Insert Tag menu and default `Case-%date%` naming.
-- Added resolved case folder preview under the Case Name field.
-- Added a warning before using an existing populated case folder.
-
-#### Preflight and Logging
-
-- Changed Preflight Check to append to the output log instead of clearing previous entries.
-- Added preflight execution/version checks for yt-dlp, FFmpeg, FFprobe, and Deno.
-- Updated the yt-dlp version status label when preflight confirms yt-dlp is runnable.
-- Reduced unnecessary settings and Dark Mode log noise.
-
-#### Case Browser Improvements
-
-- Added Case Browser filter, sort, current-folder-only view, and icon scale preferences.
-- Added horizontal scrolling and Small, Medium, and Large icon scale options.
-- Added right-click actions for file cards, including open, open folder, open related metadata, open related source link, and copy path/name actions.
-- Added case file verification against the latest SHA256 manifest.
-
-#### Settings and Appearance
-
-- Added settings schema migration with recognized-value import, default creation for newer settings, and preservation of unrecognized values.
-- Added app-level Dark Mode using built-in Tk/ttk styling only.
-- Added app-level Delete Settings File option with confirmation and reset behavior.
-- Saved Case Browser preferences as app-level settings.
-
-### v0.2026.0527 - Advanced Capture, App Settings, and Case Browser
-
-#### Capture Options and Advanced Options
-
-- Added archive mode controls for using the case download archive, ignoring the archive for a run, or forcing a re-capture.
-- Added date filters for capture date after and date before values.
-- Added max resolution presets.
-- Added playlist metadata capture when playlist or multi-item capture is enabled.
-- Added Windows URL shortcut generation.
-- Added match and reject keyword filters with clear buttons.
-- Added failure handling options to continue after failed URLs or stop on the first failed URL.
-- Moved rate limit controls into the Advanced Options panel.
-- Added keep partial files/fragments on failure.
-- Preserved persistent settings and profile support for the new capture options.
-
-#### PowerShell Capture Script Changes
-
-- Added PowerShell handling for archive mode, date filters, max resolution, playlist metadata, URL shortcuts, keyword filters, failure handling, rate limits, and partial-file retention.
-- Added FFmpeg-driven GUI thumbnail generation at the end of each URL capture, independent of the capture thumbnail checkbox.
-- Added FFprobe-driven media information caching at the end of each URL capture.
-- Fixed single-URL input handling so one pasted URL is treated as one URL instead of being indexed as individual characters.
-- Continued keeping yt-dlp updating separate from the capture script.
-
-#### Case Browser
-
-- Added `Tools > Open Case Browser`.
-- Added a separate case browser window with a folder tree for the selected Output Root.
-- Added media and sidecar file cards for selected folders.
-- Added double-click file opening from the case browser.
-- Added an `Open Folder` button for the selected folder.
-- Added single-click folder behavior that expands the selected tree item and shows its contents.
-- Added FFmpeg-generated PNG thumbnails stored in `.gui-cache\thumbnails`.
-- Added FFprobe-generated media metadata stored in `.gui-cache\metadata`.
-- Added case browser card summaries and hover tooltips with media details such as duration, size, bitrate, codec, resolution, frame rate, audio channels, and sample rate.
-- Added fallback placeholders when thumbnails or media information cannot be generated.
-
-#### Settings and Profiles
-
-- Added app-level `Delete Cookies on Exit` setting under the Settings menu.
-- Added app-level `Check VPN` setting under the Settings menu.
-- Made `Delete Cookies on Exit` and `Check VPN` save to the settings file but not to individual profiles.
-- Made `Check VPN` show or hide the VPN Status section.
-- Made Start Capture skip the VPN warning when `Check VPN` is disabled.
-- Disabled VPN-related Tools menu actions when `Check VPN` is disabled.
-- Changed custom profile saving so saving a custom profile no longer overwrites the Default profile.
-
-#### Impersonate Target Handling
-
-- Added `Show all targets` behavior for impersonate target discovery.
-- Kept the main yt-dlp-supported browser choices visible: `chrome`, `edge`, and `firefox`.
-- Added OS labels beside discovered impersonate targets when available.
-- Filtered yt-dlp log/status lines such as `[info]` from the target list.
-- Preserved Windows-focused target discovery as the default behavior.
-
-### v0.2026.0526 - yt-dlp Update Workflow and Capture Options Foundation
-
-#### yt-dlp Update Changes
-
-- Removed yt-dlp updating from the normal capture workflow.
-- Removed the previous update checkbox from the main GUI capture options.
-- Added dedicated controls to check the current yt-dlp version and run updates on request.
-- Added a Python-based update dialog that runs independently of the PowerShell script.
-- Added update choices for latest stable, latest nightly, or a selected nightly build from GitHub.
-- Added a warning that very recent nightlies may be blocked by ASR or endpoint protection.
-
-#### Capture Options Foundation
-
-- Replaced the always-visible `Prefer MP4` checkbox with a `Capture Options` button.
-- Moved MP4 preference into the Capture Options panel.
-- Added capture mode options for media capture or metadata/artifacts-only capture.
-- Added source scope options for single-item capture or playlist/multi-item capture.
-- Added sidecar artifact options for metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
-- Added persistent settings and profile support for capture options.
-
-#### PowerShell Capture Script Foundation
-
-- Added support for GUI-driven capture options.
-- Added switches for MP4 preference, metadata-only capture, playlist inclusion, metadata JSON, source links, descriptions, thumbnails, subtitles, automatic subtitles, and comments.
-- Preserved single-item capture by default unless playlist or multi-item capture is explicitly selected.
-- Added FFmpeg folder support through yt-dlp's FFmpeg location option.
-- Kept yt-dlp updating separate from the PowerShell capture process.
+See the [full changelog](CHANGELOG.md).

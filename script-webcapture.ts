@@ -9,7 +9,7 @@ explicitly enabled, it may read a user-selected Netscape cookies.txt file and
 inject either site-applicable cookies or the entire file into the isolated browser session.
 */
 
-const SCRIPT_SCHEMA_VERSION = 1;
+const SCRIPT_SCHEMA_VERSION = 6;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -268,7 +268,7 @@ async function setCookiesInBatches(client, entries) {
   return { accepted, failed };
 }
 
-async function importCookiesForUrl(client, cookieJar, targetUrl, requestedScope) {
+async function importCookiesForUrl(client, cookieJar, targetUrl, requestedScope, options = {}) {
   const scope = normalizeCookieScope(requestedScope);
   if (!cookieJar?.enabled) {
     return {
@@ -296,10 +296,11 @@ async function importCookiesForUrl(client, cookieJar, targetUrl, requestedScope)
   const selectedDomains = new Set(selected.map((cookie) => cookie.domain));
   const siteApplicableDomains = new Set(siteApplicable.map((cookie) => cookie.domain));
 
-  // Each URL begins with a clean cookie store. Site-only mode loads only
-  // cookies applicable to the submitted hostname. Entire-file mode loads all
-  // valid rows so Chromium can carry authentication through redirects and SSO.
-  await client.send("Network.clearBrowserCookies", {}, 15000);
+  // Cookie clearing is normally performed by the Environment & State preparation
+  // stage before import. Keep the historical default here for direct helper use.
+  if (options.clear_first !== false) {
+    await client.send("Network.clearBrowserCookies", {}, 15000);
+  }
   const loadResult = selected.length
     ? await setCookiesInBatches(client, selected)
     : { accepted: 0, failed: 0 };
@@ -348,10 +349,11 @@ function renderFilenameTemplate(template, context) {
     "%date%": `${date.getUTCFullYear()}${p(date.getUTCMonth() + 1)}${p(date.getUTCDate())}`,
     "%time%": `${p(date.getUTCHours())}${p(date.getUTCMinutes())}${p(date.getUTCSeconds())}`,
     "%datetime%": stampUtc(date),
+    "%engine%": "webpage",
     "%domain%": safeFileComponent(context.domain, "unknown-domain", 90),
     "%title%": safeFileComponent(context.title, "untitled", 120),
     "%index%": String(context.index).padStart(3, "0"),
-    "%mode%": context.mode === "viewport" ? "viewport" : "full-page",
+    "%mode%": context.mode === "viewport" ? "viewport" : (context.mode === "both" ? "full-page-and-viewport" : "full-page"),
     "%case%": safeFileComponent(context.caseName, "case", 120),
   };
   let output = String(template || "%datetime%_%domain%_%title%");
@@ -393,6 +395,515 @@ function normalizePdfCaptureMode(value) {
   const mode = String(value || "live_webpage").trim();
   if (["live_webpage", "paginated_png"].includes(mode)) return mode;
   return "live_webpage";
+}
+
+function normalizeCaptureMode(value) {
+  const mode = String(value || "full_page").trim();
+  if (["full_page", "viewport", "both"].includes(mode)) return mode;
+  return "full_page";
+}
+
+function normalizeImageFormat(value) {
+  const format = String(value || "png").trim().toLowerCase();
+  if (["png", "jpeg", "webp"].includes(format)) return format;
+  return "png";
+}
+
+function normalizeImageQuality(value) {
+  return Math.max(1, Math.min(100, Math.round(Number(value) || 90)));
+}
+
+function normalizeOrientation(value) {
+  return String(value || "landscape").trim() === "portrait" ? "portrait" : "landscape";
+}
+
+function normalizeColorScheme(value) {
+  const scheme = String(value || "default").trim().toLowerCase();
+  return ["default", "light", "dark"].includes(scheme) ? scheme : "default";
+}
+
+function normalizeStorageClearMode(value) {
+  const mode = String(value || "none").trim();
+  return ["none", "requested_origin", "all_visited_origins"].includes(mode) ? mode : "none";
+}
+
+function normalizeLocale(value) {
+  const locale = String(value || "default").trim();
+  return !locale || locale.toLowerCase() === "default" ? "default" : locale;
+}
+
+function normalizeTimezone(value) {
+  const timezone = String(value || "default").trim();
+  return !timezone || timezone.toLowerCase() === "default" ? "default" : timezone;
+}
+
+function environmentPresetLabel(value) {
+  return {
+    desktop_1920x1080: "Desktop 1920 × 1080",
+    desktop_1440x900: "Desktop 1440 × 900",
+    desktop_1366x768: "Desktop 1366 × 768",
+    tablet_portrait: "Tablet portrait",
+    tablet_landscape: "Tablet landscape",
+    mobile_portrait: "Mobile portrait",
+    mobile_landscape: "Mobile landscape",
+    custom: "Custom",
+  }[String(value || "custom").trim()] || "Custom";
+}
+
+function storageClearModeLabel(value) {
+  return {
+    none: "Keep site storage",
+    requested_origin: "Clear requested origin",
+    all_visited_origins: "Clear all visited origins",
+  }[normalizeStorageClearMode(value)];
+}
+
+function safeHttpOrigin(value) {
+  try {
+    const parsed = new URL(String(value || ""));
+    return /^https?:$/.test(parsed.protocol) ? parsed.origin : "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeReadinessEvent(value) {
+  return String(value || "load").trim() === "dom_content_loaded" ? "dom_content_loaded" : "load";
+}
+
+function readinessEventMethod(value) {
+  return normalizeReadinessEvent(value) === "dom_content_loaded"
+    ? "Page.domContentEventFired"
+    : "Page.loadEventFired";
+}
+
+function readinessEventLabel(value) {
+  return normalizeReadinessEvent(value) === "dom_content_loaded"
+    ? "DOM content loaded"
+    : "Full page load";
+}
+
+function normalizeReadinessTimeoutAction(value) {
+  const action = String(value || "capture_warning").trim();
+  if (["capture_warning", "stop_and_capture", "fail"].includes(action)) return action;
+  return "capture_warning";
+}
+
+function readinessTimeoutActionLabel(value) {
+  return {
+    capture_warning: "Capture with warning",
+    stop_and_capture: "Stop loading and capture",
+    fail: "Fail URL",
+  }[normalizeReadinessTimeoutAction(value)];
+}
+
+function normalizeGrowthLimitAction(value) {
+  const action = String(value || "capture_partial").trim();
+  if (["capture_partial", "capture_warning", "fail"].includes(action)) return action;
+  return "capture_partial";
+}
+
+function growthLimitActionLabel(value) {
+  return {
+    capture_partial: "Capture partial",
+    capture_warning: "Capture with warning",
+    fail: "Fail URL",
+  }[normalizeGrowthLimitAction(value)];
+}
+
+function normalizeCaptureFixedStickyBehavior(value) {
+  return normalizePdfPageBehavior(value);
+}
+
+function buildCaptureCompleteness(partialReasons, warningReasons, warnings, requestedArtifactErrors, visualArtifactCount) {
+  const partial = [...new Set(Array.isArray(partialReasons) ? partialReasons : [])];
+  const warning = [...new Set(Array.isArray(warningReasons) ? warningReasons : [])];
+  const requestedErrors = Array.isArray(requestedArtifactErrors)
+    ? requestedArtifactErrors.filter((entry) => entry && String(entry.error || entry).trim())
+    : [];
+  const hasWarnings = warning.length > 0 || (Array.isArray(warnings) && warnings.length > 0);
+  const classification = requestedErrors.length
+    ? "failed"
+    : (partial.length ? "partial" : (hasWarnings ? "complete_with_warnings" : "complete"));
+  return {
+    classification,
+    visual_capture_complete: Number(visualArtifactCount) > 0,
+    requested_artifacts_complete: requestedErrors.length === 0,
+    requested_artifact_errors: requestedErrors,
+    partial_reasons: partial,
+    warning_reasons: warning,
+    note: classification === "partial"
+      ? "The bounded capture completed, but one or more configured limits prevented full-page completeness."
+      : (classification === "failed"
+        ? "One or more requested outputs failed even though partial artifacts may exist."
+        : "The requested bounded capture completed."),
+  };
+}
+
+function normalizeNetworkQueryMode(value) {
+  return String(value || "redact_values").trim() === "include_full" ? "include_full" : "redact_values";
+}
+
+function sanitizeEvidenceUrl(value, queryMode = "redact_values") {
+  const text = String(value || "");
+  try {
+    const parsed = new URL(text);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    if (normalizeNetworkQueryMode(queryMode) !== "include_full" && parsed.search) {
+      const sanitized = new URLSearchParams();
+      for (const [name] of parsed.searchParams.entries()) sanitized.append(name, "<redacted>");
+      parsed.search = sanitized.toString();
+    }
+    return parsed.toString();
+  } catch {
+    return text.replace(/([?&][^=&#\s]+)=([^&#\s]*)/g, "$1=<redacted>").replace(/#.*$/, "");
+  }
+}
+
+function boundedText(value, maximum = 4000) {
+  const text = String(value ?? "");
+  return text.length > maximum ? `${text.slice(0, maximum)}…<truncated>` : text;
+}
+
+function safeConsoleArgument(arg) {
+  if (!arg || typeof arg !== "object") return boundedText(arg);
+  if (arg.value !== undefined) {
+    try { return boundedText(typeof arg.value === "string" ? arg.value : JSON.stringify(arg.value)); }
+    catch { return boundedText(arg.value); }
+  }
+  return boundedText(arg.description || arg.className || arg.type || "");
+}
+
+async function addTextArtifact(artifacts, kind, folder, baseName, suffix, extension, content) {
+  const path = await uniqueOutputPath(folder, `${baseName}${suffix}`, extension);
+  await Deno.writeTextFile(path, String(content ?? ""));
+  const info = await Deno.stat(path);
+  artifacts.push({ kind, path, sha256: await sha256File(path), size_bytes: info.size });
+  return path;
+}
+
+async function addBytesArtifact(artifacts, kind, folder, baseName, suffix, extension, bytes) {
+  const path = await uniqueOutputPath(folder, `${baseName}${suffix}`, extension);
+  await Deno.writeFile(path, bytes);
+  const info = await Deno.stat(path);
+  artifacts.push({ kind, path, sha256: await sha256File(path), size_bytes: info.size });
+  return path;
+}
+
+async function addJsonArtifact(artifacts, kind, folder, baseName, suffix, payload) {
+  return await addTextArtifact(artifacts, kind, folder, baseName, suffix, ".json", JSON.stringify(payload, null, 2) + "\n");
+}
+
+function sanitizeNetworkRecord(record, queryMode) {
+  return {
+    request_id: String(record.request_id || ""),
+    url: sanitizeEvidenceUrl(record.url, queryMode),
+    document_url: sanitizeEvidenceUrl(record.document_url, queryMode),
+    method: String(record.method || ""),
+    resource_type: String(record.resource_type || ""),
+    frame_id: String(record.frame_id || ""),
+    timestamp: Number(record.timestamp) || null,
+    wall_time: Number(record.wall_time) || null,
+    initiator_type: String(record.initiator_type || ""),
+    has_post_data: Boolean(record.has_post_data),
+    request_headers: redactSensitiveHeaders(record.request_headers || {}),
+    response: record.response ? {
+      url: sanitizeEvidenceUrl(record.response.url, queryMode),
+      status: Number(record.response.status) || null,
+      status_text: String(record.response.statusText || ""),
+      mime_type: String(record.response.mimeType || ""),
+      protocol: String(record.response.protocol || ""),
+      remote_ip_address: String(record.response.remoteIPAddress || ""),
+      remote_port: Number(record.response.remotePort) || null,
+      from_disk_cache: Boolean(record.response.fromDiskCache),
+      from_service_worker: Boolean(record.response.fromServiceWorker),
+      from_prefetch_cache: Boolean(record.response.fromPrefetchCache),
+      encoded_data_length: Number(record.response.encodedDataLength) || null,
+      response_headers: redactSensitiveHeaders(record.response.headers || {}),
+    } : null,
+    completed: Boolean(record.completed),
+    encoded_data_length: Number(record.encoded_data_length) || null,
+    failed: Boolean(record.failed),
+    canceled: Boolean(record.canceled),
+    error_text: String(record.error_text || ""),
+    blocked_reason: String(record.blocked_reason || ""),
+    cors_error_status: record.cors_error_status || null,
+    redirect: record.redirect ? {
+      status: Number(record.redirect.status) || null,
+      status_text: String(record.redirect.statusText || ""),
+      from_url: sanitizeEvidenceUrl(record.redirect.url, queryMode),
+      to_url: sanitizeEvidenceUrl(record.url, queryMode),
+    } : null,
+  };
+}
+
+function sanitizeConsoleStackTrace(stackTrace, queryMode) {
+  if (!stackTrace || typeof stackTrace !== "object") return stackTrace || null;
+  const output = { ...stackTrace };
+  if (Array.isArray(stackTrace.callFrames)) {
+    output.callFrames = stackTrace.callFrames.map((frame) => ({
+      ...frame,
+      url: sanitizeEvidenceUrl(frame?.url || "", queryMode),
+    }));
+  }
+  if (stackTrace.parent) output.parent = sanitizeConsoleStackTrace(stackTrace.parent, queryMode);
+  return output;
+}
+
+function sanitizeConsoleEntry(entry, queryMode) {
+  return {
+    ...(entry || {}),
+    url: sanitizeEvidenceUrl(entry?.url || "", queryMode),
+    stack_trace: sanitizeConsoleStackTrace(entry?.stack_trace, queryMode),
+  };
+}
+
+async function getCurrentSecurityMetadata(client, pageInfo, mainResponse, securityState, queryMode = "redact_values") {
+  let pageSecurity = {};
+  try {
+    pageSecurity = await evaluate(client, `({
+      is_secure_context: Boolean(window.isSecureContext),
+      origin: location.origin || "",
+      protocol: location.protocol || "",
+      cross_origin_isolated: Boolean(window.crossOriginIsolated)
+    })`, 10000);
+  } catch { /* best effort */ }
+  const details = mainResponse?.securityDetails || {};
+  const latestVisible = Array.isArray(securityState?.visible) && securityState.visible.length
+    ? securityState.visible[securityState.visible.length - 1]
+    : null;
+  const latestLegacy = Array.isArray(securityState?.legacy) && securityState.legacy.length
+    ? securityState.legacy[securityState.legacy.length - 1]
+    : null;
+  return {
+    page: pageSecurity,
+    main_response: {
+      url: sanitizeEvidenceUrl(mainResponse?.url || pageInfo?.final_url || "", queryMode),
+      protocol: String(mainResponse?.protocol || ""),
+      security_state: String(mainResponse?.securityState || latestLegacy?.securityState || ""),
+      certificate_subject: String(details.subjectName || ""),
+      certificate_issuer: String(details.issuer || ""),
+      certificate_valid_from_utc: details.validFrom ? new Date(Number(details.validFrom) * 1000).toISOString() : "",
+      certificate_valid_to_utc: details.validTo ? new Date(Number(details.validTo) * 1000).toISOString() : "",
+      certificate_protocol: String(details.protocol || ""),
+      key_exchange: String(details.keyExchange || ""),
+      key_exchange_group: String(details.keyExchangeGroup || ""),
+      cipher: String(details.cipher || ""),
+      certificate_transparency_compliance: String(details.certificateTransparencyCompliance || ""),
+      encrypted_client_hello: Boolean(details.encryptedClientHello),
+    },
+    visible_security_state: latestVisible,
+    legacy_security_state: latestLegacy,
+    certificate_errors: Array.isArray(securityState?.certificateErrors)
+      ? securityState.certificateErrors.map((entry) => ({
+        ...entry,
+        request_url: sanitizeEvidenceUrl(entry?.request_url || "", queryMode),
+      }))
+      : [],
+    note: "Security details are browser-reported metadata. Certificate errors were not bypassed.",
+  };
+}
+
+async function captureSupplementalEvidence(client, config, context) {
+  const artifacts = [];
+  const errors = [];
+  const results = {};
+  const requested = {
+    mhtml: Boolean(config.save_mhtml),
+    response_html: Boolean(config.save_response_html),
+    rendered_dom: Boolean(config.save_rendered_dom),
+    network_report: Boolean(config.save_network_report),
+    console_report: Boolean(config.save_console_report),
+    failed_request_report: Boolean(config.save_failed_request_report),
+    security_report: Boolean(config.save_security_report),
+  };
+  const run = async (name, fn) => {
+    if (!requested[name]) return;
+    try { results[name] = { requested: true, completed: true, path: await fn() }; }
+    catch (error) {
+      const message = String(error?.message || error);
+      errors.push({ artifact: name, error: message });
+      results[name] = { requested: true, completed: false, error: message };
+    }
+  };
+
+  await run("mhtml", async () => {
+    const snapshot = await client.send("Page.captureSnapshot", { format: "mhtml" }, 60000);
+    if (!snapshot?.data) throw new Error("Chromium returned an empty MHTML snapshot.");
+    return await addTextArtifact(artifacts, "webpage_mhtml", context.folder, context.baseName, "", ".mhtml", snapshot.data);
+  });
+
+  await run("response_html", async () => {
+    const requestId = String(context.mainDocumentEntry?.request_id || "");
+    const mimeType = String(context.mainResponse?.mimeType || context.pageInfo?.content_type || "").toLowerCase();
+    if (!requestId) throw new Error("The final main-document request ID was unavailable.");
+    if (mimeType && !mimeType.includes("html") && !mimeType.includes("xhtml")) {
+      throw new Error(`The final main document was not HTML (${mimeType}).`);
+    }
+    const body = await client.send("Network.getResponseBody", { requestId }, 30000);
+    if (body?.base64Encoded) {
+      return await addBytesArtifact(artifacts, "final_response_html", context.folder, context.baseName, ".response", ".html", bytesFromBase64(body.body || ""));
+    }
+    return await addTextArtifact(artifacts, "final_response_html", context.folder, context.baseName, ".response", ".html", body?.body || "");
+  });
+
+  await run("rendered_dom", async () => {
+    const html = await evaluate(client, `(() => {
+      const doctype = document.doctype
+        ? "<!DOCTYPE " + document.doctype.name + (document.doctype.publicId ? ' PUBLIC "' + document.doctype.publicId + '"' : '') + (document.doctype.systemId ? ' "' + document.doctype.systemId + '"' : '') + ">\\n"
+        : "";
+      return doctype + (document.documentElement ? document.documentElement.outerHTML : "");
+    })()`, 30000);
+    return await addTextArtifact(artifacts, "rendered_dom_html", context.folder, context.baseName, ".rendered", ".html", html || "");
+  });
+
+  await run("network_report", async () => {
+    const queryMode = normalizeNetworkQueryMode(config.network_query_mode);
+    const active = Array.from(context.networkState.requests.values());
+    const records = [...context.networkState.records, ...active].slice(0, 5000).map((entry) => sanitizeNetworkRecord(entry, queryMode));
+    return await addJsonArtifact(artifacts, "sanitized_network_report", context.folder, context.baseName, ".network", {
+      type: "wavi-webpage-network-report",
+      schema_version: 1,
+      generated_utc: nowIso(),
+      requested_url: sanitizeEvidenceUrl(context.requestedUrl, queryMode),
+      final_url: sanitizeEvidenceUrl(context.pageInfo?.final_url, queryMode),
+      query_handling: queryMode,
+      sensitive_headers_redacted: ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie"],
+      request_bodies_recorded: false,
+      record_limit: 5000,
+      records_truncated: Number(context.networkState.records_dropped || 0) > 0 || context.networkState.records.length + active.length > 5000,
+      records_dropped: Number(context.networkState.records_dropped || 0),
+      record_count: records.length,
+      records,
+    });
+  });
+
+  await run("console_report", async () => {
+    const queryMode = normalizeNetworkQueryMode(config.network_query_mode);
+    const entries = context.consoleEntries.slice(0, 500).map((entry) => sanitizeConsoleEntry(entry, queryMode));
+    return await addJsonArtifact(artifacts, "browser_console_report", context.folder, context.baseName, ".console", {
+      type: "wavi-webpage-console-report",
+      schema_version: 1,
+      generated_utc: nowIso(),
+      query_handling: queryMode,
+      entry_limit: 500,
+      entries_truncated: Number(context.consoleEntriesDropped || 0) > 0,
+      entries_dropped: Number(context.consoleEntriesDropped || 0),
+      entry_count: entries.length,
+      page_supplied_messages_may_contain_sensitive_content: true,
+      entries,
+    });
+  });
+
+  await run("failed_request_report", async () => {
+    const queryMode = normalizeNetworkQueryMode(config.network_query_mode);
+    const entries = context.networkState.failedRequests.slice(0, 1000).map((entry) => sanitizeNetworkRecord(entry, queryMode));
+    return await addJsonArtifact(artifacts, "failed_request_report", context.folder, context.baseName, ".failed-requests", {
+      type: "wavi-webpage-failed-request-report",
+      schema_version: 1,
+      generated_utc: nowIso(),
+      query_handling: queryMode,
+      entry_limit: 1000,
+      entries_truncated: Number(context.networkState.failed_requests_dropped || 0) > 0,
+      entries_dropped: Number(context.networkState.failed_requests_dropped || 0),
+      entry_count: entries.length,
+      entries,
+    });
+  });
+
+  await run("security_report", async () => {
+    const security = await getCurrentSecurityMetadata(
+      client, context.pageInfo, context.mainResponse, context.securityState, config.network_query_mode,
+    );
+    return await addJsonArtifact(artifacts, "browser_security_report", context.folder, context.baseName, ".security", {
+      type: "wavi-webpage-security-report",
+      schema_version: 1,
+      generated_utc: nowIso(),
+      requested_url: sanitizeEvidenceUrl(context.requestedUrl, config.network_query_mode),
+      final_url: sanitizeEvidenceUrl(context.pageInfo?.final_url || context.requestedUrl, config.network_query_mode),
+      ...security,
+    });
+  });
+
+  return { requested, results, errors, artifacts };
+}
+
+async function captureFailureEvidence(client, config, url, index, browserVersion, runContext, error) {
+  if (!config.save_failure_screenshot) return { artifacts: [], metadataPath: "", screenshotPath: "" };
+  const artifacts = [];
+  let pageInfo = { title: "", final_url: url, content_type: "", ready_state: "" };
+  try {
+    pageInfo = await evaluate(client, `({
+      title: document.title || "",
+      final_url: location.href || "",
+      content_type: document.contentType || "",
+      ready_state: document.readyState || ""
+    })`, 10000);
+  } catch { /* best effort */ }
+  let domain = "unknown-domain";
+  try { domain = new URL(pageInfo.final_url || url).hostname || domain; } catch { /* fallback */ }
+  const baseName = renderFilenameTemplate(config.filename_template, {
+    date: new Date(), domain, title: pageInfo.title || "capture-failure", index,
+    mode: normalizeCaptureMode(config.capture_mode), caseName: config.case_name || "",
+  });
+  let screenshotPath = "";
+  let screenshotError = "";
+  try {
+    const screenshot = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true }, 30000);
+    if (!screenshot?.data) throw new Error("Chromium returned no screenshot data.");
+    screenshotPath = await addBytesArtifact(artifacts, "failure_screenshot", runContext.webMediaFolder, baseName, ".failure", ".png", bytesFromBase64(screenshot.data));
+  } catch (screenshotFailure) {
+    screenshotError = String(screenshotFailure?.message || screenshotFailure);
+  }
+  let security = {};
+  try { security = await getCurrentSecurityMetadata(client, pageInfo, {}, { visible: [], legacy: [], certificateErrors: [] }); }
+  catch { /* best effort */ }
+  const metadataPath = await addJsonArtifact(artifacts, "failure_metadata_json", runContext.webMediaFolder, baseName, ".webcapture-failure", {
+    type: "wavi-webpage-capture-failure",
+    schema_version: 1,
+    app_version: config.app_version || "",
+    capture_failed_utc: nowIso(),
+    requested_url: url,
+    final_url: pageInfo.final_url || url,
+    page_title: pageInfo.title || "",
+    document_content_type: pageInfo.content_type || "",
+    document_ready_state: pageInfo.ready_state || "",
+    browser_product: browserVersion?.Browser || "",
+    browser_executable: config.browser_path || "",
+    normal_browser_profile_accessed: false,
+    capture_completeness: { classification: "failed", requested_artifacts_complete: false },
+    error: String(error?.stack || error?.message || error),
+    failure_screenshot: {
+      requested: true,
+      completed: Boolean(screenshotPath),
+      path: screenshotPath ? screenshotPath.slice(runContext.caseFolder.length).replace(/^[\/]+/, "") : "",
+      error: screenshotError,
+    },
+    security,
+  });
+  return { artifacts, metadataPath, screenshotPath };
+}
+
+function getImageEncoding(config) {
+  const format = normalizeImageFormat(config.image_format);
+  const quality = normalizeImageQuality(config.image_quality);
+  return {
+    format,
+    quality,
+    extension: format === "jpeg" ? ".jpg" : `.${format}`,
+    cdpOptions: format === "png" ? { format } : { format, quality },
+  };
+}
+
+class CaptureStageError extends Error {
+  constructor(message, cause = null) {
+    super(message);
+    this.name = "CaptureStageError";
+    this.stage = "capture";
+    this.cause = cause;
+  }
 }
 
 async function applyPdfPageBehavior(client, behavior) {
@@ -527,6 +1038,133 @@ async function cleanupPdfPageBehavior(client) {
   }
 }
 
+async function applyCaptureStabilization(client, config) {
+  const behavior = normalizeCaptureFixedStickyBehavior(config.fixed_sticky_behavior);
+  const disableAnimations = Boolean(config.disable_animations);
+  const disableTransitions = Boolean(config.disable_transitions);
+  const hideScrollbars = Boolean(config.hide_scrollbars);
+  if (!disableAnimations && !disableTransitions && !hideScrollbars && behavior === "preserve_layout") {
+    return {
+      applied: false,
+      disable_animations: false,
+      disable_transitions: false,
+      hide_scrollbars: false,
+      fixed_sticky_behavior: behavior,
+      matched_elements: 0,
+      modified_elements: 0,
+      hidden_elements: 0,
+      note: "No visual stabilization changes were requested.",
+      sample_elements: [],
+    };
+  }
+
+  const expression = `(() => {
+    const DISABLE_ANIMATIONS = ${JSON.stringify(disableAnimations)};
+    const DISABLE_TRANSITIONS = ${JSON.stringify(disableTransitions)};
+    const HIDE_SCROLLBARS = ${JSON.stringify(hideScrollbars)};
+    const MODE = ${JSON.stringify(behavior)};
+    const STYLE_ID = "__wavi_capture_stability_style__";
+    const ATTR = "data-wavi-capture-stability-id";
+    const oldStyle = document.getElementById(STYLE_ID);
+    if (oldStyle) oldStyle.remove();
+    for (const node of document.querySelectorAll("[" + ATTR + "]")) node.removeAttribute(ATTR);
+
+    const viewportWidth = Math.max(window.innerWidth || 0, document.documentElement?.clientWidth || 0, 1);
+    const viewportHeight = Math.max(window.innerHeight || 0, document.documentElement?.clientHeight || 0, 1);
+    const keywordPattern = /(nav|header|menu|toolbar|masthead|topbar|banner|cookie|consent)/i;
+    const matched = [];
+    const selected = [];
+    let nextId = 1;
+
+    if (MODE !== "preserve_layout") {
+      for (const el of document.body ? document.body.querySelectorAll("*") : []) {
+        if (!(el instanceof HTMLElement)) continue;
+        const style = getComputedStyle(el);
+        if (style.position !== "fixed" && style.position !== "sticky") continue;
+        const rect = el.getBoundingClientRect();
+        if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height) || rect.width < 1 || rect.height < 1) continue;
+        const descriptor = {
+          tag: (el.tagName || "").toLowerCase(),
+          role: (el.getAttribute("role") || "").toLowerCase(),
+          aria_label: (el.getAttribute("aria-label") || "").toLowerCase(),
+          class_name: String(el.className || "").toLowerCase(),
+          element_id: (el.id || "").toLowerCase(),
+          top: Math.round(rect.top),
+          bottom: Math.round(rect.bottom),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        };
+        matched.push(descriptor);
+        let shouldSelect = true;
+        if (MODE === "hide_likely_navigation_overlays") {
+          const isTopAnchored = rect.top <= Math.max(140, viewportHeight * 0.18) && rect.bottom >= 0;
+          const isWideEnough = rect.width >= Math.max(320, viewportWidth * 0.40);
+          const isReasonableHeight = rect.height <= Math.max(280, viewportHeight * 0.45);
+          const looksLikeOverlay = keywordPattern.test(descriptor.tag) || keywordPattern.test(descriptor.role) || keywordPattern.test(descriptor.aria_label) || keywordPattern.test(descriptor.class_name) || keywordPattern.test(descriptor.element_id);
+          shouldSelect = isTopAnchored && isWideEnough && isReasonableHeight && (looksLikeOverlay || rect.height <= Math.max(160, viewportHeight * 0.22));
+        }
+        if (!shouldSelect) continue;
+        const id = String(nextId++);
+        el.setAttribute(ATTR, id);
+        selected.push({ ...descriptor, id });
+        if (selected.length >= 800) break;
+      }
+    }
+
+    const cssRules = [];
+    if (DISABLE_ANIMATIONS) cssRules.push("*,*::before,*::after{animation:none !important;animation-delay:0s !important;animation-duration:0s !important;animation-iteration-count:1 !important;}");
+    if (DISABLE_TRANSITIONS) cssRules.push("*,*::before,*::after{transition:none !important;transition-delay:0s !important;transition-duration:0s !important;}");
+    if (HIDE_SCROLLBARS) cssRules.push("html,body{scrollbar-width:none !important;}html::-webkit-scrollbar,body::-webkit-scrollbar,*::-webkit-scrollbar{width:0 !important;height:0 !important;display:none !important;}");
+    for (const item of selected) {
+      const selector = "[" + ATTR + "=\\\"" + item.id + "\\\"]";
+      cssRules.push(MODE === "hide_likely_navigation_overlays"
+        ? selector + "{display:none !important;visibility:hidden !important;}"
+        : selector + "{position:static !important;top:auto !important;right:auto !important;bottom:auto !important;left:auto !important;inset:auto !important;transform:none !important;}");
+    }
+    if (cssRules.length) {
+      const styleTag = document.createElement("style");
+      styleTag.id = STYLE_ID;
+      styleTag.textContent = cssRules.join("\\n");
+      (document.head || document.documentElement).appendChild(styleTag);
+    }
+    return {
+      applied: cssRules.length > 0,
+      disable_animations: DISABLE_ANIMATIONS,
+      disable_transitions: DISABLE_TRANSITIONS,
+      hide_scrollbars: HIDE_SCROLLBARS,
+      fixed_sticky_behavior: MODE,
+      matched_elements: matched.length,
+      modified_elements: selected.length,
+      hidden_elements: MODE === "hide_likely_navigation_overlays" ? selected.length : 0,
+      note: cssRules.length ? "Applied explicit visual stabilization settings for image capture." : "No visual stabilization rules were applied.",
+      sample_elements: selected.slice(0, 12).map((item) => ({
+        tag: item.tag, role: item.role, top: item.top, width: item.width, height: item.height,
+        element_id: item.element_id, class_name: item.class_name,
+      })),
+    };
+  })()`;
+  return await evaluate(client, expression, 30000);
+}
+
+async function cleanupCaptureStabilization(client) {
+  try {
+    return await evaluate(client, `(() => {
+      const STYLE_ID = "__wavi_capture_stability_style__";
+      const ATTR = "data-wavi-capture-stability-id";
+      const styleTag = document.getElementById(STYLE_ID);
+      if (styleTag) styleTag.remove();
+      let cleaned = 0;
+      for (const node of document.querySelectorAll("[" + ATTR + "]")) {
+        node.removeAttribute(ATTR);
+        cleaned += 1;
+      }
+      return { cleaned };
+    })()`, 10000);
+  } catch {
+    return { cleaned: 0 };
+  }
+}
+
 class CdpClient {
   constructor(webSocket) {
     this.webSocket = webSocket;
@@ -614,6 +1252,10 @@ class CdpClient {
       this.pending.set(id, { resolve, reject, timer });
       this.webSocket.send(JSON.stringify({ id, method, params }));
     });
+  }
+
+  clearEventBacklog(method) {
+    this.eventBacklog.delete(method);
   }
 
   waitForEvent(method, timeoutMs = 30000) {
@@ -732,12 +1374,48 @@ async function getBrowserVersion(port) {
 }
 
 async function waitForNetworkQuiet(state, quietMs = 750, maximumMs = 5000) {
-  const deadline = Date.now() + maximumMs;
+  const startedAt = Date.now();
+  const boundedQuietMs = Math.max(100, Math.min(10000, Number(quietMs) || 750));
+  const boundedMaximumMs = Math.max(0, Math.min(300000, Number(maximumMs) || 0));
+  if (boundedMaximumMs === 0) {
+    return {
+      enabled: false,
+      settled: null,
+      quiet_ms: boundedQuietMs,
+      maximum_ms: 0,
+      elapsed_ms: 0,
+      inflight_at_end: state.inflight.size,
+      maximum_inflight: Number(state.maximumInflight) || state.inflight.size,
+      reason: "Network settling was disabled.",
+    };
+  }
+
+  const deadline = startedAt + boundedMaximumMs;
   while (Date.now() < deadline) {
-    if (state.inflight.size === 0 && Date.now() - state.lastActivity >= quietMs) return true;
+    if (state.inflight.size === 0 && Date.now() - state.lastActivity >= boundedQuietMs) {
+      return {
+        enabled: true,
+        settled: true,
+        quiet_ms: boundedQuietMs,
+        maximum_ms: boundedMaximumMs,
+        elapsed_ms: Date.now() - startedAt,
+        inflight_at_end: 0,
+        maximum_inflight: Number(state.maximumInflight) || 0,
+        reason: "The network remained quiet for the configured duration.",
+      };
+    }
     await delay(100);
   }
-  return false;
+  return {
+    enabled: true,
+    settled: false,
+    quiet_ms: boundedQuietMs,
+    maximum_ms: boundedMaximumMs,
+    elapsed_ms: Date.now() - startedAt,
+    inflight_at_end: state.inflight.size,
+    maximum_inflight: Number(state.maximumInflight) || state.inflight.size,
+    reason: "Network activity did not remain quiet before the maximum settling duration elapsed.",
+  };
 }
 
 async function evaluate(client, expression, timeoutMs = 30000) {
@@ -754,15 +1432,155 @@ async function evaluate(client, expression, timeoutMs = 30000) {
   return result.result?.value;
 }
 
+async function waitForPageConditions(client, config) {
+  const selectorEnabled = Boolean(config.wait_selector_enabled);
+  const textEnabled = Boolean(config.wait_text_enabled);
+  const selector = String(config.wait_selector || "");
+  const selectorState = String(config.wait_selector_state || "visible") === "exists" ? "exists" : "visible";
+  const text = String(config.wait_text || "");
+  const textScope = String(config.wait_text_scope || "visible") === "dom" ? "dom" : "visible";
+  const maximumMs = Math.max(1000, Math.min(300000, Number(config.condition_timeout_seconds || 15) * 1000));
+  const startedAt = Date.now();
+
+  if (!selectorEnabled && !textEnabled) {
+    return {
+      enabled: false,
+      completed: true,
+      elapsed_ms: 0,
+      maximum_ms: maximumMs,
+      selector: { enabled: false, selector: "", required_state: selectorState, matched: null },
+      text: { enabled: false, text: "", scope: textScope, matched: null },
+      unmet_conditions: [],
+      reason: "No selector or text readiness conditions were enabled.",
+    };
+  }
+
+  const expression = `(() => {
+    const selectorEnabled = ${JSON.stringify(selectorEnabled)};
+    const selector = ${JSON.stringify(selector)};
+    const selectorState = ${JSON.stringify(selectorState)};
+    const textEnabled = ${JSON.stringify(textEnabled)};
+    const text = ${JSON.stringify(text)};
+    const textScope = ${JSON.stringify(textScope)};
+    let selectorMatched = !selectorEnabled;
+    let selectorError = "";
+    if (selectorEnabled) {
+      try {
+        const element = document.querySelector(selector);
+        if (selectorState === "exists") {
+          selectorMatched = Boolean(element);
+        } else if (element) {
+          const style = getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          selectorMatched = style.display !== "none" && style.visibility !== "hidden" &&
+            Number(style.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+        } else {
+          selectorMatched = false;
+        }
+      } catch (error) {
+        selectorError = String(error && (error.message || error) || "Invalid selector");
+      }
+    }
+    let textMatched = !textEnabled;
+    if (textEnabled) {
+      const haystack = textScope === "dom"
+        ? String(document.documentElement ? (document.documentElement.textContent || "") : "")
+        : String(document.body ? (document.body.innerText || "") : "");
+      textMatched = haystack.includes(text);
+    }
+    return { selectorMatched, selectorError, textMatched };
+  })()`;
+
+  let lastResult = { selectorMatched: !selectorEnabled, selectorError: "", textMatched: !textEnabled };
+  while (Date.now() - startedAt < maximumMs) {
+    lastResult = await evaluate(client, expression, Math.min(10000, maximumMs));
+    if (lastResult?.selectorError) {
+      throw new Error(`Invalid CSS selector: ${lastResult.selectorError}`);
+    }
+    if (lastResult?.selectorMatched && lastResult?.textMatched) {
+      return {
+        enabled: true,
+        completed: true,
+        elapsed_ms: Date.now() - startedAt,
+        maximum_ms: maximumMs,
+        selector: { enabled: selectorEnabled, selector, required_state: selectorState, matched: Boolean(lastResult.selectorMatched) },
+        text: { enabled: textEnabled, text, scope: textScope, matched: Boolean(lastResult.textMatched) },
+        unmet_conditions: [],
+        reason: "All enabled page conditions were satisfied.",
+      };
+    }
+    await delay(200);
+  }
+
+  const unmet = [];
+  if (selectorEnabled && !lastResult?.selectorMatched) unmet.push("CSS selector");
+  if (textEnabled && !lastResult?.textMatched) unmet.push("text");
+  return {
+    enabled: true,
+    completed: false,
+    elapsed_ms: Date.now() - startedAt,
+    maximum_ms: maximumMs,
+    selector: { enabled: selectorEnabled, selector, required_state: selectorState, matched: Boolean(lastResult?.selectorMatched) },
+    text: { enabled: textEnabled, text, scope: textScope, matched: Boolean(lastResult?.textMatched) },
+    unmet_conditions: unmet,
+    reason: `The following page condition(s) were not satisfied before timeout: ${unmet.join(", ")}.`,
+  };
+}
+
+async function applyReadinessTimeoutAction(client, actionValue, stage, message, warnings, timeoutRecords) {
+  const action = normalizeReadinessTimeoutAction(actionValue);
+  const record = {
+    stage,
+    action,
+    action_label: readinessTimeoutActionLabel(action),
+    message: String(message || "Readiness check timed out."),
+    recorded_utc: nowIso(),
+    page_stop_loading_attempted: false,
+    page_stop_loading_succeeded: null,
+  };
+
+  if (action === "fail") {
+    timeoutRecords.push(record);
+    throw new Error(`${stage} readiness timeout: ${record.message}`);
+  }
+  if (action === "stop_and_capture") {
+    record.page_stop_loading_attempted = true;
+    try {
+      await client.send("Page.stopLoading", {}, 10000);
+      record.page_stop_loading_succeeded = true;
+    } catch {
+      record.page_stop_loading_succeeded = false;
+    }
+  }
+  timeoutRecords.push(record);
+  warnings.push(`${stage} readiness timeout: ${record.message} Action: ${record.action_label}.`);
+  return record;
+}
+
 async function performLazyScroll(client, config) {
   if (!config.lazy_scroll) {
     await evaluate(client, "window.scrollTo(0, 0); true;");
-    return { performed: false, iterations: 0, timed_out: false, final_height: 0 };
+    return {
+      performed: false,
+      iterations: 0,
+      timed_out: false,
+      initial_height: 0,
+      final_height: 0,
+      maximum_height: 0,
+      detect_page_growth: Boolean(config.detect_page_growth),
+      growth_cycles: 0,
+      maximum_growth_cycles: Math.max(1, Math.min(500, Number(config.maximum_growth_cycles || 25))),
+      growth_limit_reached: false,
+      growth_limit_action: normalizeGrowthLimitAction(config.growth_limit_action),
+      termination_reason: "disabled",
+    };
   }
 
   const maxMs = Math.max(1000, Number(config.max_scroll_seconds || 60) * 1000);
   const waitMs = Math.max(50, Math.min(5000, Number(config.scroll_wait_ms || 400)));
   const stableChecks = Math.max(1, Math.min(20, Number(config.stable_height_checks || 3)));
+  const detectGrowth = Boolean(config.detect_page_growth);
+  const maximumGrowthCycles = Math.max(1, Math.min(500, Number(config.maximum_growth_cycles || 25)));
   const script = `
     (async () => {
       const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -774,10 +1592,15 @@ async function performLazyScroll(client, config) {
         window.innerHeight || 0
       );
       const started = Date.now();
-      let lastHeight = getHeight();
+      const initialHeight = getHeight();
+      let lastHeight = initialHeight;
+      let maximumHeight = initialHeight;
       let stable = 0;
       let iterations = 0;
       let timedOut = false;
+      let growthCycles = 0;
+      let growthLimitReached = false;
+      let terminationReason = "iteration_limit";
       window.scrollTo(0, 0);
       await sleep(Math.min(500, ${waitMs}));
       while (iterations < 2000) {
@@ -787,25 +1610,55 @@ async function performLazyScroll(client, config) {
         window.scrollTo(0, nextY);
         await sleep(${waitMs});
         const newHeight = getHeight();
-        const atBottom = window.scrollY + (window.innerHeight || 0) >= newHeight - 4;
-        if (newHeight === lastHeight) stable += 1; else stable = 0;
+        maximumHeight = Math.max(maximumHeight, newHeight);
+        const grew = newHeight > lastHeight;
+        if (grew) {
+          stable = 0;
+          if (${detectGrowth}) growthCycles += 1;
+        } else {
+          stable += 1;
+        }
         lastHeight = newHeight;
         iterations += 1;
-        if (atBottom && stable >= ${stableChecks}) break;
-        if (Date.now() - started >= ${maxMs}) { timedOut = true; break; }
+        const atBottom = window.scrollY + (window.innerHeight || 0) >= newHeight - 4;
+        if (${detectGrowth} && growthCycles >= ${maximumGrowthCycles}) {
+          growthLimitReached = true;
+          terminationReason = "growth_limit";
+          break;
+        }
+        if (atBottom && stable >= ${stableChecks}) {
+          terminationReason = "stable_height";
+          break;
+        }
+        if (Date.now() - started >= ${maxMs}) {
+          timedOut = true;
+          terminationReason = "time_limit";
+          break;
+        }
       }
       window.scrollTo(0, 0);
       await sleep(Math.min(1000, ${waitMs} * 2));
-      return { performed: true, iterations, timed_out: timedOut, final_height: getHeight() };
+      return {
+        performed: true,
+        iterations,
+        timed_out: timedOut,
+        initial_height: initialHeight,
+        final_height: getHeight(),
+        maximum_height: maximumHeight,
+        detect_page_growth: ${detectGrowth},
+        growth_cycles: growthCycles,
+        maximum_growth_cycles: ${maximumGrowthCycles},
+        growth_limit_reached: growthLimitReached,
+        termination_reason: terminationReason,
+      };
     })()
   `;
-  return await evaluate(client, script, maxMs + 10000);
-}
-
-async function writePng(path, base64Data) {
-  const bytes = bytesFromBase64(base64Data);
-  await Deno.writeFile(path, bytes);
-  return { bytes: bytes.length, sha256: await sha256Bytes(bytes) };
+  const result = await evaluate(client, script, maxMs + 10000);
+  return {
+    ...result,
+    growth_limit_action: normalizeGrowthLimitAction(config.growth_limit_action),
+    growth_limit_action_label: growthLimitActionLabel(config.growth_limit_action),
+  };
 }
 
 async function writePdf(path, base64Data) {
@@ -843,9 +1696,12 @@ function getPdfGeometry(config) {
 }
 
 function getPaginatedPngSourceArtifacts(capture) {
-  return (capture?.artifacts || [])
-    .filter((artifact) => String(artifact.kind || "").includes("png"))
-    .sort((a, b) => (Number(a.y_css_px) || 0) - (Number(b.y_css_px) || 0));
+  const pngArtifacts = (capture?.artifacts || []).filter((artifact) => normalizeImageFormat(artifact.format) === "png");
+  const fullPageArtifacts = pngArtifacts.filter((artifact) => String(artifact.role || "").startsWith("full_page"));
+  const selected = fullPageArtifacts.length
+    ? fullPageArtifacts
+    : pngArtifacts.filter((artifact) => String(artifact.role || "") === "initial_viewport");
+  return selected.sort((a, b) => (Number(a.y_css_px) || 0) - (Number(b.y_css_px) || 0));
 }
 
 function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlForIndex) {
@@ -853,7 +1709,11 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
   if (!sourceArtifacts.length) throw new Error("No PNG capture artifacts were available for paginated PDF output.");
 
   const pageWidthCssPx = Math.max(1, Math.ceil(Number(capture.page_width) || Number(sourceArtifacts[0].width_css_px) || 1));
-  const totalHeightCssPx = Math.max(1, Math.ceil(Number(capture.page_height) || 0));
+  const totalHeightCssPx = Math.max(1, Math.ceil(
+    capture?.segmentation?.limit_reached
+      ? Number(capture.segmentation.captured_height_css_px) || Number(capture.page_height) || 0
+      : Number(capture.page_height) || 0
+  ));
   const sliceHeightCssPx = Math.max(1, Math.floor(pageWidthCssPx * geometry.contentHeightIn / geometry.contentWidthIn));
   const pageCount = Math.max(1, Math.ceil(totalHeightCssPx / sliceHeightCssPx));
   const cssPageWidthIn = geometry.contentWidthIn / geometry.scale;
@@ -1272,22 +2132,35 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
   }
 }
 
-async function capturePage(client, config, outputFolder, baseName, layout) {
-  const artifacts = [];
-  const mode = config.capture_mode === "viewport" ? "viewport" : "full_page";
-  const width = Math.max(1, Math.ceil(Number(layout.width) || Number(config.viewport_width) || 1440));
-  const height = Math.max(1, Math.ceil(Number(layout.height) || Number(config.viewport_height) || 900));
+async function writeCaptureImage(path, base64Data) {
+  const bytes = bytesFromBase64(base64Data);
+  await Deno.writeFile(path, bytes);
+  return { bytes: bytes.length, sha256: await sha256Bytes(bytes) };
+}
 
-  if (mode === "viewport") {
-    const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
+async function removeCaptureArtifacts(artifacts) {
+  for (const artifact of artifacts || []) {
+    try { await Deno.remove(artifact.path); } catch { /* best effort */ }
+  }
+}
+
+async function captureViewportImage(client, config, outputFolder, baseName) {
+  const artifacts = [];
+  const encoding = getImageEncoding(config);
+  try {
+    const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, encoding.extension);
     const result = await client.send("Page.captureScreenshot", {
-      format: "png",
+      ...encoding.cdpOptions,
       fromSurface: true,
       captureBeyondViewport: false,
     }, 120000);
-    const record = await writePng(outputPath, result.data);
+    const record = await writeCaptureImage(outputPath, result.data);
     artifacts.push({
-      kind: "viewport_png",
+      kind: `initial_viewport_${encoding.format}`,
+      role: "initial_viewport",
+      format: encoding.format,
+      quality: encoding.format === "png" ? null : encoding.quality,
+      lossy: encoding.format !== "png",
       path: outputPath,
       sha256: record.sha256,
       size_bytes: record.bytes,
@@ -1296,82 +2169,348 @@ async function capturePage(client, config, outputFolder, baseName, layout) {
       width_css_px: Number(config.viewport_width) || 1440,
       height_css_px: Number(config.viewport_height) || 900,
     });
-    return { artifacts, segmented: false, page_width: width, page_height: height };
+    return artifacts;
+  } catch (error) {
+    await removeCaptureArtifacts(artifacts);
+    throw new CaptureStageError(`Initial viewport capture failed: ${error.message || error}`, error);
   }
+}
 
-  const maximumSingleDimension = Math.max(8000, Number(config.maximum_single_dimension || 30000));
-  const maximumSinglePixels = Math.max(20_000_000, Number(config.maximum_single_pixels || 150_000_000));
-  const shouldSegment = height > maximumSingleDimension || width > maximumSingleDimension || width * height > maximumSinglePixels;
+async function captureFullPageImages(client, config, outputFolder, baseName, layout) {
+  const artifacts = [];
+  const encoding = getImageEncoding(config);
+  const width = Math.max(1, Math.ceil(Number(layout.width) || Number(config.viewport_width) || 1440));
+  const height = Math.max(1, Math.ceil(Number(layout.height) || Number(config.viewport_height) || 900));
 
-  if (!shouldSegment) {
-    try {
-      const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_full`, ".png");
+  try {
+    const hardMaximumDimension = Math.max(8000, Math.min(30000, Number(config.maximum_single_dimension || 30000)));
+    const maximumSingleHeight = Math.max(2000, Math.min(hardMaximumDimension, Number(config.maximum_single_height || 30000)));
+    const maximumSinglePixels = Math.max(20_000_000, Math.min(150_000_000, Number(config.maximum_single_pixels || 150_000_000)));
+    const shouldSegment = height > maximumSingleHeight || width > hardMaximumDimension || width * height > maximumSinglePixels;
+    let fallbackReason = shouldSegment ? "configured_limit" : "";
+
+    if (!shouldSegment) {
+      try {
+        const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_full`, encoding.extension);
+        const result = await client.send("Page.captureScreenshot", {
+          ...encoding.cdpOptions,
+          fromSurface: true,
+          captureBeyondViewport: true,
+          clip: { x: 0, y: 0, width, height, scale: 1 },
+        }, 180000);
+        const record = await writeCaptureImage(outputPath, result.data);
+        artifacts.push({
+          kind: `full_page_${encoding.format}`,
+          role: "full_page",
+          format: encoding.format,
+          quality: encoding.format === "png" ? null : encoding.quality,
+          lossy: encoding.format !== "png",
+          path: outputPath,
+          sha256: record.sha256,
+          size_bytes: record.bytes,
+          x_css_px: 0,
+          y_css_px: 0,
+          width_css_px: width,
+          height_css_px: height,
+        });
+        return {
+          artifacts,
+          segmented: false,
+          page_width: width,
+          page_height: height,
+          segmentation: {
+            used: false,
+            reason: "single_image_within_limits",
+            maximum_single_height: maximumSingleHeight,
+            maximum_single_pixels: maximumSinglePixels,
+            required_segments: 1,
+            captured_segments: 1,
+            maximum_segments: Math.max(1, Math.min(500, Number(config.maximum_segments || 100))),
+            segment_height: Math.max(1000, Math.min(16000, Number(config.segment_height || 12000))),
+            segment_overlap: Math.max(0, Math.min(1000, Number(config.segment_overlap || 0))),
+            limit_reached: false,
+            captured_height_css_px: height,
+          },
+        };
+      } catch (error) {
+        await removeCaptureArtifacts(artifacts);
+        artifacts.length = 0;
+        fallbackReason = `single_image_error: ${error.message || error}`;
+        console.log(`Single-image capture failed; using segmented fallback: ${error.message || error}`);
+      }
+    }
+
+    const segmentHeight = Math.max(1000, Math.min(16000, Number(config.segment_height || 12000)));
+    const segmentOverlap = Math.max(0, Math.min(1000, Number(config.segment_overlap || 0), segmentHeight - 1));
+    const segmentStep = Math.max(1, segmentHeight - segmentOverlap);
+    const maximumSegments = Math.max(1, Math.min(500, Number(config.maximum_segments || 100)));
+    const requiredParts = height <= segmentHeight ? 1 : Math.ceil((height - segmentOverlap) / segmentStep);
+    const partCount = Math.min(requiredParts, maximumSegments);
+    let capturedHeight = 0;
+    for (let part = 0; part < partCount; part += 1) {
+      const y = part * segmentStep;
+      const partHeight = Math.min(segmentHeight, height - y);
+      if (partHeight <= 0) break;
+      const outputPath = await uniqueOutputPath(
+        outputFolder,
+        `${baseName}_full_part-${String(part + 1).padStart(3, "0")}`,
+        encoding.extension,
+      );
       const result = await client.send("Page.captureScreenshot", {
-        format: "png",
+        ...encoding.cdpOptions,
         fromSurface: true,
         captureBeyondViewport: true,
-        clip: { x: 0, y: 0, width, height, scale: 1 },
+        clip: { x: 0, y, width, height: partHeight, scale: 1 },
       }, 180000);
-      const record = await writePng(outputPath, result.data);
+      const record = await writeCaptureImage(outputPath, result.data);
+      capturedHeight = Math.max(capturedHeight, y + partHeight);
       artifacts.push({
-        kind: "full_page_png",
+        kind: `full_page_${encoding.format}_segment`,
+        role: "full_page_segment",
+        format: encoding.format,
+        quality: encoding.format === "png" ? null : encoding.quality,
+        lossy: encoding.format !== "png",
+        part: part + 1,
+        parts_total: partCount,
+        required_parts_total: requiredParts,
+        overlap_css_px: segmentOverlap,
         path: outputPath,
         sha256: record.sha256,
         size_bytes: record.bytes,
         x_css_px: 0,
-        y_css_px: 0,
+        y_css_px: y,
         width_css_px: width,
-        height_css_px: height,
+        height_css_px: partHeight,
       });
-      return { artifacts, segmented: false, page_width: width, page_height: height };
-    } catch (error) {
-      console.log(`Single-image capture failed; using segmented fallback: ${error.message || error}`);
     }
+    const limitReached = requiredParts > artifacts.length;
+    return {
+      artifacts,
+      segmented: true,
+      page_width: width,
+      page_height: height,
+      segmentation: {
+        used: true,
+        reason: fallbackReason || "configured_limit",
+        maximum_single_height: maximumSingleHeight,
+        maximum_single_pixels: maximumSinglePixels,
+        required_segments: requiredParts,
+        captured_segments: artifacts.length,
+        maximum_segments: maximumSegments,
+        segment_height: segmentHeight,
+        segment_overlap: segmentOverlap,
+        segment_step: segmentStep,
+        limit_reached: limitReached,
+        captured_height_css_px: Math.min(height, capturedHeight),
+      },
+    };
+  } catch (error) {
+    await removeCaptureArtifacts(artifacts);
+    if (error?.stage === "capture") throw error;
+    throw new CaptureStageError(`Full-page capture failed: ${error.message || error}`, error);
   }
-
-  const segmentHeight = Math.max(2000, Math.min(16000, Number(config.segment_height || 12000)));
-  const partCount = Math.ceil(height / segmentHeight);
-  for (let part = 0; part < partCount; part += 1) {
-    const y = part * segmentHeight;
-    const partHeight = Math.min(segmentHeight, height - y);
-    const outputPath = await uniqueOutputPath(
-      outputFolder,
-      `${baseName}_full_part-${String(part + 1).padStart(3, "0")}`,
-      ".png",
-    );
-    const result = await client.send("Page.captureScreenshot", {
-      format: "png",
-      fromSurface: true,
-      captureBeyondViewport: true,
-      clip: { x: 0, y, width, height: partHeight, scale: 1 },
-    }, 180000);
-    const record = await writePng(outputPath, result.data);
-    artifacts.push({
-      kind: "full_page_png_segment",
-      part: part + 1,
-      parts_total: partCount,
-      path: outputPath,
-      sha256: record.sha256,
-      size_bytes: record.bytes,
-      x_css_px: 0,
-      y_css_px: y,
-      width_css_px: width,
-      height_css_px: partHeight,
-    });
-  }
-  return { artifacts, segmented: true, page_width: width, page_height: height };
 }
 
-async function captureUrl(client, config, url, index, browserVersion, runContext) {
+async function applyBrowserEnvironment(client, config) {
+  const width = Math.max(320, Math.min(7680, Number(config.viewport_width) || 1440));
+  const height = Math.max(240, Math.min(4320, Number(config.viewport_height) || 900));
+  const deviceScaleFactor = Math.max(0.5, Math.min(4, Number(config.device_scale_factor) || 1));
+  const mobile = Boolean(config.mobile_emulation);
+  const touch = Boolean(config.touch_emulation);
+  const orientation = normalizeOrientation(config.orientation);
+  const locale = normalizeLocale(config.locale);
+  const timezone = normalizeTimezone(config.timezone);
+  const colorScheme = normalizeColorScheme(config.color_scheme);
+  const reducedMotion = Boolean(config.reduced_motion);
+
+  await client.send("Emulation.setDeviceMetricsOverride", {
+    width,
+    height,
+    deviceScaleFactor,
+    mobile,
+    screenWidth: width,
+    screenHeight: height,
+    screenOrientation: {
+      type: orientation === "portrait" ? "portraitPrimary" : "landscapePrimary",
+      angle: orientation === "portrait" ? 0 : 90,
+    },
+  });
+  await client.send("Emulation.setTouchEmulationEnabled", {
+    enabled: touch,
+    maxTouchPoints: touch ? 5 : 1,
+  });
+  if (locale !== "default") await client.send("Emulation.setLocaleOverride", { locale });
+  if (timezone !== "default") await client.send("Emulation.setTimezoneOverride", { timezoneId: timezone });
+
+  const features = [];
+  if (colorScheme !== "default") features.push({ name: "prefers-color-scheme", value: colorScheme });
+  if (reducedMotion) features.push({ name: "prefers-reduced-motion", value: "reduce" });
+  await client.send("Emulation.setEmulatedMedia", { features });
+
+  return {
+    preset: String(config.environment_preset || "custom"),
+    preset_label: environmentPresetLabel(config.environment_preset),
+    viewport_width_css_px: width,
+    viewport_height_css_px: height,
+    device_scale_factor: deviceScaleFactor,
+    mobile_layout_emulation: mobile,
+    touch_emulation: touch,
+    orientation,
+    locale,
+    timezone,
+    color_scheme: colorScheme,
+    reduced_motion: reducedMotion,
+    exact_physical_device_claimed: false,
+    note: "Environment presets configure viewport, scale, mobile layout, touch, orientation, locale, timezone, and media preferences without claiming exact physical-device reproduction or changing the browser user agent.",
+  };
+}
+
+async function prepareBrowserStateForUrl(client, config, url, runContext) {
+  const cacheDisabled = Boolean(config.disable_cache);
+  const bypassServiceWorkers = Boolean(config.bypass_service_workers);
+  const clearCookies = config.clear_cookies_between_urls !== false;
+  const storageMode = normalizeStorageClearMode(config.storage_clear_mode);
+  await client.send("Network.setCacheDisabled", { cacheDisabled });
+  await client.send("Network.setBypassServiceWorker", { bypass: bypassServiceWorkers });
+
+  if (!(runContext.visitedOrigins instanceof Set)) runContext.visitedOrigins = new Set();
+  const requestedOrigin = safeHttpOrigin(url);
+  const origins = new Set();
+  if (storageMode === "requested_origin" && requestedOrigin) origins.add(requestedOrigin);
+  if (storageMode === "all_visited_origins") {
+    for (const origin of runContext.visitedOrigins) if (origin) origins.add(origin);
+    if (requestedOrigin) origins.add(requestedOrigin);
+  }
+
+  const clearedOrigins = [];
+  const storageTypes = "appcache,file_systems,indexeddb,local_storage,websql,service_workers,cache_storage";
+  for (const origin of origins) {
+    await client.send("Storage.clearDataForOrigin", { origin, storageTypes }, 30000);
+    clearedOrigins.push(origin);
+  }
+  if (clearCookies) await client.send("Network.clearBrowserCookies", {}, 15000);
+  if (requestedOrigin) runContext.visitedOrigins.add(requestedOrigin);
+
+  return {
+    cache_disabled: cacheDisabled,
+    service_workers_bypassed: bypassServiceWorkers,
+    reload_without_cache_requested: Boolean(config.reload_without_cache),
+    storage_clear_mode: storageMode,
+    storage_clear_mode_label: storageClearModeLabel(storageMode),
+    storage_types_cleared: storageMode === "none" ? [] : storageTypes.split(","),
+    requested_origin: requestedOrigin,
+    origins_cleared: clearedOrigins,
+    cookies_cleared_before_import: clearCookies,
+    order: ["cache_and_service_worker_policy", "site_storage_clear", "cookie_clear", "cookie_import", "navigation"],
+  };
+}
+
+function recordVisitedOrigins(runContext, values) {
+  if (!(runContext.visitedOrigins instanceof Set)) runContext.visitedOrigins = new Set();
+  for (const value of values || []) {
+    const origin = safeHttpOrigin(value);
+    if (origin) runContext.visitedOrigins.add(origin);
+  }
+}
+
+async function performReadinessCycle(client, config, networkState, warnings, commandKind, commandCallback) {
+  const cycleStartedMs = Date.now();
+  const readinessTimeouts = [];
+  const readinessEvent = normalizeReadinessEvent(config.readiness_event);
+  const readinessMethod = readinessEventMethod(readinessEvent);
+  const loadTimeoutMs = Math.max(5000, Math.min(600000, Number(config.page_load_timeout_seconds || 45) * 1000));
+  networkState.inflight.clear();
+  networkState.lastActivity = Date.now();
+  networkState.maximumInflight = 0;
+  client.clearEventBacklog(readinessMethod);
+  const readinessEventStartedMs = Date.now();
+  const readinessPromise = client.waitForEvent(readinessMethod, loadTimeoutMs);
+  readinessPromise.catch(() => {});
+  const commandStartedMs = Date.now();
+  const commandResult = await commandCallback(loadTimeoutMs);
+  const commandElapsedMs = Date.now() - commandStartedMs;
+  if (commandResult?.errorText) throw new Error(`Navigation failed: ${commandResult.errorText}`);
+
+  const readinessEventResult = {
+    event: readinessEvent,
+    event_label: readinessEventLabel(readinessEvent),
+    cdp_method: readinessMethod,
+    fired: false,
+    timed_out: false,
+    elapsed_ms: 0,
+  };
+  try {
+    await readinessPromise;
+    readinessEventResult.fired = true;
+    readinessEventResult.elapsed_ms = Date.now() - readinessEventStartedMs;
+  } catch (error) {
+    readinessEventResult.timed_out = true;
+    readinessEventResult.elapsed_ms = Date.now() - readinessEventStartedMs;
+    readinessEventResult.error = String(error?.message || error);
+    await applyReadinessTimeoutAction(
+      client, config.readiness_timeout_action, readinessEventResult.event_label,
+      readinessEventResult.error, warnings, readinessTimeouts,
+    );
+  }
+
+  const networkQuiet = await waitForNetworkQuiet(
+    networkState, Number(config.network_quiet_ms || 1000),
+    Number(config.network_settle_timeout_seconds || 0) * 1000,
+  );
+  if (networkQuiet.enabled && networkQuiet.settled === false) {
+    await applyReadinessTimeoutAction(
+      client, config.readiness_timeout_action, "Network settling", networkQuiet.reason,
+      warnings, readinessTimeouts,
+    );
+  }
+
+  const pageConditions = await waitForPageConditions(client, config);
+  if (pageConditions.enabled && !pageConditions.completed) {
+    await applyReadinessTimeoutAction(
+      client, config.readiness_timeout_action, "Page conditions", pageConditions.reason,
+      warnings, readinessTimeouts,
+    );
+  }
+
+  const additionalWaitMs = Math.max(0, Math.min(60000, Number(config.additional_wait_seconds || 2) * 1000));
+  if (additionalWaitMs) await delay(additionalWaitMs);
+  return {
+    command_kind: commandKind,
+    command_elapsed_ms: commandElapsedMs,
+    command_result: commandResult || {},
+    event: readinessEventResult,
+    maximum_navigation_seconds: loadTimeoutMs / 1000,
+    network_quiet: networkQuiet,
+    page_conditions: pageConditions,
+    timeout_action: normalizeReadinessTimeoutAction(config.readiness_timeout_action),
+    timeout_action_label: readinessTimeoutActionLabel(config.readiness_timeout_action),
+    timeouts: readinessTimeouts,
+    additional_wait_seconds: additionalWaitMs / 1000,
+    total_elapsed_ms: Date.now() - cycleStartedMs,
+    classification: readinessTimeouts.length ? "ready_with_warnings" : "ready",
+  };
+}
+
+async function captureUrl(client, config, url, index, browserVersion, runContext, attemptInfo = {}) {
   const startedAt = nowIso();
   const warnings = [];
   const consoleErrors = [];
+  const consoleEntries = [];
+  let consoleEntriesDropped = 0;
   const networkState = {
     inflight: new Set(),
     lastActivity: Date.now(),
+    maximumInflight: 0,
     documentResponses: [],
     redirects: [],
+    requests: new Map(),
+    records: [],
+    failedRequests: [],
+    failed_requests_dropped: 0,
+    record_limit: 5000,
+    records_dropped: 0,
   };
+  const securityState = { visible: [], legacy: [], certificateErrors: [] };
   let mainFrameId = "";
   let cookieImport = {
     enabled: Boolean(config.use_cookies_file),
@@ -1390,32 +2529,144 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     invalid_rows_skipped: Number(config.cookie_jar?.stats?.invalid_rows_skipped) || 0,
   };
 
+  const appendNetworkRecord = (record) => {
+    if (!record) return;
+    if (networkState.records.length < networkState.record_limit) networkState.records.push(record);
+    else networkState.records_dropped += 1;
+  };
   const eventListener = (method, params) => {
     if (method === "Network.requestWillBeSent") {
+      if (params.redirectResponse) {
+        const previous = networkState.requests.get(params.requestId) || {
+          request_id: params.requestId,
+          url: params.redirectResponse.url || "",
+          resource_type: params.type || "",
+          frame_id: params.frameId || "",
+        };
+        previous.redirect = params.redirectResponse;
+        previous.response = params.redirectResponse;
+        previous.completed = true;
+        appendNetworkRecord(previous);
+      }
+      const request = params.request || {};
+      networkState.requests.set(params.requestId, {
+        request_id: params.requestId,
+        url: request.url || "",
+        document_url: params.documentURL || "",
+        method: request.method || "",
+        resource_type: params.type || "",
+        frame_id: params.frameId || "",
+        timestamp: params.timestamp || null,
+        wall_time: params.wallTime || null,
+        initiator_type: params.initiator?.type || "",
+        has_post_data: Boolean(request.hasPostData || request.postDataEntries?.length),
+        request_headers: request.headers || {},
+        response: null,
+        completed: false,
+        failed: false,
+      });
       networkState.inflight.add(params.requestId);
+      networkState.maximumInflight = Math.max(networkState.maximumInflight, networkState.inflight.size);
       networkState.lastActivity = Date.now();
       if (params.type === "Document" && params.redirectResponse && (!mainFrameId || params.frameId === mainFrameId)) {
         networkState.redirects.push({
           from_url: params.redirectResponse.url || "",
-          to_url: params.request?.url || "",
+          to_url: request.url || "",
           status: Number(params.redirectResponse.status) || null,
           status_text: params.redirectResponse.statusText || "",
         });
       }
-    } else if (method === "Network.loadingFinished" || method === "Network.loadingFailed") {
+    } else if (method === "Network.responseReceived") {
+      const record = networkState.requests.get(params.requestId);
+      if (record) record.response = params.response || {};
+      if (params.type === "Document" && (!mainFrameId || params.frameId === mainFrameId)) {
+        networkState.documentResponses.push({
+          request_id: params.requestId,
+          frame_id: params.frameId || "",
+          response: params.response || {},
+        });
+      }
+      networkState.lastActivity = Date.now();
+    } else if (method === "Network.loadingFinished") {
       networkState.inflight.delete(params.requestId);
       networkState.lastActivity = Date.now();
-    } else if (method === "Network.responseReceived" && params.type === "Document" && (!mainFrameId || params.frameId === mainFrameId)) {
-      networkState.documentResponses.push(params.response || {});
+      const record = networkState.requests.get(params.requestId);
+      if (record) {
+        record.completed = true;
+        record.encoded_data_length = Number(params.encodedDataLength) || 0;
+        appendNetworkRecord(record);
+        networkState.requests.delete(params.requestId);
+      }
+    } else if (method === "Network.loadingFailed") {
+      networkState.inflight.delete(params.requestId);
       networkState.lastActivity = Date.now();
-    } else if (method === "Runtime.consoleAPICalled" && (params.type === "error" || params.type === "warning")) {
-      const text = (params.args || []).map((arg) => arg.value ?? arg.description ?? "").join(" ").trim();
-      if (text && consoleErrors.length < 100) consoleErrors.push({ type: params.type, text });
+      const record = networkState.requests.get(params.requestId) || { request_id: params.requestId };
+      record.failed = true;
+      record.completed = true;
+      record.canceled = Boolean(params.canceled);
+      record.resource_type = record.resource_type || params.type || "";
+      record.error_text = params.errorText || "";
+      record.blocked_reason = params.blockedReason || "";
+      record.cors_error_status = params.corsErrorStatus || null;
+      appendNetworkRecord(record);
+      if (networkState.failedRequests.length < 1000) networkState.failedRequests.push({ ...record });
+      else networkState.failed_requests_dropped += 1;
+      networkState.requests.delete(params.requestId);
+    } else if (method === "Runtime.consoleAPICalled" && ["error", "warning"].includes(params.type)) {
+      const text = (params.args || []).map(safeConsoleArgument).join(" ").trim();
+      const entry = {
+        kind: "console",
+        level: params.type,
+        text: boundedText(text),
+        timestamp: params.timestamp || null,
+        execution_context_id: params.executionContextId || null,
+        stack_trace: params.stackTrace || null,
+      };
+      if (text && consoleErrors.length < 100) consoleErrors.push({ type: params.type, text: boundedText(text) });
+      if (text && consoleEntries.length < 500) consoleEntries.push(entry);
+      else if (text) consoleEntriesDropped += 1;
+    } else if (method === "Runtime.exceptionThrown") {
+      const details = params.exceptionDetails || {};
+      const description = details.exception?.description || details.text || "Uncaught exception";
+      if (consoleEntries.length < 500) consoleEntries.push({
+        kind: "exception",
+        level: "error",
+        text: boundedText(description),
+        timestamp: params.timestamp || null,
+        url: details.url || "",
+        line_number: details.lineNumber ?? null,
+        column_number: details.columnNumber ?? null,
+        stack_trace: details.stackTrace || details.exception?.preview || null,
+      });
+      else consoleEntriesDropped += 1;
+      if (consoleErrors.length < 100) consoleErrors.push({ type: "exception", text: boundedText(description) });
     } else if (method === "Log.entryAdded") {
       const entry = params.entry || {};
-      if ((entry.level === "error" || entry.level === "warning") && consoleErrors.length < 100) {
-        consoleErrors.push({ type: entry.level, text: entry.text || "" });
+      if (["error", "warning"].includes(entry.level)) {
+        if (consoleErrors.length < 100) consoleErrors.push({ type: entry.level, text: boundedText(entry.text || "") });
+        if (consoleEntries.length < 500) consoleEntries.push({
+          kind: "log",
+          level: entry.level,
+          source: entry.source || "",
+          text: boundedText(entry.text || ""),
+          timestamp: entry.timestamp || null,
+          url: entry.url || "",
+          line_number: entry.lineNumber ?? null,
+          stack_trace: entry.stackTrace || null,
+        });
+        else consoleEntriesDropped += 1;
       }
+    } else if (method === "Security.visibleSecurityStateChanged") {
+      if (securityState.visible.length < 100) securityState.visible.push(params.visibleSecurityState || params || {});
+    } else if (method === "Security.securityStateChanged") {
+      if (securityState.legacy.length < 100) securityState.legacy.push(params || {});
+    } else if (method === "Security.certificateError") {
+      if (securityState.certificateErrors.length < 100) securityState.certificateErrors.push({
+        event_id: params.eventId || null,
+        error_type: params.errorType || "",
+        request_url: params.requestURL || "",
+        recorded_utc: nowIso(),
+      });
     }
   };
   client.addEventListener(eventListener);
@@ -1423,8 +2674,11 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
   try {
     await client.send("Page.enable");
     await client.send("Runtime.enable");
-    await client.send("Network.enable", { maxTotalBufferSize: 10_000_000, maxResourceBufferSize: 5_000_000 });
-    cookieImport = await importCookiesForUrl(client, config.cookie_jar, url, config.cookie_scope);
+    await client.send("Network.enable", { maxTotalBufferSize: 50_000_000, maxResourceBufferSize: 20_000_000 });
+    try { await client.send("Security.enable"); } catch { /* optional */ }
+    const browserEnvironment = await applyBrowserEnvironment(client, config);
+    const pageStatePreparation = await prepareBrowserStateForUrl(client, config, url, runContext);
+    cookieImport = await importCookiesForUrl(client, config.cookie_jar, url, config.cookie_scope, { clear_first: false });
     if (cookieImport.enabled) {
       console.log(
         `WEB_CAPTURE_COOKIES_APPLIED	${index}	${cookieImport.scope}	${cookieImport.selected_cookie_count}	` +
@@ -1438,39 +2692,51 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       }
     }
     try { await client.send("Log.enable"); } catch { /* optional */ }
-    await client.send("Emulation.setDeviceMetricsOverride", {
-      width: Number(config.viewport_width) || 1440,
-      height: Number(config.viewport_height) || 900,
-      deviceScaleFactor: 1,
-      mobile: false,
-      screenWidth: Number(config.viewport_width) || 1440,
-      screenHeight: Number(config.viewport_height) || 900,
-    });
 
-    const loadTimeoutMs = Math.max(5000, Number(config.page_load_timeout_seconds || 45) * 1000);
-    const loadPromise = client.waitForEvent("Page.loadEventFired", loadTimeoutMs);
-    loadPromise.catch(() => {});
-    const navigation = await client.send("Page.navigate", { url }, loadTimeoutMs);
-    if (navigation.errorText) throw new Error(`Navigation failed: ${navigation.errorText}`);
+    const readinessStartedMs = Date.now();
+    const initialReadiness = await performReadinessCycle(
+      client, config, networkState, warnings, "navigate",
+      (timeoutMs) => client.send("Page.navigate", { url }, timeoutMs),
+    );
+    const navigation = initialReadiness.command_result || {};
     mainFrameId = navigation.frameId || mainFrameId;
 
-    try {
-      await loadPromise;
-    } catch (error) {
-      warnings.push(`Page load event timeout: ${error.message || error}`);
-      try { await client.send("Page.stopLoading"); } catch { /* best effort */ }
+    let finalReadiness = initialReadiness;
+    let reloadReadiness = null;
+    if (Boolean(config.reload_without_cache)) {
+      reloadReadiness = await performReadinessCycle(
+        client, config, networkState, warnings, "reload_without_cache",
+        (timeoutMs) => client.send("Page.reload", { ignoreCache: true }, timeoutMs),
+      );
+      finalReadiness = reloadReadiness;
     }
+    const readinessInfo = {
+      cycles: reloadReadiness ? [initialReadiness, reloadReadiness] : [initialReadiness],
+      initial_navigation: initialReadiness,
+      reload_without_cache: {
+        enabled: Boolean(config.reload_without_cache),
+        performed: Boolean(reloadReadiness),
+        result: reloadReadiness,
+      },
+      event: finalReadiness.event,
+      maximum_navigation_seconds: finalReadiness.maximum_navigation_seconds,
+      navigation_command_elapsed_ms: initialReadiness.command_elapsed_ms,
+      network_quiet: finalReadiness.network_quiet,
+      page_conditions: finalReadiness.page_conditions,
+      timeout_action: finalReadiness.timeout_action,
+      timeout_action_label: finalReadiness.timeout_action_label,
+      timeouts: [
+        ...(initialReadiness.timeouts || []),
+        ...((reloadReadiness && reloadReadiness.timeouts) || []),
+      ],
+      additional_wait_seconds: finalReadiness.additional_wait_seconds,
+      total_elapsed_ms: Date.now() - readinessStartedMs,
+      classification: (initialReadiness.timeouts?.length || reloadReadiness?.timeouts?.length)
+        ? "ready_with_warnings" : "ready",
+    };
 
-    const networkQuiet = await waitForNetworkQuiet(networkState, 750, Math.min(10000, Math.max(2000, loadTimeoutMs / 4)));
-    if (!networkQuiet) warnings.push("Network activity did not fully settle before capture.");
-
-    const additionalWaitMs = Math.max(0, Math.min(60000, Number(config.additional_wait_seconds || 2) * 1000));
-    if (additionalWaitMs) await delay(additionalWaitMs);
-
-    const scrollResult = await performLazyScroll(client, config);
-    if (scrollResult?.timed_out) warnings.push("Lazy-load scrolling reached its configured time limit.");
-
-    const pageInfo = await evaluate(client, `({
+    const captureMode = normalizeCaptureMode(config.capture_mode);
+    let pageInfo = await evaluate(client, `({
       title: document.title || "",
       final_url: location.href,
       language: document.documentElement ? (document.documentElement.lang || "") : "",
@@ -1480,12 +2746,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       viewport_height: window.innerHeight || 0
     })`);
 
-    const metrics = await client.send("Page.getLayoutMetrics");
-    const contentSize = metrics.cssContentSize || metrics.contentSize || {};
-    const layout = {
-      width: Math.max(Number(contentSize.width) || 0, Number(config.viewport_width) || 1440),
-      height: Math.max(Number(contentSize.height) || 0, Number(config.viewport_height) || 900),
-    };
+    recordVisitedOrigins(runContext, [
+      url,
+      pageInfo.final_url,
+      ...networkState.redirects.flatMap((entry) => [entry.from_url, entry.to_url]),
+      ...networkState.documentResponses.map((entry) => entry.response?.url || ""),
+    ]);
 
     let domain = "unknown-domain";
     try { domain = new URL(pageInfo.final_url || url).hostname || "unknown-domain"; } catch { /* keep fallback */ }
@@ -1495,11 +2761,95 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       domain,
       title: pageInfo.title,
       index,
-      mode: config.capture_mode,
+      mode: captureMode,
       caseName: config.case_name || "",
     });
 
-    const capture = await capturePage(client, config, runContext.webMediaFolder, baseName, layout);
+    const capture = {
+      artifacts: [],
+      segmented: false,
+      page_width: Number(pageInfo.viewport_width) || Number(config.viewport_width) || 1440,
+      page_height: Number(pageInfo.viewport_height) || Number(config.viewport_height) || 900,
+      segmentation: { used: false, limit_reached: false },
+    };
+    const partialReasons = [];
+    const warningReasons = [];
+    let stabilizationInfo = null;
+    let stabilizationCleanup = { cleaned: 0 };
+    let measurementInfo = {
+      remeasure_before_capture: Boolean(config.remeasure_before_capture),
+      initial: null,
+      final: null,
+      used: null,
+    };
+    let scrollResult = { performed: false, reason: "Initial viewport-only capture does not scroll before capture." };
+    try {
+      stabilizationInfo = await applyCaptureStabilization(client, config);
+      const initialMetrics = await client.send("Page.getLayoutMetrics");
+      const initialContentSize = initialMetrics.cssContentSize || initialMetrics.contentSize || {};
+      measurementInfo.initial = {
+        width: Math.max(Number(initialContentSize.width) || 0, Number(config.viewport_width) || 1440),
+        height: Math.max(Number(initialContentSize.height) || 0, Number(config.viewport_height) || 900),
+      };
+
+      if (captureMode === "viewport" || captureMode === "both") {
+        const viewportArtifacts = await captureViewportImage(client, config, runContext.webMediaFolder, baseName);
+        capture.artifacts.push(...viewportArtifacts);
+      }
+
+      if (captureMode === "full_page" || captureMode === "both") {
+        scrollResult = await performLazyScroll(client, config);
+        if (scrollResult?.timed_out) {
+          const message = "Lazy-load scrolling reached its configured time limit; the result is marked partial.";
+          warnings.push(message);
+          partialReasons.push("scroll_time_limit_reached");
+        }
+        if (scrollResult?.growth_limit_reached) {
+          const action = normalizeGrowthLimitAction(config.growth_limit_action);
+          const message = `Page growth reached ${scrollResult.maximum_growth_cycles} configured cycle(s).`;
+          if (action === "fail") throw new Error(`${message} Growth-limit behavior is Fail URL.`);
+          warnings.push(`${message} Action: ${growthLimitActionLabel(action)}.`);
+          if (action === "capture_partial") partialReasons.push("page_growth_limit_reached");
+          else warningReasons.push("page_growth_limit_reached");
+        }
+
+        pageInfo = await evaluate(client, `({
+          title: document.title || "",
+          final_url: location.href,
+          language: document.documentElement ? (document.documentElement.lang || "") : "",
+          content_type: document.contentType || "",
+          ready_state: document.readyState || "",
+          viewport_width: window.innerWidth || 0,
+          viewport_height: window.innerHeight || 0
+        })`);
+        let layout = measurementInfo.initial;
+        if (config.remeasure_before_capture) {
+          const finalMetrics = await client.send("Page.getLayoutMetrics");
+          const finalContentSize = finalMetrics.cssContentSize || finalMetrics.contentSize || {};
+          measurementInfo.final = {
+            width: Math.max(Number(finalContentSize.width) || 0, Number(config.viewport_width) || 1440),
+            height: Math.max(Number(finalContentSize.height) || 0, Number(config.viewport_height) || 900),
+          };
+          layout = measurementInfo.final;
+        }
+        measurementInfo.used = layout;
+        const fullCapture = await captureFullPageImages(client, config, runContext.webMediaFolder, baseName, layout);
+        capture.artifacts.push(...fullCapture.artifacts);
+        capture.segmented = fullCapture.segmented;
+        capture.page_width = fullCapture.page_width;
+        capture.page_height = fullCapture.page_height;
+        capture.segmentation = fullCapture.segmentation || capture.segmentation;
+        if (capture.segmentation?.limit_reached) {
+          warnings.push(`Long-page capture required ${capture.segmentation.required_segments} segments, exceeding the configured maximum of ${capture.segmentation.maximum_segments}; the result is marked partial.`);
+          partialReasons.push("maximum_segment_count_reached");
+        }
+      }
+    } catch (error) {
+      await removeCaptureArtifacts(capture.artifacts);
+      throw error;
+    } finally {
+      stabilizationCleanup = await cleanupCaptureStabilization(client);
+    }
     const pdfArtifacts = [];
     let pdfError = "";
     let pdfBehaviorInfo = {
@@ -1534,11 +2884,42 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       }
     }
 
-    const mainResponse = networkState.documentResponses.length
+    const mainDocumentEntry = networkState.documentResponses.length
       ? networkState.documentResponses[networkState.documentResponses.length - 1]
       : {};
+    const mainResponse = mainDocumentEntry.response || mainDocumentEntry || {};
 
-    const allArtifacts = [...capture.artifacts, ...pdfArtifacts];
+    const supplementalEvidence = await captureSupplementalEvidence(client, config, {
+      folder: runContext.webMediaFolder,
+      baseName,
+      requestedUrl: url,
+      pageInfo,
+      mainDocumentEntry,
+      mainResponse,
+      networkState,
+      consoleEntries,
+      consoleEntriesDropped,
+      securityState,
+    });
+    for (const evidenceError of supplementalEvidence.errors) {
+      const message = `Requested evidence artifact ${evidenceError.artifact} failed: ${evidenceError.error}`;
+      warnings.push(message);
+      console.log(message);
+    }
+
+    const allArtifacts = [...capture.artifacts, ...pdfArtifacts, ...supplementalEvidence.artifacts];
+    if (readinessInfo.timeouts.length) warningReasons.push("readiness_timeout");
+    const requestedArtifactErrors = [];
+    if (pdfError) {
+      warningReasons.push("requested_pdf_failed");
+      requestedArtifactErrors.push({ artifact: "pdf", error: pdfError });
+    }
+    requestedArtifactErrors.push(...supplementalEvidence.errors);
+    const captureCompleteness = buildCaptureCompleteness(
+      partialReasons, warningReasons, warnings, requestedArtifactErrors, capture.artifacts.length,
+    );
+    const completenessClassification = captureCompleteness.classification;
+    console.log(`Capture completeness: ${completenessClassification.replaceAll("_", " ")}.`);
     const sidecar = {
       type: "avi-capture-gui-web-page-capture",
       schema_version: SCRIPT_SCHEMA_VERSION,
@@ -1547,6 +2928,9 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       helper_script: basename(config.script_path || "script-webcapture.ts"),
       job_id: config.job_id || "",
       capture_index: index,
+      capture_attempt: Math.max(1, Number(attemptInfo.attempt) || 1),
+      configured_capture_retries: Math.max(0, Number(config.capture_retry_count) || 0),
+      prior_capture_retry_errors: Array.isArray(attemptInfo.prior_errors) ? attemptInfo.prior_errors : [],
       capture_started_utc: startedAt,
       capture_completed_utc: nowIso(),
       requested_url: url,
@@ -1590,13 +2974,35 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
             : "Only cookies applicable to the submitted hostname were injected into the isolated browser profile.")
           : "Cookie-file use was disabled.",
       },
+      browser_environment: browserEnvironment,
+      page_state: {
+        preparation: pageStatePreparation,
+        cache_disabled: Boolean(config.disable_cache),
+        service_workers_bypassed: Boolean(config.bypass_service_workers),
+        reload_without_cache: readinessInfo.reload_without_cache,
+        storage_clear_mode: normalizeStorageClearMode(config.storage_clear_mode),
+        storage_clear_mode_label: storageClearModeLabel(config.storage_clear_mode),
+        cookies_cleared_between_urls: config.clear_cookies_between_urls !== false,
+        visited_origins_tracked: runContext.visitedOrigins instanceof Set ? Array.from(runContext.visitedOrigins).sort() : [],
+      },
       viewport_width_css_px: Number(pageInfo.viewport_width) || Number(config.viewport_width) || 1440,
       viewport_height_css_px: Number(pageInfo.viewport_height) || Number(config.viewport_height) || 900,
       page_width_css_px: capture.page_width,
       page_height_css_px: capture.page_height,
-      capture_mode: config.capture_mode === "viewport" ? "viewport" : "full_page",
+      capture_mode: normalizeCaptureMode(config.capture_mode),
+      image_format: normalizeImageFormat(config.image_format),
+      image_quality: normalizeImageFormat(config.image_format) === "png" ? null : normalizeImageQuality(config.image_quality),
+      image_lossy: normalizeImageFormat(config.image_format) !== "png",
       segmented: capture.segmented,
+      segmentation: capture.segmentation || {},
       lazy_scroll: scrollResult || {},
+      page_measurement: measurementInfo,
+      visual_stabilization: {
+        ...(stabilizationInfo || {}),
+        cleanup: stabilizationCleanup,
+      },
+      capture_completeness: captureCompleteness,
+      readiness: readinessInfo,
       load_timeout_seconds: Number(config.page_load_timeout_seconds) || 45,
       additional_wait_seconds: Number(config.additional_wait_seconds) || 0,
       proxy_used: Boolean(config.proxy_server),
@@ -1610,6 +3016,22 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
           ? "The GUI records the requested and final URL in the app-level Webpage Capture SQLite archive after this capture completes successfully."
           : "The app-level Universal Download Archive setting was disabled for this run.",
       },
+      evidence_outputs: {
+        requested: supplementalEvidence.requested,
+        network_query_mode: normalizeNetworkQueryMode(config.network_query_mode),
+        results: Object.fromEntries(Object.entries(supplementalEvidence.results).map(([name, result]) => [name, {
+          ...result,
+          path: result.path && result.path.startsWith(runContext.caseFolder)
+            ? result.path.slice(runContext.caseFolder.length).replace(/^[\/]+/, "")
+            : (result.path || ""),
+        }])),
+        errors: supplementalEvidence.errors,
+        sensitive_headers_redacted: ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie"],
+        request_bodies_recorded: false,
+      },
+      security_metadata: await getCurrentSecurityMetadata(
+        client, pageInfo, mainResponse, securityState, config.network_query_mode,
+      ),
       pdf_options: {
         enabled: Boolean(config.create_pdf),
         landscape: Boolean(config.pdf_landscape),
@@ -1635,6 +3057,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       },
       warnings,
       browser_console_warnings_and_errors: consoleErrors,
+      browser_console_entry_count: consoleEntries.length,
+      browser_console_entries_dropped: consoleEntriesDropped,
+      failed_request_count: networkState.failedRequests.length,
+      failed_requests_dropped: networkState.failed_requests_dropped,
+      network_record_count: networkState.records.length + networkState.requests.size,
+      network_records_dropped: networkState.records_dropped,
       artifacts: allArtifacts.map((artifact) => ({
         ...artifact,
         path: artifact.path.startsWith(runContext.caseFolder)
@@ -1661,8 +3089,10 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       title: pageInfo.title || "",
       warnings,
       cookieImport,
-      complete: !pdfError,
-      error: pdfError,
+      captureAttempt: Math.max(1, Number(attemptInfo.attempt) || 1),
+      completenessClassification,
+      complete: captureCompleteness.requested_artifacts_complete,
+      error: requestedArtifactErrors.map((entry) => entry.error).join(" | "),
     };
   } finally {
     client.removeEventListener(eventListener);
@@ -1688,6 +3118,8 @@ async function launchBrowser(config) {
     "--allow-file-access-from-files",
     "--new-window",
   ];
+  const locale = normalizeLocale(config.locale);
+  if (locale !== "default") args.push(`--lang=${locale}`);
   if (config.proxy_server) args.push(`--proxy-server=${config.proxy_server}`);
   args.push("about:blank");
 
@@ -1799,7 +3231,10 @@ async function main() {
     logPath = joinPath(logsFolder, `web-capture_${runStamp}.log`);
     await Deno.writeTextFile(logPath, "");
     const manifestPath = joinPath(manifestsFolder, `sha256-manifest-web_${runStamp}.csv`);
-    const runContext = { caseFolder, webMediaFolder, logsFolder, manifestsFolder, manifestPath };
+    const runContext = {
+      caseFolder, webMediaFolder, logsFolder, manifestsFolder, manifestPath,
+      visitedOrigins: new Set(),
+    };
 
     await log("Webpage Capture started.");
     await log(`Browser: ${browser.version.Browser || basename(config.browser_path)}`);
@@ -1820,16 +3255,63 @@ async function main() {
     } else {
       await log("Universal Webpage archive: disabled.");
     }
-    await log(`Capture mode: ${config.capture_mode === "viewport" ? "viewport" : "full page"}`);
+    const captureModeLabel = { full_page: "full page", viewport: "initial viewport", both: "full page + initial viewport" }[normalizeCaptureMode(config.capture_mode)];
+    const imageFormat = normalizeImageFormat(config.image_format);
+    const imageQualityLabel = imageFormat === "png" ? "lossless" : `quality ${normalizeImageQuality(config.image_quality)}`;
+    await log(`Capture mode: ${captureModeLabel}`);
+    await log(`Image format: ${imageFormat.toUpperCase()} (${imageQualityLabel})`);
+    await log(
+      `Browser environment: ${environmentPresetLabel(config.environment_preset)}; ` +
+      `${Number(config.viewport_width) || 1440}×${Number(config.viewport_height) || 900}; ` +
+      `scale ${Math.max(0.5, Math.min(4, Number(config.device_scale_factor) || 1))}; ` +
+      `${config.mobile_emulation ? "mobile layout" : "desktop layout"}; ` +
+      `${config.touch_emulation ? "touch" : "no touch"}; ${normalizeOrientation(config.orientation)}.`,
+    );
+    await log(
+      `Browser preferences: locale ${normalizeLocale(config.locale)}; timezone ${normalizeTimezone(config.timezone)}; ` +
+      `colour scheme ${normalizeColorScheme(config.color_scheme)}; reduced motion ${config.reduced_motion ? "on" : "off"}.`,
+    );
+    await log(
+      `Page state: cache ${config.disable_cache ? "disabled" : "enabled"}; service workers ` +
+      `${config.bypass_service_workers ? "bypassed" : "allowed"}; ${storageClearModeLabel(config.storage_clear_mode)}; ` +
+      `cookies ${config.clear_cookies_between_urls !== false ? "cleared before each URL" : "retained between URLs"}; ` +
+      `reload without cache ${config.reload_without_cache ? "on" : "off"}.`,
+    );
+    await log(`Capture retries: ${Math.max(0, Math.min(2, Number(config.capture_retry_count) || 0))}`);
+    const evidenceLabels = [];
+    if (config.save_mhtml) evidenceLabels.push("MHTML");
+    if (config.save_response_html) evidenceLabels.push("final response HTML");
+    if (config.save_rendered_dom) evidenceLabels.push("rendered DOM HTML");
+    if (config.save_network_report) evidenceLabels.push(`network report (${normalizeNetworkQueryMode(config.network_query_mode)})`);
+    if (config.save_console_report) evidenceLabels.push("console report");
+    if (config.save_failed_request_report) evidenceLabels.push("failed-request report");
+    if (config.save_security_report) evidenceLabels.push("security report");
+    if (config.save_failure_screenshot) evidenceLabels.push("failure screenshot/metadata");
+    await log(`Evidence outputs: ${evidenceLabels.length ? evidenceLabels.join(", ") : "none"}.`);
+    await log(`Readiness event: ${readinessEventLabel(config.readiness_event)} (maximum navigation ${Math.max(5, Math.min(600, Number(config.page_load_timeout_seconds) || 45))}s).`);
+    const configuredNetworkMaximum = Math.max(0, Math.min(300, Number(config.network_settle_timeout_seconds) || 0));
+    await log(configuredNetworkMaximum > 0
+      ? `Network settling: ${Math.max(100, Math.min(10000, Number(config.network_quiet_ms) || 1000))}ms quiet, ${configuredNetworkMaximum}s maximum.`
+      : "Network settling: disabled.");
+    const conditionLabels = [];
+    if (config.wait_selector_enabled) conditionLabels.push(`CSS selector (${String(config.wait_selector_state || "visible")})`);
+    if (config.wait_text_enabled) conditionLabels.push(`text (${String(config.wait_text_scope || "visible")})`);
+    await log(conditionLabels.length
+      ? `Page conditions: ${conditionLabels.join(" + ")} with ${Math.max(1, Math.min(300, Number(config.condition_timeout_seconds) || 15))}s shared timeout.`
+      : "Page conditions: disabled.");
+    await log(`Readiness timeout action: ${readinessTimeoutActionLabel(config.readiness_timeout_action)}.`);
+    await log(`Additional readiness wait: ${Math.max(0, Math.min(60, Number(config.additional_wait_seconds) || 0))}s.`);
     await log(`Submitted URLs: ${(config.urls || []).length}`);
 
     const urls = Array.isArray(config.urls) ? config.urls : [];
     for (let i = 0; i < urls.length; i += 1) {
       const url = String(urls[i] || "").trim();
+      const safeClassificationUrl = url.replace(/[\t\r\n]+/g, " ");
       if (!/^https?:\/\//i.test(url)) {
         failed += 1;
         await log(`URL ${i + 1}/${urls.length} rejected because it is not HTTP/HTTPS: ${url}`);
-        console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${url}`);
+        console.log(`GUI_WEB_CAPTURE_CLASSIFICATION\t${i + 1}\t${urls.length}\tfailed\t${safeClassificationUrl}`);
+        console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${safeClassificationUrl}`);
         continue;
       }
 
@@ -1839,7 +3321,6 @@ async function main() {
       if (archiveSkip) {
         skipped += 1;
         const archiveId = String(archiveSkip.archive_id || "web:unknown").replace(/[\t\r\n]+/g, " ");
-        const safeUrl = url.replace(/[\t\r\n]+/g, " ");
         const skipRecord = {
           url_index: i + 1,
           url_total: urls.length,
@@ -1855,17 +3336,48 @@ async function main() {
         await log(
           `URL ${i + 1}/${urls.length} skipped by Universal Webpage archive: ${archiveId} | ${url}`,
         );
-        console.log(`GUI_UNIVERSAL_ARCHIVE_SKIP\t${i + 1}\t${urls.length}\t${archiveId}\t${safeUrl}`);
-        console.log(`GUI_QUEUE_URL_COMPLETE\t${i + 1}\t${urls.length}\t${safeUrl}`);
+        console.log(`GUI_UNIVERSAL_ARCHIVE_SKIP\t${i + 1}\t${urls.length}\t${archiveId}\t${safeClassificationUrl}`);
+        console.log(`GUI_QUEUE_URL_COMPLETE\t${i + 1}\t${urls.length}\t${safeClassificationUrl}`);
         continue;
       }
 
       await log(`URL ${i + 1}/${urls.length}: ${url}`);
       try {
-        const result = await captureUrl(browser.client, config, url, i + 1, browser.version, runContext);
+        const retryLimit = Math.max(0, Math.min(2, Number(config.capture_retry_count) || 0));
+        const priorCaptureErrors = [];
+        let result = null;
+        for (let attempt = 1; attempt <= retryLimit + 1; attempt += 1) {
+          try {
+            result = await captureUrl(
+              browser.client,
+              config,
+              url,
+              i + 1,
+              browser.version,
+              runContext,
+              { attempt, prior_errors: [...priorCaptureErrors] },
+            );
+            break;
+          } catch (error) {
+            const message = String(error?.message || error);
+            if (error?.stage === "capture" && attempt <= retryLimit) {
+              priorCaptureErrors.push({ attempt, error: message, recorded_utc: nowIso() });
+              await log(`Capture attempt ${attempt} failed; re-navigating for retry ${attempt + 1} of ${retryLimit + 1}: ${message}`);
+              continue;
+            }
+            throw error;
+          }
+        }
+        if (!result) throw new Error("Webpage Capture produced no result after the configured attempts.");
         for (const artifact of result.artifacts) manifestRecords.push(artifact);
         await log(`Captured: ${result.finalUrl}`);
         await log(`Title: ${result.title || "(untitled)"}`);
+        await log(
+          `Capture completeness: ${String(result.completenessClassification || "complete").replaceAll("_", " ")}.`,
+        );
+        if (Number(result.captureAttempt) > 1) {
+          await log(`Visual capture succeeded on attempt ${result.captureAttempt} after ${Number(result.captureAttempt) - 1} retry/retries.`);
+        }
         if (result.cookieImport?.enabled) {
           await log(
             `Cookies for URL (${result.cookieImport.scope_label}): ${result.cookieImport.accepted_cookie_count} of ` +
@@ -1875,6 +3387,10 @@ async function main() {
           );
         }
         if (result.warnings.length) await log(`Warnings: ${result.warnings.join(" | ")}`);
+        console.log(
+          `GUI_WEB_CAPTURE_CLASSIFICATION\t${i + 1}\t${urls.length}\t` +
+          `${result.completenessClassification || "complete"}\t${safeClassificationUrl}`,
+        );
         if (result.complete) {
           completed += 1;
           if (config.universal_archive?.enabled) {
@@ -1898,16 +3414,33 @@ async function main() {
             };
             console.log(`GUI_WEB_UNIVERSAL_ARCHIVE_RECORD\t${JSON.stringify(archivePayload)}`);
           }
-          console.log(`GUI_QUEUE_URL_COMPLETE\t${i + 1}\t${urls.length}\t${url}`);
+          console.log(`GUI_QUEUE_URL_COMPLETE\t${i + 1}\t${urls.length}\t${safeClassificationUrl}`);
         } else {
           failed += 1;
           await log(`ERROR: ${result.error || "A requested Webpage Capture artifact was not created."}`);
-          console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${url}`);
+          console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${safeClassificationUrl}`);
         }
       } catch (error) {
         failed += 1;
         await log(`ERROR capturing ${url}: ${error?.stack || error?.message || error}`);
-        console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${url}`);
+        try {
+          const failureEvidence = await captureFailureEvidence(
+            browser.client,
+            config,
+            url,
+            i + 1,
+            browser.version,
+            runContext,
+            error,
+          );
+          for (const artifact of failureEvidence.artifacts) manifestRecords.push(artifact);
+          if (failureEvidence.screenshotPath) await log(`Failure screenshot: ${failureEvidence.screenshotPath}`);
+          if (failureEvidence.metadataPath) await log(`Failure metadata: ${failureEvidence.metadataPath}`);
+        } catch (failureEvidenceError) {
+          await log(`WARNING: Failure evidence could not be created: ${failureEvidenceError?.message || failureEvidenceError}`);
+        }
+        console.log(`GUI_WEB_CAPTURE_CLASSIFICATION\t${i + 1}\t${urls.length}\tfailed\t${safeClassificationUrl}`);
+        console.log(`GUI_QUEUE_URL_INCOMPLETE\t${i + 1}\t${urls.length}\t${safeClassificationUrl}`);
       }
     }
 
