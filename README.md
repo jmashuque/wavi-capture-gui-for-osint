@@ -168,8 +168,6 @@ Do this once before the first capture, or whenever you prepare a fresh copy of W
      script-webcapture.ts
      README.md
      CHANGELOG.md
-     VERSION.txt
-     VERIFY_HASHES.txt
      LICENSE
      yt-dlp.exe
      gallery-dl.exe
