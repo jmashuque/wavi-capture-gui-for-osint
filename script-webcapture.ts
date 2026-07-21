@@ -9,7 +9,7 @@ explicitly enabled, it may read a user-selected Netscape cookies.txt file and
 inject either site-applicable cookies or the entire file into the isolated browser session.
 */
 
-const SCRIPT_SCHEMA_VERSION = 6;
+const SCRIPT_SCHEMA_VERSION = 8;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -70,6 +70,132 @@ function bytesFromBase64(value) {
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
   return bytes;
+}
+
+const PDF_PRINT_COMMAND_TIMEOUT_MS = 180000;
+const PDF_STREAM_READ_TIMEOUT_MS = 30000;
+const PDF_STREAM_TOTAL_TIMEOUT_MS = 600000;
+const PDF_STREAM_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+const BROWSER_STDERR_TAIL_CHARACTERS = 16384;
+
+const SHA256_CONSTANTS = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function rotateRight32(value, bits) {
+  return ((value >>> bits) | (value << (32 - bits))) >>> 0;
+}
+
+class IncrementalSha256 {
+  constructor() {
+    this.state = new Uint32Array([
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ]);
+    this.buffer = new Uint8Array(64);
+    this.bufferLength = 0;
+    this.bytesHashed = 0n;
+    this.finished = false;
+  }
+
+  update(input) {
+    if (this.finished) throw new Error("SHA-256 digest has already been finalized.");
+    const data = input instanceof Uint8Array ? input : new Uint8Array(input || 0);
+    this.bytesHashed += BigInt(data.length);
+    let offset = 0;
+
+    if (this.bufferLength > 0) {
+      const needed = 64 - this.bufferLength;
+      const take = Math.min(needed, data.length);
+      this.buffer.set(data.subarray(0, take), this.bufferLength);
+      this.bufferLength += take;
+      offset += take;
+      if (this.bufferLength === 64) {
+        this.processBlock(this.buffer);
+        this.bufferLength = 0;
+      }
+    }
+
+    while (offset + 64 <= data.length) {
+      this.processBlock(data.subarray(offset, offset + 64));
+      offset += 64;
+    }
+
+    if (offset < data.length) {
+      this.buffer.set(data.subarray(offset), 0);
+      this.bufferLength = data.length - offset;
+    }
+    return this;
+  }
+
+  processBlock(block) {
+    const words = new Uint32Array(64);
+    for (let i = 0; i < 16; i += 1) {
+      const offset = i * 4;
+      words[i] = (
+        (block[offset] << 24) |
+        (block[offset + 1] << 16) |
+        (block[offset + 2] << 8) |
+        block[offset + 3]
+      ) >>> 0;
+    }
+    for (let i = 16; i < 64; i += 1) {
+      const s0 = (rotateRight32(words[i - 15], 7) ^ rotateRight32(words[i - 15], 18) ^ (words[i - 15] >>> 3)) >>> 0;
+      const s1 = (rotateRight32(words[i - 2], 17) ^ rotateRight32(words[i - 2], 19) ^ (words[i - 2] >>> 10)) >>> 0;
+      words[i] = (words[i - 16] + s0 + words[i - 7] + s1) >>> 0;
+    }
+
+    let [a, b, c, d, e, f, g, h] = this.state;
+    for (let i = 0; i < 64; i += 1) {
+      const sum1 = (rotateRight32(e, 6) ^ rotateRight32(e, 11) ^ rotateRight32(e, 25)) >>> 0;
+      const choice = ((e & f) ^ ((~e) & g)) >>> 0;
+      const temp1 = (h + sum1 + choice + SHA256_CONSTANTS[i] + words[i]) >>> 0;
+      const sum0 = (rotateRight32(a, 2) ^ rotateRight32(a, 13) ^ rotateRight32(a, 22)) >>> 0;
+      const majority = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const temp2 = (sum0 + majority) >>> 0;
+      h = g;
+      g = f;
+      f = e;
+      e = (d + temp1) >>> 0;
+      d = c;
+      c = b;
+      b = a;
+      a = (temp1 + temp2) >>> 0;
+    }
+
+    this.state[0] = (this.state[0] + a) >>> 0;
+    this.state[1] = (this.state[1] + b) >>> 0;
+    this.state[2] = (this.state[2] + c) >>> 0;
+    this.state[3] = (this.state[3] + d) >>> 0;
+    this.state[4] = (this.state[4] + e) >>> 0;
+    this.state[5] = (this.state[5] + f) >>> 0;
+    this.state[6] = (this.state[6] + g) >>> 0;
+    this.state[7] = (this.state[7] + h) >>> 0;
+  }
+
+  digestHex() {
+    if (this.finished) throw new Error("SHA-256 digest has already been finalized.");
+    this.finished = true;
+    const bitLength = this.bytesHashed * 8n;
+    const finalLength = this.bufferLength < 56 ? 64 : 128;
+    const finalBlock = new Uint8Array(finalLength);
+    finalBlock.set(this.buffer.subarray(0, this.bufferLength), 0);
+    finalBlock[this.bufferLength] = 0x80;
+    for (let i = 0; i < 8; i += 1) {
+      finalBlock[finalLength - 1 - i] = Number((bitLength >> BigInt(i * 8)) & 0xffn);
+    }
+    for (let offset = 0; offset < finalBlock.length; offset += 64) {
+      this.processBlock(finalBlock.subarray(offset, offset + 64));
+    }
+    return Array.from(this.state, (word) => word.toString(16).padStart(8, "0")).join("").toUpperCase();
+  }
 }
 
 async function sha256Bytes(bytes) {
@@ -513,6 +639,20 @@ function growthLimitActionLabel(value) {
 
 function normalizeCaptureFixedStickyBehavior(value) {
   return normalizePdfPageBehavior(value);
+}
+
+function normalizePdfLargeHandling(value) {
+  const handling = String(value || "automatic").trim();
+  return ["automatic", "single", "split", "fail"].includes(handling) ? handling : "automatic";
+}
+
+function pdfLargeHandlingLabel(value) {
+  return {
+    automatic: "Automatic",
+    single: "Single PDF",
+    split: "Split into parts",
+    fail: "Fail above safety limit",
+  }[normalizePdfLargeHandling(value)];
 }
 
 function buildCaptureCompleteness(partialReasons, warningReasons, warnings, requestedArtifactErrors, visualArtifactCount) {
@@ -1173,6 +1313,12 @@ class CdpClient {
     this.eventWaiters = new Map();
     this.eventBacklog = new Map();
     this.listeners = [];
+    this.transportDiagnostics = {
+      error: null,
+      close: null,
+      last_failure: null,
+    };
+    this.browserDiagnostics = null;
 
     webSocket.onmessage = (event) => {
       let message;
@@ -1215,23 +1361,59 @@ class CdpClient {
       }
     };
 
-    const failAll = (reason) => {
+    const failAll = (reason, details = null) => {
+      this.transportDiagnostics.last_failure = {
+        recorded_utc: nowIso(),
+        reason,
+        details,
+      };
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
-        pending.reject(new Error(reason));
+        const error = new Error(reason);
+        error.cdp_transport = this.getTransportDiagnostics();
+        pending.reject(error);
       }
       this.pending.clear();
       for (const waiters of this.eventWaiters.values()) {
         for (const waiter of waiters) {
           clearTimeout(waiter.timer);
-          waiter.reject(new Error(reason));
+          const error = new Error(reason);
+          error.cdp_transport = this.getTransportDiagnostics();
+          waiter.reject(error);
         }
       }
       this.eventWaiters.clear();
     };
 
-    webSocket.onerror = () => failAll("DevTools WebSocket error.");
-    webSocket.onclose = () => failAll("DevTools WebSocket closed.");
+    webSocket.onerror = (event) => {
+      const detail = String(event?.message || event?.error?.message || "").trim();
+      this.transportDiagnostics.error = {
+        recorded_utc: nowIso(),
+        message: detail,
+      };
+      failAll(detail ? `DevTools WebSocket error: ${detail}` : "DevTools WebSocket error.", this.transportDiagnostics.error);
+    };
+    webSocket.onclose = (event) => {
+      const close = {
+        recorded_utc: nowIso(),
+        code: Number(event?.code) || 0,
+        reason: String(event?.reason || ""),
+        was_clean: Boolean(event?.wasClean),
+      };
+      this.transportDiagnostics.close = close;
+      const reasonParts = [`code ${close.code}`];
+      if (close.reason) reasonParts.push(close.reason);
+      reasonParts.push(close.was_clean ? "clean" : "unclean");
+      failAll(`DevTools WebSocket closed (${reasonParts.join(", ")}).`, close);
+    };
+  }
+
+  setBrowserDiagnostics(diagnostics) {
+    this.browserDiagnostics = diagnostics || null;
+  }
+
+  getTransportDiagnostics() {
+    return JSON.parse(JSON.stringify(this.transportDiagnostics || {}));
   }
 
   addEventListener(listener) {
@@ -1305,6 +1487,90 @@ async function connectWebSocket(url, timeoutMs = 15000) {
       reject(new Error("Could not connect to the browser DevTools WebSocket."));
     };
   });
+}
+
+async function collectBrowserStderrTail(readable, diagnostics, maximumCharacters = BROWSER_STDERR_TAIL_CHARACTERS) {
+  if (!readable || typeof readable.getReader !== "function") return "";
+  const reader = readable.getReader();
+  const decoder = new TextDecoder();
+  let tail = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      tail += decoder.decode(value, { stream: true });
+      if (tail.length > maximumCharacters) tail = tail.slice(-maximumCharacters);
+      if (diagnostics) diagnostics.stderr_tail = tail;
+    }
+    tail += decoder.decode();
+    if (tail.length > maximumCharacters) tail = tail.slice(-maximumCharacters);
+  } catch (error) {
+    if (diagnostics) diagnostics.stderr_read_error = String(error?.message || error);
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+  if (diagnostics) diagnostics.stderr_tail = tail;
+  return tail;
+}
+
+function normalizeBrowserStatus(status) {
+  if (!status) return null;
+  return {
+    success: Boolean(status.success),
+    code: Number.isFinite(Number(status.code)) ? Number(status.code) : null,
+    signal: status.signal == null ? null : String(status.signal),
+  };
+}
+
+function normalizeDiagnosticText(value, maximumCharacters = 4000) {
+  const text = String(value || "").replace(/[\r\n]+/g, " | ").trim();
+  return text.length > maximumCharacters ? text.slice(-maximumCharacters) : text;
+}
+
+async function collectPdfFailureDiagnostics(client, streamState = null) {
+  const browserDiagnostics = client?.browserDiagnostics || null;
+  if (browserDiagnostics && !browserDiagnostics.status && browserDiagnostics.statusPromise) {
+    try {
+      await Promise.race([browserDiagnostics.statusPromise.catch(() => null), delay(350)]);
+    } catch {
+      // Best effort only.
+    }
+  }
+  const transport = typeof client?.getTransportDiagnostics === "function"
+    ? client.getTransportDiagnostics()
+    : {};
+  const browser = browserDiagnostics ? {
+    pid: Number(browserDiagnostics.pid) || null,
+    started_utc: String(browserDiagnostics.started_utc || ""),
+    status: browserDiagnostics.status || null,
+    stderr_tail: normalizeDiagnosticText(browserDiagnostics.stderr_tail || ""),
+    stderr_read_error: String(browserDiagnostics.stderr_read_error || ""),
+  } : null;
+  return {
+    transport,
+    browser,
+    stream: streamState ? { ...streamState } : null,
+  };
+}
+
+function summarizePdfFailureDiagnostics(diagnostics) {
+  const parts = [];
+  const close = diagnostics?.transport?.close;
+  if (close) {
+    parts.push(`WebSocket close code ${Number(close.code) || 0}${close.reason ? ` (${normalizeDiagnosticText(close.reason, 300)})` : ""}`);
+  } else if (diagnostics?.transport?.error) {
+    const message = normalizeDiagnosticText(diagnostics.transport.error.message || "", 300);
+    parts.push(message ? `WebSocket error: ${message}` : "WebSocket transport error");
+  }
+  const status = diagnostics?.browser?.status;
+  if (status) {
+    parts.push(`browser exited with code ${status.code}${status.signal ? `, signal ${status.signal}` : ""}`);
+  }
+  if (diagnostics?.stream) {
+    const stream = diagnostics.stream;
+    parts.push(`stream ${Number(stream.bytes_written) || 0} byte(s) in ${Number(stream.chunk_count) || 0} chunk(s)`);
+  }
+  return parts.join("; ");
 }
 
 async function waitForDevTools(profileRoot, childStatusPromise, timeoutMs = 20000) {
@@ -1661,10 +1927,170 @@ async function performLazyScroll(client, config) {
   };
 }
 
-async function writePdf(path, base64Data) {
-  const bytes = bytesFromBase64(base64Data);
-  await Deno.writeFile(path, bytes);
-  return { bytes: bytes.length, sha256: await sha256Bytes(bytes) };
+async function writeAll(file, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = await file.write(bytes.subarray(offset));
+    if (!Number.isFinite(written) || written <= 0) throw new Error("PDF output file accepted no additional bytes.");
+    offset += written;
+  }
+}
+
+function cdpStreamBytes(data, base64Encoded) {
+  if (base64Encoded) return bytesFromBase64(data);
+  return new TextEncoder().encode(String(data || ""));
+}
+
+async function releaseMemoryBeforePdf(client) {
+  const result = {
+    renderer_garbage_collection_requested: false,
+    helper_garbage_collection_requested: false,
+  };
+  await delay(0);
+  try {
+    await client.send("HeapProfiler.collectGarbage", {}, 15000);
+    result.renderer_garbage_collection_requested = true;
+  } catch {
+    // Some Chromium-family browsers do not expose this optional CDP command.
+  }
+  try {
+    if (typeof globalThis.gc === "function") {
+      globalThis.gc();
+      result.helper_garbage_collection_requested = true;
+    }
+  } catch {
+    // Explicit helper GC is normally unavailable unless Deno was launched with a V8 flag.
+  }
+  await delay(0);
+  return result;
+}
+
+async function streamPdfToAtomicFile(client, outputPath, params) {
+  const partialPath = `${outputPath}.partial`;
+  try { await Deno.remove(partialPath); } catch { /* no stale partial */ }
+
+  const streamState = {
+    transfer_mode: "ReturnAsStream",
+    partial_filename: basename(partialPath),
+    output_filename: basename(outputPath),
+    chunk_size_bytes: PDF_STREAM_CHUNK_SIZE_BYTES,
+    chunk_count: 0,
+    bytes_written: 0,
+    print_command_elapsed_ms: 0,
+    stream_elapsed_ms: 0,
+    total_elapsed_ms: 0,
+    eof_received: false,
+    stream_closed: false,
+    partial_removed_after_failure: false,
+  };
+  const started = Date.now();
+  let lastProgressAt = started;
+  let handle = "";
+  let file = null;
+  const hasher = new IncrementalSha256();
+  const signature = [];
+
+  try {
+    const printStarted = Date.now();
+    const result = await client.send("Page.printToPDF", {
+      ...params,
+      transferMode: "ReturnAsStream",
+    }, PDF_PRINT_COMMAND_TIMEOUT_MS);
+    streamState.print_command_elapsed_ms = Date.now() - printStarted;
+    handle = String(result.stream || "");
+    if (!handle) {
+      throw new Error("Chromium did not return a PDF stream handle.");
+    }
+
+    file = await Deno.open(partialPath, { createNew: true, write: true });
+    const streamStarted = Date.now();
+    while (!streamState.eof_received) {
+      if (Date.now() - started > PDF_STREAM_TOTAL_TIMEOUT_MS) {
+        throw new Error(`PDF streaming exceeded the ${Math.round(PDF_STREAM_TOTAL_TIMEOUT_MS / 1000)}-second safety timeout.`);
+      }
+      let chunk;
+      try {
+        chunk = await client.send("IO.read", {
+          handle,
+          size: PDF_STREAM_CHUNK_SIZE_BYTES,
+        }, PDF_STREAM_READ_TIMEOUT_MS);
+      } catch (error) {
+        if (String(error?.message || error).includes("Timed out waiting for CDP command: IO.read")) {
+          throw new Error(`PDF stream was idle for more than ${Math.round(PDF_STREAM_READ_TIMEOUT_MS / 1000)} seconds.`);
+        }
+        throw error;
+      }
+      const bytes = cdpStreamBytes(chunk.data, Boolean(chunk.base64Encoded));
+      if (bytes.length > 0) {
+        await writeAll(file, bytes);
+        hasher.update(bytes);
+        streamState.chunk_count += 1;
+        streamState.bytes_written += bytes.length;
+        lastProgressAt = Date.now();
+        for (let index = 0; index < bytes.length && signature.length < 8; index += 1) signature.push(bytes[index]);
+      } else if (!chunk.eof && Date.now() - lastProgressAt > PDF_STREAM_READ_TIMEOUT_MS) {
+        throw new Error(`PDF stream produced no data for more than ${Math.round(PDF_STREAM_READ_TIMEOUT_MS / 1000)} seconds.`);
+      } else if (!chunk.eof) {
+        await delay(25);
+      }
+      streamState.eof_received = Boolean(chunk.eof);
+    }
+    streamState.stream_elapsed_ms = Date.now() - streamStarted;
+    if (streamState.bytes_written <= 0) throw new Error("Chromium returned an empty PDF stream.");
+    const signatureText = new TextDecoder().decode(new Uint8Array(signature));
+    if (!signatureText.startsWith("%PDF-")) throw new Error("The streamed output did not contain a valid PDF signature.");
+
+    await file.sync();
+    file.close();
+    file = null;
+    try {
+      await client.send("IO.close", { handle }, 15000);
+      streamState.stream_closed = true;
+    } finally {
+      handle = "";
+    }
+    await Deno.rename(partialPath, outputPath);
+    streamState.total_elapsed_ms = Date.now() - started;
+    return {
+      bytes: streamState.bytes_written,
+      sha256: hasher.digestHex(),
+      transport: {
+        ...streamState,
+        partial_filename: "",
+        atomic_write_completed: true,
+      },
+    };
+  } catch (error) {
+    streamState.total_elapsed_ms = Date.now() - started;
+    if (file) {
+      try { file.close(); } catch { /* ignore */ }
+      file = null;
+    }
+    if (handle) {
+      try {
+        await client.send("IO.close", { handle }, 5000);
+        streamState.stream_closed = true;
+      } catch {
+        // The browser or transport may already be unavailable.
+      }
+    }
+    try {
+      await Deno.remove(partialPath);
+      streamState.partial_removed_after_failure = true;
+    } catch {
+      streamState.partial_removed_after_failure = !(await pathExists(partialPath));
+    }
+    const diagnostics = await collectPdfFailureDiagnostics(client, streamState);
+    const summary = summarizePdfFailureDiagnostics(diagnostics);
+    const enhanced = new Error(`${error?.message || error}${summary ? ` (${summary})` : ""}`);
+    enhanced.cause = error;
+    enhanced.pdf_diagnostics = diagnostics;
+    throw enhanced;
+  } finally {
+    if (file) {
+      try { file.close(); } catch { /* ignore */ }
+    }
+  }
 }
 
 function filePathToFileUrl(filePath) {
@@ -2045,8 +2471,240 @@ async function navigateToPaginatedPdfDocument(client, documentUrl) {
   throw new Error(`Timed out while preparing the paginated PNG PDF document${progressText ? ` (${progressText})` : ""}.`);
 }
 
+function isPdfPageRangeOutOfBoundsError(error) {
+  const message = String(error?.message || error || "");
+  return /page range|page ranges|exceeds page count|outside.*page|no pages|invalid.*page.*range/i.test(message);
+}
+
+async function estimateLivePdfPages(client, params) {
+  const metrics = await client.send("Page.getLayoutMetrics", {}, 30000);
+  const content = metrics.cssContentSize || metrics.contentSize || {};
+  const contentHeightCssPx = Math.max(1, Number(content.height) || 1);
+  const paperHeightIn = Boolean(params.landscape)
+    ? Math.max(0.1, Number(params.paperWidth) || 8.5)
+    : Math.max(0.1, Number(params.paperHeight) || 11);
+  const printableHeightIn = Math.max(
+    0.01,
+    paperHeightIn - Math.max(0, Number(params.marginTop) || 0) - Math.max(0, Number(params.marginBottom) || 0),
+  );
+  const scale = Math.max(0.1, Number(params.scale) || 1);
+  const printableHeightCssPx = (printableHeightIn * 96) / scale;
+  const estimatedPages = Math.max(1, Math.ceil(contentHeightCssPx / Math.max(1, printableHeightCssPx)));
+  return {
+    estimated_pages: estimatedPages,
+    content_height_css_px: contentHeightCssPx,
+    printable_height_in: printableHeightIn,
+    printable_height_css_px: printableHeightCssPx,
+    scale,
+    prefer_css_page_size: Boolean(params.preferCSSPageSize),
+    note: "This is a lightweight estimate used only to choose the large-PDF policy; Chromium print CSS may change the actual page count.",
+  };
+}
+
+async function probeLivePdfPageExists(client, params, pageNumber) {
+  let handle = "";
+  try {
+    const result = await client.send("Page.printToPDF", {
+      ...params,
+      pageRanges: String(pageNumber),
+      transferMode: "ReturnAsStream",
+    }, PDF_PRINT_COMMAND_TIMEOUT_MS);
+    handle = String(result.stream || "");
+    if (!handle) throw new Error("Chromium did not return a PDF stream handle while probing the next page.");
+    return { exists: true, error: "" };
+  } catch (error) {
+    if (isPdfPageRangeOutOfBoundsError(error)) return { exists: false, error: "" };
+    return { exists: null, error: String(error?.message || error) };
+  } finally {
+    if (handle) {
+      try { await client.send("IO.close", { handle }, 15000); } catch { /* best effort */ }
+    }
+  }
+}
+
+async function uniquePdfSetPaths(folder, baseName) {
+  let attempt = 1;
+  while (attempt < 10000) {
+    const suffix = attempt === 1 ? "" : `_${attempt}`;
+    const stem = joinPath(folder, `${baseName}${suffix}`);
+    const descriptorPath = `${stem}.pdfset.json`;
+    const firstPartPath = `${stem}_part001.pdf`;
+    if (!(await pathExists(descriptorPath)) && !(await pathExists(firstPartPath))) {
+      return { stem, descriptorPath };
+    }
+    attempt += 1;
+  }
+  throw new Error("Could not create a unique Live Page PDF set filename.");
+}
+
+async function writePdfSetDescriptor(path, payload) {
+  const partialPath = `${path}.partial`;
+  try { await Deno.remove(partialPath); } catch { /* no stale partial */ }
+  try {
+    await Deno.writeTextFile(partialPath, JSON.stringify(payload, null, 2) + "\n");
+    await Deno.rename(partialPath, path);
+    const info = await Deno.stat(path);
+    return { bytes: info.size, sha256: await sha256File(path) };
+  } catch (error) {
+    try { await Deno.remove(partialPath); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+function livePdfPartArtifact(path, record, config, pageRange, partNumber) {
+  return {
+    kind: "web_page_pdf_part",
+    role: "live_page_pdf_part",
+    path,
+    sha256: record.sha256,
+    size_bytes: record.bytes,
+    page_range: pageRange,
+    part_number: partNumber,
+    landscape: Boolean(config.pdf_landscape),
+    display_header_footer: Boolean(config.pdf_display_header_footer),
+    print_background: Boolean(config.pdf_print_background),
+    paper_width_in: Number(config.pdf_paper_width_in) || 8.5,
+    paper_height_in: Number(config.pdf_paper_height_in) || 11,
+    scale: Number(config.pdf_scale) || 1,
+    source_mode: "live_webpage",
+    transfer_mode: record.transport.transfer_mode,
+    stream_chunk_count: record.transport.chunk_count,
+    stream_chunk_size_bytes: record.transport.chunk_size_bytes,
+    stream_elapsed_ms: record.transport.stream_elapsed_ms,
+    atomic_write: true,
+  };
+}
+
+async function captureSplitLivePagePdf(client, config, outputFolder, baseName, pdfContext, params, estimate, memoryPreparation) {
+  const pagesPerPart = Math.max(1, Math.min(500, Number(config.pdf_pages_per_part) || 50));
+  const maximumTotalPages = Math.max(1, Math.min(5000, Number(config.pdf_max_total_pages) || 500));
+  const maximumParts = Math.max(1, Math.min(100, Number(config.pdf_max_parts) || 20));
+  const setPaths = await uniquePdfSetPaths(outputFolder, `${baseName}_print`);
+  const descriptorPath = setPaths.descriptorPath;
+  const stem = setPaths.stem;
+  const artifacts = [];
+  const parts = [];
+  const warnings = [];
+  const partialReasons = [];
+  let nextPage = 1;
+  let complete = false;
+  let terminationReason = "";
+  let terminalError = "";
+
+  while (parts.length < maximumParts && nextPage <= maximumTotalPages) {
+    const partNumber = parts.length + 1;
+    const lastPage = Math.min(maximumTotalPages, nextPage + pagesPerPart - 1);
+    const pageRange = `${nextPage}-${lastPage}`;
+    const partPath = `${stem}_part${String(partNumber).padStart(3, "0")}.pdf`;
+    try {
+      const record = await streamPdfToAtomicFile(client, partPath, { ...params, pageRanges: pageRange });
+      const artifact = livePdfPartArtifact(partPath, record, config, pageRange, partNumber);
+      artifacts.push(artifact);
+      parts.push({
+        part_number: partNumber,
+        filename: basename(partPath),
+        page_range: pageRange,
+        size_bytes: record.bytes,
+        sha256: record.sha256,
+        transport: record.transport,
+      });
+      console.log(`Live Page PDF part ${partNumber} completed: pages ${pageRange}.`);
+      nextPage = lastPage + 1;
+    } catch (error) {
+      if (isPdfPageRangeOutOfBoundsError(error) && parts.length > 0) {
+        complete = true;
+        terminationReason = "document_end";
+        break;
+      }
+      terminalError = String(error?.message || error);
+      terminationReason = parts.length > 0 ? "part_failure" : "initial_part_failure";
+      if (!parts.length) throw error;
+      warnings.push(`Live Page PDF splitting stopped after ${parts.length} completed part(s): ${terminalError}`);
+      partialReasons.push("pdf_split_part_failure");
+      break;
+    }
+  }
+
+  if (!complete && !terminalError && parts.length > 0) {
+    const probe = await probeLivePdfPageExists(client, params, nextPage);
+    if (probe.exists === false) {
+      complete = true;
+      terminationReason = "document_end_at_safety_boundary";
+    } else {
+      terminationReason = nextPage > maximumTotalPages ? "maximum_total_pages" : "maximum_parts";
+      warnings.push(
+        probe.exists === true
+          ? `Live Page PDF reached the configured ${terminationReason === "maximum_total_pages" ? "maximum total pages" : "maximum parts"} limit; completed parts were preserved and the PDF result is partial.`
+          : `Live Page PDF reached a configured safety limit and the next page could not be probed (${probe.error}); completed parts were preserved and the PDF result is partial.`,
+      );
+      partialReasons.push(terminationReason === "maximum_total_pages" ? "pdf_maximum_total_pages_reached" : "pdf_maximum_parts_reached");
+      if (probe.error) terminalError = probe.error;
+    }
+  }
+
+  const descriptor = {
+    type: "wavi-live-page-pdf-set",
+    schema_version: 1,
+    created_utc: nowIso(),
+    requested_url: String(pdfContext.requested_url || ""),
+    final_url: String(pdfContext.final_url || ""),
+    page_title: String(pdfContext.page_title || ""),
+    capture_utc: String(pdfContext.capture_utc || ""),
+    source_mode: "live_webpage",
+    complete,
+    partial: !complete,
+    termination_reason: terminationReason,
+    terminal_error: terminalError,
+    page_estimate: estimate,
+    pages_per_part: pagesPerPart,
+    maximum_total_pages: maximumTotalPages,
+    maximum_parts: maximumParts,
+    parts_completed: parts.length,
+    next_page_not_captured: complete ? null : nextPage,
+    parts,
+    warnings,
+  };
+  const descriptorRecord = await writePdfSetDescriptor(descriptorPath, descriptor);
+  artifacts.push({
+    kind: "web_page_pdf_set_metadata",
+    role: "live_page_pdf_set_metadata",
+    path: descriptorPath,
+    sha256: descriptorRecord.sha256,
+    size_bytes: descriptorRecord.bytes,
+    source_mode: "live_webpage",
+    complete,
+    parts_completed: parts.length,
+  });
+
+  return {
+    artifacts,
+    warnings,
+    partial_reasons: partialReasons,
+    large_pdf: {
+      requested_handling: normalizePdfLargeHandling(config.pdf_large_handling),
+      requested_handling_label: pdfLargeHandlingLabel(config.pdf_large_handling),
+      effective_handling: "split",
+      estimate,
+      pages_per_part: pagesPerPart,
+      maximum_total_pages: maximumTotalPages,
+      maximum_parts: maximumParts,
+      complete,
+      termination_reason: terminationReason,
+      parts_completed: parts.length,
+      descriptor_filename: basename(descriptorPath),
+      terminal_error: terminalError,
+    },
+    transport: {
+      transfer_mode: "ReturnAsStream",
+      part_count: parts.length,
+      total_bytes: parts.reduce((sum, part) => sum + Number(part.size_bytes || 0), 0),
+      total_chunks: parts.reduce((sum, part) => sum + Number(part.transport?.chunk_count || 0), 0),
+      memory_preparation: memoryPreparation,
+    },
+  };
+}
+
 async function capturePdf(client, config, outputFolder, baseName, pdfContext, capture) {
-  const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_print`, ".pdf");
   const captureMode = normalizePdfCaptureMode(config.pdf_capture_mode);
   const params = {
     landscape: Boolean(config.pdf_landscape),
@@ -2067,13 +2725,14 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
   if (!params.pageRanges) delete params.pageRanges;
 
   if (captureMode === "paginated_png") {
+    const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_print`, ".pdf");
     const pngServer = await startPaginatedPngPdfServer(config, capture);
     try {
       const preparedInfo = await navigateToPaginatedPdfDocument(client, pngServer.documentUrl);
       delete params.pageRanges;
       params.preferCSSPageSize = false;
-      const result = await client.send("Page.printToPDF", params, 180000);
-      const record = await writePdf(outputPath, result.data);
+      const memoryPreparation = await releaseMemoryBeforePdf(client);
+      const record = await streamPdfToAtomicFile(client, outputPath, params);
       return {
         artifacts: [{
           kind: "web_page_pdf",
@@ -2087,6 +2746,11 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
           paper_height_in: Number(config.pdf_paper_height_in) || 11,
           scale: Number(config.pdf_scale) || 1,
           source_mode: captureMode,
+          transfer_mode: record.transport.transfer_mode,
+          stream_chunk_count: record.transport.chunk_count,
+          stream_chunk_size_bytes: record.transport.chunk_size_bytes,
+          stream_elapsed_ms: record.transport.stream_elapsed_ms,
+          atomic_write: true,
         }],
         behavior: {
           behavior: normalizePdfPageBehavior(config.pdf_page_behavior),
@@ -2094,11 +2758,22 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
           matched_elements: 0,
           modified_elements: 0,
           hidden_elements: 0,
-          note: "PDF generated by paginating the captured PNG; live webpage behavior adjustments were not applied.",
+          note: "PDF generated by paginating the captured PNG; Live Page splitting settings were not applied.",
           sample_elements: [],
         },
         capture_mode: captureMode,
         source_info: { ...pngServer.sourceInfo, ...preparedInfo },
+        large_pdf: {
+          requested_handling: normalizePdfLargeHandling(config.pdf_large_handling),
+          effective_handling: "not_applicable",
+          note: "Large Live Page PDF handling applies only to Live Page PDFs.",
+        },
+        warnings: [],
+        partial_reasons: [],
+        transport: {
+          ...record.transport,
+          memory_preparation: memoryPreparation,
+        },
       };
     } finally {
       await pngServer.close();
@@ -2107,8 +2782,40 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
 
   const behaviorInfo = await applyPdfPageBehavior(client, config.pdf_page_behavior);
   try {
-    const result = await client.send("Page.printToPDF", params, 180000);
-    const record = await writePdf(outputPath, result.data);
+    const memoryPreparation = await releaseMemoryBeforePdf(client);
+    const estimate = await estimateLivePdfPages(client, params);
+    const requestedHandling = normalizePdfLargeHandling(config.pdf_large_handling);
+    const automaticThreshold = Math.max(2, Math.min(5000, Number(config.pdf_auto_split_threshold_pages) || 100));
+    const maximumTotalPages = Math.max(1, Math.min(5000, Number(config.pdf_max_total_pages) || 500));
+    const manualPageRanges = String(params.pageRanges || "").trim();
+    let effectiveHandling = requestedHandling;
+    if (manualPageRanges) effectiveHandling = "single_manual_page_ranges";
+    else if (requestedHandling === "automatic") effectiveHandling = estimate.estimated_pages >= automaticThreshold ? "split" : "single";
+    else if (requestedHandling === "fail") {
+      if (estimate.estimated_pages > maximumTotalPages) {
+        throw new Error(`Estimated Live Page PDF length (${estimate.estimated_pages} pages) exceeds the configured safety limit of ${maximumTotalPages} pages.`);
+      }
+      effectiveHandling = "single";
+    }
+    console.log(
+      `Live Page PDF handling: requested=${requestedHandling}, effective=${effectiveHandling}, estimated_pages=${estimate.estimated_pages}, ` +
+      `automatic_threshold=${automaticThreshold}, maximum_total_pages=${maximumTotalPages}.`,
+    );
+
+    if (effectiveHandling === "split") {
+      const splitResult = await captureSplitLivePagePdf(
+        client, config, outputFolder, baseName, pdfContext, params, estimate, memoryPreparation,
+      );
+      return {
+        ...splitResult,
+        behavior: behaviorInfo,
+        capture_mode: captureMode,
+        source_info: null,
+      };
+    }
+
+    const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_print`, ".pdf");
+    const record = await streamPdfToAtomicFile(client, outputPath, params);
     return {
       artifacts: [{
         kind: "web_page_pdf",
@@ -2122,10 +2829,30 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
         paper_height_in: Number(config.pdf_paper_height_in) || 11,
         scale: Number(config.pdf_scale) || 1,
         source_mode: captureMode,
+        transfer_mode: record.transport.transfer_mode,
+        stream_chunk_count: record.transport.chunk_count,
+        stream_chunk_size_bytes: record.transport.chunk_size_bytes,
+        stream_elapsed_ms: record.transport.stream_elapsed_ms,
+        atomic_write: true,
       }],
       behavior: behaviorInfo,
       capture_mode: captureMode,
       source_info: null,
+      warnings: [],
+      partial_reasons: [],
+      large_pdf: {
+        requested_handling: requestedHandling,
+        requested_handling_label: pdfLargeHandlingLabel(requestedHandling),
+        effective_handling: effectiveHandling,
+        automatic_split_threshold_pages: automaticThreshold,
+        maximum_total_pages: maximumTotalPages,
+        estimate,
+        manual_page_ranges_override: Boolean(manualPageRanges),
+      },
+      transport: {
+        ...record.transport,
+        memory_preparation: memoryPreparation,
+      },
     };
   } finally {
     await cleanupPdfPageBehavior(client);
@@ -2865,6 +3592,9 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     };
     let pdfCaptureMode = normalizePdfCaptureMode(config.pdf_capture_mode);
     let pdfSourceInfo = null;
+    let pdfTransportInfo = null;
+    let pdfLargeInfo = null;
+    let pdfFailureDiagnostics = null;
     if (config.create_pdf) {
       try {
         const pdfCapture = await capturePdf(client, config, runContext.webMediaFolder, baseName, {
@@ -2877,10 +3607,23 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         pdfBehaviorInfo = pdfCapture.behavior || pdfBehaviorInfo;
         pdfCaptureMode = normalizePdfCaptureMode(pdfCapture.capture_mode || config.pdf_capture_mode);
         pdfSourceInfo = pdfCapture.source_info || null;
+        pdfTransportInfo = pdfCapture.transport || null;
+        pdfLargeInfo = pdfCapture.large_pdf || null;
+        for (const pdfWarning of pdfCapture.warnings || []) {
+          warnings.push(pdfWarning);
+          warningReasons.push("pdf_large_handling_warning");
+          console.log(pdfWarning);
+        }
+        for (const pdfPartialReason of pdfCapture.partial_reasons || []) partialReasons.push(pdfPartialReason);
       } catch (error) {
+        pdfFailureDiagnostics = error?.pdf_diagnostics || await collectPdfFailureDiagnostics(client);
         pdfError = `PDF capture failed: ${error.message || error}`;
         warnings.push(pdfError);
         console.log(pdfError);
+        const diagnosticSummary = summarizePdfFailureDiagnostics(pdfFailureDiagnostics);
+        if (diagnosticSummary) console.log(`PDF transport diagnostics: ${diagnosticSummary}`);
+        const stderrTail = normalizeDiagnosticText(pdfFailureDiagnostics?.browser?.stderr_tail || "", 2000);
+        if (stderrTail) console.log(`Chromium stderr tail during PDF failure: ${stderrTail}`);
       }
     }
 
@@ -3052,7 +3795,20 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         page_behavior: normalizePdfPageBehavior(config.pdf_page_behavior),
         behavior_result: pdfBehaviorInfo,
         paginated_png_result: pdfSourceInfo,
+        transport_result: pdfTransportInfo,
+        large_pdf_handling: {
+          requested: normalizePdfLargeHandling(config.pdf_large_handling),
+          requested_label: pdfLargeHandlingLabel(config.pdf_large_handling),
+          automatic_split_threshold_pages: Math.max(2, Number(config.pdf_auto_split_threshold_pages) || 100),
+          pages_per_part: Math.max(1, Number(config.pdf_pages_per_part) || 50),
+          maximum_total_pages: Math.max(1, Number(config.pdf_max_total_pages) || 500),
+          maximum_parts: Math.max(1, Number(config.pdf_max_parts) || 20),
+          result: pdfLargeInfo,
+        },
+        failure_diagnostics: pdfFailureDiagnostics,
         completed: !pdfError,
+        fully_complete: !pdfError && pdfLargeInfo?.complete !== false,
+        partial: !pdfError && pdfLargeInfo?.complete === false,
         error: pdfError,
       },
       warnings,
@@ -3127,14 +3883,29 @@ async function launchBrowser(config) {
     args,
     stdin: "null",
     stdout: "null",
-    stderr: "null",
+    stderr: "piped",
   }).spawn();
-  const statusPromise = child.status;
+  const diagnostics = {
+    pid: Number(child.pid) || null,
+    started_utc: nowIso(),
+    status: null,
+    stderr_tail: "",
+    stderr_read_error: "",
+    statusPromise: null,
+    stderrPromise: null,
+  };
+  diagnostics.stderrPromise = collectBrowserStderrTail(child.stderr, diagnostics);
+  const statusPromise = child.status.then((status) => {
+    diagnostics.status = normalizeBrowserStatus(status);
+    return status;
+  });
+  diagnostics.statusPromise = statusPromise;
   const port = await waitForDevTools(config.profile_root, statusPromise, Number(config.browser_start_timeout_seconds || 20) * 1000);
   const pageTarget = await getPageTarget(port);
   const client = await connectWebSocket(pageTarget.webSocketDebuggerUrl, 15000);
+  client.setBrowserDiagnostics(diagnostics);
   const version = await getBrowserVersion(port);
-  return { child, statusPromise, port, client, version };
+  return { child, statusPromise, port, client, version, diagnostics };
 }
 
 async function closeBrowser(browser) {
@@ -3154,6 +3925,9 @@ async function closeBrowser(browser) {
   if (!exited) {
     try { browser.child.kill("SIGTERM"); } catch { /* ignore */ }
     await Promise.race([browser.statusPromise.catch(() => {}), delay(3000)]);
+  }
+  if (browser.diagnostics?.stderrPromise) {
+    try { await Promise.race([browser.diagnostics.stderrPromise, delay(1000)]); } catch { /* ignore */ }
   }
 }
 

@@ -2,6 +2,13 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v2.2026.0721](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v2.2026.0721) - Large PDF Reliability and Window Placement
+
+- Added streamed, atomic PDF writing with bounded memory use, partial-file cleanup, and improved browser/CDP failure diagnostics.
+- Added automatic or manual Live Page PDF splitting with numbered parts, safety limits, preserved completed parts, and PDF-set metadata.
+- Fixed main-window position persistence, including multi-monitor and off-screen recovery.
+- Improved first-launch placement so the full interface remains visible above the taskbar.
+
 ## [v2.2026.0717](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v2.2026.0717) - Expanded Webpage Capture and Workflow Persistence
 
 - Expanded Webpage Capture with organized options for output, readiness, long-page stability, browser environment, and supplemental evidence.

@@ -30,7 +30,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v2.2026.0717"
+APP_VERSION = "v2.2026.0721"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 980
@@ -38,12 +38,15 @@ APP_WINDOW_MIN_WIDTH = 1050
 APP_WINDOW_MIN_HEIGHT = 840
 APP_WINDOW_SCREEN_MARGIN_WIDTH = 80
 APP_WINDOW_SCREEN_MARGIN_HEIGHT = 120
+APP_WINDOW_TITLEBAR_ALLOWANCE = 48
+APP_WINDOW_DEFAULT_TOP_PADDING = 16
+WINDOW_GEOMETRY_CAPTURE_DELAY_MS = 250
 URL_ROW_MIN_HEIGHT = 215
 CLIPBOARD_SAFE_MAX_BYTES = 4 * 1024 * 1024
 CLIPBOARD_SAFE_MAX_LINES = 50000
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 41
+SETTINGS_SCHEMA_VERSION = 42
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -190,6 +193,11 @@ DEFAULTS = {
     "web_pdf_footer_template": DEFAULT_WEB_PDF_FOOTER_TEMPLATE,
     "web_pdf_page_behavior": "preserve_layout",
     "web_pdf_capture_mode": "live_webpage",
+    "web_pdf_large_handling": "automatic",
+    "web_pdf_auto_split_threshold_pages": "100",
+    "web_pdf_pages_per_part": "50",
+    "web_pdf_max_total_pages": "500",
+    "web_pdf_max_parts": "20",
     "input_file": os.path.join(ROOT, "urls.txt"),
     "case_name": "Case-%datetime%",
     "filename_template": "%extractor%/%uploader%/%upload_date%_%id%_%title%.%ext%",
@@ -402,6 +410,7 @@ settings_state_loading = True
 last_normal_window_geometry = ""
 last_non_iconic_window_state = "normal"
 window_state_restore_after_id = None
+window_geometry_capture_after_id = None
 last_capture_context = {}
 last_image_capture_context = {}
 last_web_capture_context = {}
@@ -2768,7 +2777,13 @@ def build_web_case_summary_text(exit_code, submitted_url_count, paths, versions,
         f"  Environment: {display_web_environment_preset(settings.get('web_environment_preset', DEFAULTS['web_environment_preset']))}; {settings.get('web_viewport_width', DEFAULTS['web_viewport_width'])} × {settings.get('web_viewport_height', DEFAULTS['web_viewport_height'])}; scale {settings.get('web_device_scale_factor', DEFAULTS['web_device_scale_factor'])}",
         f"  Readiness: {_web_readiness_event_label(settings.get('web_readiness_event'))}; network quiet {settings.get('web_network_quiet_ms', DEFAULTS['web_network_quiet_ms'])} ms; settle limit {settings.get('web_network_settle_timeout', DEFAULTS['web_network_settle_timeout'])} seconds",
         f"  Lazy-load scrolling: {_summary_enabled(settings.get('web_lazy_scroll', DEFAULTS['web_lazy_scroll']))}",
-        f"  PDF: {_summary_enabled(settings.get('web_create_pdf', DEFAULTS['web_create_pdf']))}",
+        (
+            f"  PDF: {_summary_enabled(settings.get('web_create_pdf', DEFAULTS['web_create_pdf']))}; "
+            f"source {get_web_pdf_capture_mode_label(settings.get('web_pdf_capture_mode'))}; "
+            f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))}"
+            if settings.get('web_create_pdf', DEFAULTS['web_create_pdf'])
+            else "  PDF: Disabled"
+        ),
         f"  Evidence outputs: {evidence_text}",
         f"  Universal archive: {_summary_enabled(app_universal_archive_enabled())}",
         f"  Concurrent captures: {settings.get('web_concurrent_captures', DEFAULTS['web_concurrent_captures'])}",
@@ -5430,6 +5445,11 @@ def get_settings_dict():
         "web_pdf_footer_template": get_web_pdf_footer_template_value(),
         "web_pdf_page_behavior": web_pdf_page_behavior_var.get() if web_pdf_page_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"],
         "web_pdf_capture_mode": web_pdf_capture_mode_var.get() if web_pdf_capture_mode_var.get() in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"],
+        "web_pdf_large_handling": web_pdf_large_handling_var.get() if web_pdf_large_handling_var.get() in {"automatic", "single", "split", "fail"} else DEFAULTS["web_pdf_large_handling"],
+        "web_pdf_auto_split_threshold_pages": normalize_positive_int_string(web_pdf_auto_split_threshold_pages_var.get(), DEFAULTS["web_pdf_auto_split_threshold_pages"]),
+        "web_pdf_pages_per_part": normalize_positive_int_string(web_pdf_pages_per_part_var.get(), DEFAULTS["web_pdf_pages_per_part"]),
+        "web_pdf_max_total_pages": normalize_positive_int_string(web_pdf_max_total_pages_var.get(), DEFAULTS["web_pdf_max_total_pages"]),
+        "web_pdf_max_parts": normalize_positive_int_string(web_pdf_max_parts_var.get(), DEFAULTS["web_pdf_max_parts"]),
     }
 
 
@@ -5724,6 +5744,12 @@ def apply_settings_dict(settings):
     web_pdf_page_behavior_var.set(saved_web_pdf_behavior if saved_web_pdf_behavior in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"])
     saved_web_pdf_capture_mode = settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"])
     web_pdf_capture_mode_var.set(saved_web_pdf_capture_mode if saved_web_pdf_capture_mode in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"])
+    saved_web_pdf_large_handling = settings.get("web_pdf_large_handling", DEFAULTS["web_pdf_large_handling"])
+    web_pdf_large_handling_var.set(saved_web_pdf_large_handling if saved_web_pdf_large_handling in {"automatic", "single", "split", "fail"} else DEFAULTS["web_pdf_large_handling"])
+    web_pdf_auto_split_threshold_pages_var.set(normalize_positive_int_string(settings.get("web_pdf_auto_split_threshold_pages", DEFAULTS["web_pdf_auto_split_threshold_pages"]), DEFAULTS["web_pdf_auto_split_threshold_pages"]))
+    web_pdf_pages_per_part_var.set(normalize_positive_int_string(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"]), DEFAULTS["web_pdf_pages_per_part"]))
+    web_pdf_max_total_pages_var.set(normalize_positive_int_string(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"]), DEFAULTS["web_pdf_max_total_pages"]))
+    web_pdf_max_parts_var.set(normalize_positive_int_string(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]), DEFAULTS["web_pdf_max_parts"]))
     try:
         update_web_pdf_options_state()
         update_web_evidence_options_state()
@@ -5990,6 +6016,262 @@ def select_app_tab_by_label(label):
     return APP_SETTINGS_DEFAULTS["last_selected_tab"]
 
 
+def get_monitor_work_areas():
+    """Return available monitor work areas as ``(left, top, right, bottom, primary)``.
+
+    On Windows this uses the native monitor work areas, which exclude taskbars
+    and preserve negative coordinates for monitors positioned left or above the
+    primary display. Tk's virtual-root values are retained as a portable
+    fallback for testing and non-Windows environments.
+    """
+    areas = []
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", wintypes.LONG),
+                    ("top", wintypes.LONG),
+                    ("right", wintypes.LONG),
+                    ("bottom", wintypes.LONG),
+                ]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", RECT),
+                    ("rcWork", RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            callback_type = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HMONITOR,
+                wintypes.HDC,
+                ctypes.POINTER(RECT),
+                wintypes.LPARAM,
+            )
+
+            user32 = ctypes.windll.user32
+            user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFO)]
+            user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+            def enum_monitor_callback(monitor, _hdc, _rect, _data):
+                info = MONITORINFO()
+                info.cbSize = ctypes.sizeof(MONITORINFO)
+                if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    if work.right > work.left and work.bottom > work.top:
+                        areas.append((
+                            int(work.left),
+                            int(work.top),
+                            int(work.right),
+                            int(work.bottom),
+                            bool(info.dwFlags & 1),
+                        ))
+                return True
+
+            monitor_callback = callback_type(enum_monitor_callback)
+            user32.EnumDisplayMonitors.argtypes = [
+                wintypes.HDC,
+                ctypes.POINTER(RECT),
+                callback_type,
+                wintypes.LPARAM,
+            ]
+            user32.EnumDisplayMonitors.restype = wintypes.BOOL
+            user32.EnumDisplayMonitors(0, None, monitor_callback, 0)
+        except Exception:
+            areas = []
+
+    if not areas:
+        try:
+            left = int(root.winfo_vrootx())
+            top = int(root.winfo_vrooty())
+            width = int(root.winfo_vrootwidth() or root.winfo_screenwidth())
+            height = int(root.winfo_vrootheight() or root.winfo_screenheight())
+            if width > 0 and height > 0:
+                areas.append((left, top, left + width, top + height, True))
+        except Exception:
+            pass
+
+    if not areas:
+        try:
+            width = max(1, int(root.winfo_screenwidth()))
+            height = max(1, int(root.winfo_screenheight()))
+        except Exception:
+            width, height = APP_WINDOW_WIDTH, APP_WINDOW_DEFAULT_HEIGHT
+        areas.append((0, 0, width, height, True))
+
+    return areas
+
+
+def choose_monitor_work_area(x=None, y=None, width=None, height=None):
+    """Choose the monitor containing most of a saved window rectangle.
+
+    If no saved rectangle is supplied, prefer the primary monitor. A window
+    that no longer intersects any monitor is assigned to the nearest work area.
+    """
+    areas = get_monitor_work_areas()
+    if x is None or y is None or width is None or height is None:
+        return next((area for area in areas if area[4]), areas[0])
+
+    window_left = int(x)
+    window_top = int(y)
+    window_right = window_left + max(1, int(width))
+    window_bottom = window_top + max(1, int(height))
+
+    def overlap_area(area):
+        left, top, right, bottom, _primary = area
+        overlap_width = max(0, min(window_right, right) - max(window_left, left))
+        overlap_height = max(0, min(window_bottom, bottom) - max(window_top, top))
+        return overlap_width * overlap_height
+
+    best = max(areas, key=overlap_area)
+    if overlap_area(best) > 0:
+        return best
+
+    center_x = window_left + (max(1, int(width)) / 2)
+    center_y = window_top + (max(1, int(height)) / 2)
+
+    def distance_squared(area):
+        left, top, right, bottom, _primary = area
+        nearest_x = min(max(center_x, left), right)
+        nearest_y = min(max(center_y, top), bottom)
+        return (center_x - nearest_x) ** 2 + (center_y - nearest_y) ** 2
+
+    return min(areas, key=distance_squared)
+
+
+def get_native_toplevel_handle():
+    """Return the decorated Windows top-level handle when available."""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+
+        from ctypes import wintypes
+
+        hwnd = int(root.winfo_id())
+        user32 = ctypes.windll.user32
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        parent = int(user32.GetParent(wintypes.HWND(hwnd)) or 0)
+        return parent or hwnd
+    except Exception:
+        return 0
+
+
+def get_current_window_rectangle():
+    """Return the current client size and absolute desktop position.
+
+    ``wm geometry`` uses a negative offset to mean "from the right/bottom", so
+    parsing that string as an absolute coordinate can move windows that were on
+    monitors left of or above the primary display. Numeric Tk dimensions plus
+    the native Windows frame rectangle avoid that ambiguity.
+    """
+    try:
+        root.update_idletasks()
+        width = max(1, int(root.winfo_width()))
+        height = max(1, int(root.winfo_height()))
+        x = int(root.winfo_x())
+        y = int(root.winfo_y())
+
+        hwnd = get_native_toplevel_handle()
+        if hwnd:
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                rect = wintypes.RECT()
+                user32 = ctypes.windll.user32
+                user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+                user32.GetWindowRect.restype = wintypes.BOOL
+                if user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                    x = int(rect.left)
+                    y = int(rect.top)
+            except Exception:
+                pass
+
+        return width, height, x, y
+    except Exception:
+        return None
+
+
+def format_window_geometry(width, height, x, y):
+    return f"{int(width)}x{int(height)}{int(x):+d}{int(y):+d}"
+
+
+def set_window_geometry_absolute(width, height, x, y):
+    """Apply client size and absolute virtual-desktop coordinates.
+
+    Windows native positioning is used after Tk applies the client size so
+    negative coordinates remain absolute on left/upper secondary monitors.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    x = int(x)
+    y = int(y)
+
+    root.geometry(f"{width}x{height}")
+    root.update_idletasks()
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            hwnd = get_native_toplevel_handle()
+            if not hwnd:
+                raise RuntimeError("Could not resolve the main window handle")
+            from ctypes import wintypes
+
+            SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            user32 = ctypes.windll.user32
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND,
+                wintypes.HWND,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                wintypes.UINT,
+            ]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            if user32.SetWindowPos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(0),
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ):
+                root.update_idletasks()
+                return True
+        except Exception:
+            pass
+
+    # Portable fallback. Some window managers interpret the requested Tk
+    # coordinate as the client origin and then add decorations. Correct that
+    # offset once so subsequent save/restore cycles do not drift downward.
+    root.geometry(format_window_geometry(width, height, x, y))
+    root.update_idletasks()
+    try:
+        actual_x = int(root.winfo_x())
+        actual_y = int(root.winfo_y())
+        corrected_x = x + (x - actual_x)
+        corrected_y = y + (y - actual_y)
+        if (corrected_x != x or corrected_y != y) and corrected_x >= 0 and corrected_y >= 0:
+            root.geometry(format_window_geometry(width, height, corrected_x, corrected_y))
+            root.update_idletasks()
+    except Exception:
+        pass
+    return True
+
 def normalize_saved_window_geometry(value):
     """Return bounded ``width, height, x, y`` values or None."""
     match = re.fullmatch(r"\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*", str(value or ""))
@@ -6002,7 +6284,6 @@ def normalize_saved_window_geometry(value):
     if abs(x) > 100000 or abs(y) > 100000:
         return None
     return width, height, x, y
-
 
 def normalize_saved_window_state(value):
     """Return a restorable top-level window state.
@@ -6020,10 +6301,11 @@ def remember_current_normal_window_geometry():
     try:
         if str(root.state()).strip().lower() != "normal":
             return last_normal_window_geometry
-        root.update_idletasks()
-        value = str(root.geometry() or "").strip()
-        if normalize_saved_window_geometry(value):
-            last_normal_window_geometry = value
+        rectangle = get_current_window_rectangle()
+        if rectangle is not None:
+            value = format_window_geometry(*rectangle)
+            if normalize_saved_window_geometry(value):
+                last_normal_window_geometry = value
     except Exception:
         pass
     return last_normal_window_geometry
@@ -6040,15 +6322,12 @@ def get_current_window_geometry():
     if normalize_saved_window_geometry(last_normal_window_geometry):
         return last_normal_window_geometry
 
-    try:
-        root.update_idletasks()
-        value = str(root.geometry() or "").strip()
+    rectangle = get_current_window_rectangle()
+    if rectangle is not None:
+        value = format_window_geometry(*rectangle)
         if normalize_saved_window_geometry(value):
             return value
-    except Exception:
-        pass
     return ""
-
 
 def get_current_window_state():
     """Return ``normal`` or ``zoomed`` while ignoring minimized state."""
@@ -6078,34 +6357,38 @@ def apply_saved_window_geometry(value):
 
     width, height, x, y = parsed
     try:
-        screen_x = int(root.winfo_vrootx())
-        screen_y = int(root.winfo_vrooty())
-        screen_width = int(root.winfo_vrootwidth() or root.winfo_screenwidth())
-        screen_height = int(root.winfo_vrootheight() or root.winfo_screenheight())
-        if screen_width <= 0 or screen_height <= 0:
-            raise ValueError("Invalid virtual screen dimensions")
+        work_left, work_top, work_right, work_bottom, _primary = choose_monitor_work_area(
+            x, y, width, height
+        )
+        work_width = max(1, work_right - work_left)
+        work_height = max(1, work_bottom - work_top)
 
-        max_width = max(900, screen_width - APP_WINDOW_SCREEN_MARGIN_WIDTH)
-        max_height = max(700, screen_height - APP_WINDOW_SCREEN_MARGIN_HEIGHT)
+        max_width = max(700, work_width - APP_WINDOW_SCREEN_MARGIN_WIDTH)
+        max_height = max(640, work_height - APP_WINDOW_SCREEN_MARGIN_HEIGHT)
         min_width = min(APP_WINDOW_MIN_WIDTH, max_width)
         min_height = min(APP_WINDOW_MIN_HEIGHT, max_height)
         width = max(min_width, min(width, max_width))
         height = max(min_height, min(height, max_height))
 
-        # Keep at least a usable strip of the window on the current virtual desktop.
-        visible_x = min(160, width)
+        # Preserve the exact saved position when it remains usable. If the
+        # monitor layout changed, keep the title bar and a meaningful width
+        # visible inside the nearest monitor's work area.
+        visible_x = min(240, width)
         visible_y = min(100, height)
-        x = max(screen_x - width + visible_x, min(x, screen_x + screen_width - visible_x))
-        y = max(screen_y, min(y, screen_y + screen_height - visible_y))
+        minimum_x = work_left - width + visible_x
+        maximum_x = work_right - visible_x
+        minimum_y = work_top
+        maximum_y = max(work_top, work_bottom - visible_y)
+        x = max(minimum_x, min(x, maximum_x))
+        y = max(minimum_y, min(y, maximum_y))
 
         root.minsize(min_width, min_height)
-        last_normal_window_geometry = f"{width}x{height}{x:+d}{y:+d}"
-        root.geometry(last_normal_window_geometry)
+        last_normal_window_geometry = format_window_geometry(width, height, x, y)
+        set_window_geometry_absolute(width, height, x, y)
         return last_normal_window_geometry
     except Exception:
         apply_screen_aware_startup_geometry()
         return get_current_window_geometry()
-
 
 def apply_saved_window_presentation(geometry_value, state_value):
     """Restore normal geometry first, then maximize on the idle queue if needed."""
@@ -21351,6 +21634,11 @@ def get_web_settings_dict():
         "web_pdf_footer_template": get_web_pdf_footer_template_value(),
         "web_pdf_page_behavior": web_pdf_page_behavior_var.get() if web_pdf_page_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_pdf_page_behavior"],
         "web_pdf_capture_mode": web_pdf_capture_mode_var.get() if web_pdf_capture_mode_var.get() in {"live_webpage", "paginated_png"} else DEFAULTS["web_pdf_capture_mode"],
+        "web_pdf_large_handling": web_pdf_large_handling_var.get() if web_pdf_large_handling_var.get() in {"automatic", "single", "split", "fail"} else DEFAULTS["web_pdf_large_handling"],
+        "web_pdf_auto_split_threshold_pages": normalize_positive_int_string(web_pdf_auto_split_threshold_pages_var.get(), DEFAULTS["web_pdf_auto_split_threshold_pages"]),
+        "web_pdf_pages_per_part": normalize_positive_int_string(web_pdf_pages_per_part_var.get(), DEFAULTS["web_pdf_pages_per_part"]),
+        "web_pdf_max_total_pages": normalize_positive_int_string(web_pdf_max_total_pages_var.get(), DEFAULTS["web_pdf_max_total_pages"]),
+        "web_pdf_max_parts": normalize_positive_int_string(web_pdf_max_parts_var.get(), DEFAULTS["web_pdf_max_parts"]),
     }
 
 
@@ -21489,6 +21777,17 @@ def get_web_pdf_capture_mode_label(value=None):
     return mapping.get(capture_mode, mapping[DEFAULTS["web_pdf_capture_mode"]])
 
 
+def get_web_pdf_large_handling_label(value=None):
+    handling = str(value if value is not None else web_pdf_large_handling_var.get()).strip()
+    mapping = {
+        "automatic": "Automatic split",
+        "single": "Single PDF",
+        "split": "Split into parts",
+        "fail": "Fail above safety limit",
+    }
+    return mapping.get(handling, mapping[DEFAULTS["web_pdf_large_handling"]])
+
+
 def get_web_pdf_page_behavior_label(value=None):
     behavior = str(value if value is not None else web_pdf_page_behavior_var.get()).strip()
     mapping = {
@@ -21604,6 +21903,13 @@ def update_web_options_summary(*args):
                 pdf_parts.append("CSS page size")
             if web_pdf_capture_mode_var.get() == "live_webpage":
                 pdf_parts.append(get_web_pdf_page_behavior_label())
+                pdf_parts.append(get_web_pdf_large_handling_label())
+                if web_pdf_large_handling_var.get() == "automatic":
+                    pdf_parts.append(f"split at ~{normalize_positive_int_string(web_pdf_auto_split_threshold_pages_var.get(), DEFAULTS['web_pdf_auto_split_threshold_pages'])} pages")
+                if web_pdf_large_handling_var.get() in {"automatic", "split"}:
+                    pdf_parts.append(f"{normalize_positive_int_string(web_pdf_pages_per_part_var.get(), DEFAULTS['web_pdf_pages_per_part'])} pages/part")
+                if web_pdf_large_handling_var.get() in {"automatic", "split", "fail"}:
+                    pdf_parts.append(f"max {normalize_positive_int_string(web_pdf_max_total_pages_var.get(), DEFAULTS['web_pdf_max_total_pages'])} pages")
             page_ranges = web_pdf_page_ranges_var.get().strip()
             if page_ranges and web_pdf_capture_mode_var.get() == "live_webpage":
                 pdf_parts.append(f"pages {page_ranges}")
@@ -21730,7 +22036,27 @@ def update_web_pdf_options_state(*args):
     live_state = "normal" if enabled and live_capture_mode else "disabled"
     for widget in globals().get("web_pdf_live_widgets", []):
         try:
-            widget.configure(state=live_state)
+            widget.configure(state=("readonly" if live_state == "normal" and isinstance(widget, ttk.Combobox) else live_state))
+        except Exception:
+            pass
+
+    large_handling = str(web_pdf_large_handling_var.get()).strip()
+    split_state = "normal" if enabled and live_capture_mode and large_handling in {"automatic", "split"} else "disabled"
+    for widget in globals().get("web_pdf_split_widgets", []):
+        try:
+            widget.configure(state=split_state)
+        except Exception:
+            pass
+    automatic_state = "normal" if enabled and live_capture_mode and large_handling == "automatic" else "disabled"
+    for widget in globals().get("web_pdf_automatic_widgets", []):
+        try:
+            widget.configure(state=automatic_state)
+        except Exception:
+            pass
+    safety_state = "normal" if enabled and live_capture_mode and large_handling in {"automatic", "split", "fail"} else "disabled"
+    for widget in globals().get("web_pdf_safety_widgets", []):
+        try:
+            widget.configure(state=safety_state)
         except Exception:
             pass
 
@@ -22140,6 +22466,25 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
             raise ValueError("Webpage Capture PDF capture mode must be a supported choice.")
         if pdf_capture_mode == "paginated_png" and image_format != "png":
             raise ValueError("Captured PNG PDF output requires PNG as the Webpage Capture image format.")
+        pdf_large_handling = str(settings.get("web_pdf_large_handling", DEFAULTS["web_pdf_large_handling"]) or DEFAULTS["web_pdf_large_handling"]).strip()
+        if pdf_large_handling not in {"automatic", "single", "split", "fail"}:
+            raise ValueError("Webpage Capture large Live Page PDF handling must be Automatic, Single PDF, Split into parts, or Fail above safety limit.")
+        pdf_auto_split_threshold = int(settings.get("web_pdf_auto_split_threshold_pages", DEFAULTS["web_pdf_auto_split_threshold_pages"]))
+        pdf_pages_per_part = int(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"]))
+        pdf_max_total_pages = int(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"]))
+        pdf_max_parts = int(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]))
+        if not 2 <= pdf_auto_split_threshold <= 5000:
+            raise ValueError("Webpage Capture automatic PDF split threshold must be from 2 to 5000 estimated pages.")
+        if not 1 <= pdf_pages_per_part <= 500:
+            raise ValueError("Webpage Capture pages per PDF part must be from 1 to 500.")
+        if not 1 <= pdf_max_total_pages <= 5000:
+            raise ValueError("Webpage Capture maximum Live Page PDF pages must be from 1 to 5000.")
+        if not 1 <= pdf_max_parts <= 100:
+            raise ValueError("Webpage Capture maximum PDF parts must be from 1 to 100.")
+        if pdf_pages_per_part > pdf_max_total_pages:
+            raise ValueError("Webpage Capture pages per PDF part cannot exceed the maximum total PDF pages.")
+        if pdf_auto_split_threshold > pdf_max_total_pages:
+            raise ValueError("Webpage Capture automatic PDF split threshold cannot exceed the maximum total PDF pages.")
     get_web_proxy_server_for_browser()
     settings["web_script_path"] = script_path
     settings["web_deno_path"] = deno_path
@@ -22270,6 +22615,11 @@ def make_web_capture_config(job, preflight_only=False):
         "pdf_footer_template": str(settings.get("web_pdf_footer_template", DEFAULTS["web_pdf_footer_template"]) or ""),
         "pdf_page_behavior": settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"]),
         "pdf_capture_mode": settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"]),
+        "pdf_large_handling": settings.get("web_pdf_large_handling", DEFAULTS["web_pdf_large_handling"]),
+        "pdf_auto_split_threshold_pages": int(settings.get("web_pdf_auto_split_threshold_pages", DEFAULTS["web_pdf_auto_split_threshold_pages"])),
+        "pdf_pages_per_part": int(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"])),
+        "pdf_max_total_pages": int(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"])),
+        "pdf_max_parts": int(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"])),
         "maximum_single_dimension": 30000,
         "proxy_server": get_web_proxy_server_for_browser(),
     }
@@ -22656,7 +23006,12 @@ def start_web_capture():
             f"{settings.get('web_pdf_paper_width_in')}x{settings.get('web_pdf_paper_height_in')} in | "
             f"scale {settings.get('web_pdf_scale')} | "
             f"headers/footers {'on' if settings.get('web_pdf_display_header_footer') else 'off'} | "
-            f"behavior {get_web_pdf_page_behavior_label(settings.get('web_pdf_page_behavior'))}\n"
+            f"behavior {get_web_pdf_page_behavior_label(settings.get('web_pdf_page_behavior'))} | "
+            f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))} | "
+            f"auto split {settings.get('web_pdf_auto_split_threshold_pages', DEFAULTS['web_pdf_auto_split_threshold_pages'])} pages | "
+            f"{settings.get('web_pdf_pages_per_part', DEFAULTS['web_pdf_pages_per_part'])} pages/part | "
+            f"max {settings.get('web_pdf_max_total_pages', DEFAULTS['web_pdf_max_total_pages'])} pages, "
+            f"{settings.get('web_pdf_max_parts', DEFAULTS['web_pdf_max_parts'])} parts\n"
         )
     web_append_log(f"URLs: {len(urls)}\n")
     web_append_log("Command:\n" + format_command_for_log(cmd) + "\n\n")
@@ -22784,8 +23139,27 @@ def show_web_start_capture_menu():
             pass
 
 
+def capture_stable_normal_window_geometry():
+    """Capture geometry only after move/resize/maximize events have settled."""
+    global window_geometry_capture_after_id, last_non_iconic_window_state
+    window_geometry_capture_after_id = None
+
+    if globals().get("settings_state_loading", True) or APP_CLOSING:
+        return
+
+    try:
+        state = str(root.state() or "").strip().lower()
+        if state == "normal":
+            remember_current_normal_window_geometry()
+            last_non_iconic_window_state = "normal"
+        elif state == "zoomed":
+            last_non_iconic_window_state = "zoomed"
+    except Exception:
+        return
+
+
 def on_root_window_configure(event=None):
-    global last_non_iconic_window_state
+    global last_non_iconic_window_state, window_geometry_capture_after_id
 
     if globals().get("settings_state_loading", True) or APP_CLOSING:
         return
@@ -22795,48 +23169,82 @@ def on_root_window_configure(event=None):
         state = str(root.state() or "").strip().lower()
         if state == "iconic":
             return
-        if state == "normal":
-            remember_current_normal_window_geometry()
-            last_non_iconic_window_state = "normal"
-        elif state == "zoomed":
+        if state == "zoomed":
             last_non_iconic_window_state = "zoomed"
+
+        # A Windows maximize/restore transition can emit Configure while Tk
+        # still reports the old state. Delay geometry capture until the window
+        # manager has settled so maximized dimensions never replace the last
+        # normal size and position.
+        try:
+            if window_geometry_capture_after_id:
+                root.after_cancel(window_geometry_capture_after_id)
+        except Exception:
+            pass
+        window_geometry_capture_after_id = safe_after(
+            WINDOW_GEOMETRY_CAPTURE_DELAY_MS,
+            capture_stable_normal_window_geometry,
+        )
     except Exception:
         return
     schedule_settings_autosave(delay_ms=1200)
 
 
-def apply_screen_aware_startup_geometry():
-    """Apply a default startup size that fits the current logical display.
+def calculate_default_window_geometry(work_area):
+    """Return a first-launch geometry and minimum size for a monitor work area."""
+    work_left, work_top, work_right, work_bottom, _primary = work_area
+    work_width = max(1, work_right - work_left)
+    work_height = max(1, work_bottom - work_top)
 
-    Windows display scaling can make a 1920x1200 monitor much smaller in
-    Tkinter's logical pixels. Cap the startup and minimum heights so the bottom
-    notebook tabs remain on-screen.
+    max_width = max(700, work_width - APP_WINDOW_SCREEN_MARGIN_WIDTH)
+    max_height = max(640, work_height - APP_WINDOW_SCREEN_MARGIN_HEIGHT)
+    width = min(APP_WINDOW_WIDTH, max_width)
+    height = min(APP_WINDOW_DEFAULT_HEIGHT, max_height)
+    min_width = min(APP_WINDOW_MIN_WIDTH, max_width)
+    min_height = min(APP_WINDOW_MIN_HEIGHT, max_height, height)
+
+    x = work_left + max(0, (work_width - width) // 2)
+    outer_height_estimate = height + APP_WINDOW_TITLEBAR_ALLOWANCE
+    y = work_top + max(
+        APP_WINDOW_DEFAULT_TOP_PADDING,
+        (work_height - outer_height_estimate) // 2,
+    )
+    if y + outer_height_estimate > work_bottom:
+        y = max(work_top, work_bottom - outer_height_estimate)
+
+    return width, height, x, y, min_width, min_height
+
+def apply_screen_aware_startup_geometry():
+    """Place a first-launch window inside the monitor work area.
+
+    The Windows work area excludes the taskbar. WAVI explicitly chooses a
+    centered, slightly top-biased position instead of letting the window manager
+    place a tall window too low, which could hide lower controls.
     """
     global last_normal_window_geometry
 
     try:
-        screen_width = int(root.winfo_screenwidth())
-        screen_height = int(root.winfo_screenheight())
-        max_width = max(900, screen_width - APP_WINDOW_SCREEN_MARGIN_WIDTH)
-        max_height = max(700, screen_height - APP_WINDOW_SCREEN_MARGIN_HEIGHT)
-        width = min(APP_WINDOW_WIDTH, max_width)
-        height = min(APP_WINDOW_DEFAULT_HEIGHT, max_height)
-        min_width = min(APP_WINDOW_MIN_WIDTH, max_width)
-        min_height = min(APP_WINDOW_MIN_HEIGHT, max_height, height)
-        root.geometry(f"{width}x{height}")
+        width, height, x, y, min_width, min_height = calculate_default_window_geometry(
+            choose_monitor_work_area()
+        )
+
         root.minsize(min_width, min_height)
-        root.update_idletasks()
-        value = str(root.geometry() or "").strip()
-        if normalize_saved_window_geometry(value):
-            last_normal_window_geometry = value
-    except Exception:
-        root.geometry(f"{APP_WINDOW_WIDTH}x{APP_WINDOW_DEFAULT_HEIGHT}")
-        root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT)
-        try:
-            root.update_idletasks()
-            value = str(root.geometry() or "").strip()
+        last_normal_window_geometry = format_window_geometry(width, height, x, y)
+        set_window_geometry_absolute(width, height, x, y)
+        rectangle = get_current_window_rectangle()
+        if rectangle is not None:
+            value = format_window_geometry(*rectangle)
             if normalize_saved_window_geometry(value):
                 last_normal_window_geometry = value
+    except Exception:
+        root.minsize(APP_WINDOW_MIN_WIDTH, APP_WINDOW_MIN_HEIGHT)
+        set_window_geometry_absolute(APP_WINDOW_WIDTH, APP_WINDOW_DEFAULT_HEIGHT, 16, 16)
+        try:
+            rectangle = get_current_window_rectangle()
+            if rectangle is not None:
+                value = format_window_geometry(*rectangle)
+                if normalize_saved_window_geometry(value):
+                    last_normal_window_geometry = value
         except Exception:
             pass
 
@@ -23070,6 +23478,11 @@ web_pdf_header_template_var = tk.StringVar(value=DEFAULTS["web_pdf_header_templa
 web_pdf_footer_template_var = tk.StringVar(value=DEFAULTS["web_pdf_footer_template"])
 web_pdf_page_behavior_var = tk.StringVar(value=DEFAULTS["web_pdf_page_behavior"])
 web_pdf_capture_mode_var = tk.StringVar(value=DEFAULTS["web_pdf_capture_mode"])
+web_pdf_large_handling_var = tk.StringVar(value=DEFAULTS["web_pdf_large_handling"])
+web_pdf_auto_split_threshold_pages_var = tk.StringVar(value=DEFAULTS["web_pdf_auto_split_threshold_pages"])
+web_pdf_pages_per_part_var = tk.StringVar(value=DEFAULTS["web_pdf_pages_per_part"])
+web_pdf_max_total_pages_var = tk.StringVar(value=DEFAULTS["web_pdf_max_total_pages"])
+web_pdf_max_parts_var = tk.StringVar(value=DEFAULTS["web_pdf_max_parts"])
 web_status_var = tk.StringVar(value="Ready")
 web_preflight_done_var = tk.BooleanVar(value=False)
 web_options_summary_var = tk.StringVar(value="")
@@ -25985,6 +26398,9 @@ ttk.Checkbutton(
 web_pdf_option_widgets = []
 web_pdf_live_widgets = []
 web_pdf_header_footer_widgets = []
+web_pdf_split_widgets = []
+web_pdf_automatic_widgets = []
+web_pdf_safety_widgets = []
 
 def register_web_pdf_widget(widget):
     web_pdf_option_widgets.append(widget)
@@ -26147,6 +26563,72 @@ for row, (label_text, variable) in enumerate((
         web_pdf_margin_left_entry = entry
     else:
         web_pdf_margin_right_entry = entry
+
+# Large Live Page PDF handling. Explicit page ranges take precedence and are
+# always generated as one streamed PDF. A dedicated tab avoids increasing the
+# height of every PDF Options page.
+web_pdf_large_tab = ttk.Frame(web_pdf_notebook, padding=8)
+web_pdf_large_tab.columnconfigure(0, weight=1)
+web_pdf_notebook.add(web_pdf_large_tab, text="Large PDFs")
+web_pdf_large_frame = ttk.LabelFrame(web_pdf_large_tab, text="Large Live Page PDFs", padding=8)
+web_pdf_large_frame.grid(row=0, column=0, sticky="ew")
+for column in range(4):
+    web_pdf_large_frame.columnconfigure(column, weight=1 if column in {1, 3} else 0)
+
+web_pdf_large_handling_frame = ttk.LabelFrame(web_pdf_large_frame, text="Handling", padding=6)
+web_pdf_large_handling_frame.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+for column, (label, value) in enumerate((
+    ("Automatic", "automatic"),
+    ("Single PDF", "single"),
+    ("Split into parts", "split"),
+    ("Fail above safety limit", "fail"),
+)):
+    web_pdf_large_handling_frame.columnconfigure(column, weight=1)
+    register_web_pdf_live_widget(ttk.Radiobutton(
+        web_pdf_large_handling_frame,
+        text=label,
+        variable=web_pdf_large_handling_var,
+        value=value,
+        command=update_web_pdf_options_state,
+    )).grid(row=0, column=column, sticky="w", padx=(0, 8), pady=2)
+
+ttk.Label(web_pdf_large_frame, text="Pages per part").grid(row=1, column=0, sticky="w", pady=3)
+web_pdf_pages_per_part_entry = register_web_pdf_live_widget(ttk.Entry(
+    web_pdf_large_frame, textvariable=web_pdf_pages_per_part_var, width=10
+))
+web_pdf_pages_per_part_entry.grid(row=1, column=1, sticky="ew", padx=(8, 18), pady=3)
+web_pdf_split_widgets.append(web_pdf_pages_per_part_entry)
+
+ttk.Label(web_pdf_large_frame, text="Auto split at estimated pages").grid(row=1, column=2, sticky="w", pady=3)
+web_pdf_auto_split_entry = register_web_pdf_live_widget(ttk.Entry(
+    web_pdf_large_frame, textvariable=web_pdf_auto_split_threshold_pages_var, width=10
+))
+web_pdf_auto_split_entry.grid(row=1, column=3, sticky="ew", padx=(8, 0), pady=3)
+web_pdf_automatic_widgets.append(web_pdf_auto_split_entry)
+
+ttk.Label(web_pdf_large_frame, text="Maximum total pages").grid(row=2, column=0, sticky="w", pady=3)
+web_pdf_max_total_pages_entry = register_web_pdf_live_widget(ttk.Entry(
+    web_pdf_large_frame, textvariable=web_pdf_max_total_pages_var, width=10
+))
+web_pdf_max_total_pages_entry.grid(row=2, column=1, sticky="ew", padx=(8, 18), pady=3)
+web_pdf_safety_widgets.append(web_pdf_max_total_pages_entry)
+
+ttk.Label(web_pdf_large_frame, text="Maximum parts").grid(row=2, column=2, sticky="w", pady=3)
+web_pdf_max_parts_entry = register_web_pdf_live_widget(ttk.Entry(
+    web_pdf_large_frame, textvariable=web_pdf_max_parts_var, width=10
+))
+web_pdf_max_parts_entry.grid(row=2, column=3, sticky="ew", padx=(8, 0), pady=3)
+web_pdf_split_widgets.append(web_pdf_max_parts_entry)
+
+ttk.Label(
+    web_pdf_large_frame,
+    text=(
+        "Live Page only. Automatic uses a lightweight page estimate; Split writes numbered streamed PDFs. "
+        "Safety caps preserve completed parts and mark the result partial. A manual Pages value above overrides this policy."
+    ),
+    wraplength=900,
+    justify="left",
+).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
 # Templates tab: dedicated space for custom HTML without forcing the whole
 # PDF overlay to grow vertically.
