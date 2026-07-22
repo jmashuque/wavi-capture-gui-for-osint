@@ -137,6 +137,8 @@ Recommended source pages:
 
 Use approved releases for your environment. For FFmpeg, the Gyan.dev release essentials build is usually enough because it includes both `ffmpeg.exe` and `ffprobe.exe`.
 
+For Deno, download `deno-x86_64-pc-windows-msvc.zip` by pressing **Show all assets** below the release.
+
 ## Basic Usage
 
 This section covers the normal first-run workflow. Start with the defaults, run **Preflight Check**, and change advanced options only when the capture requires them.
