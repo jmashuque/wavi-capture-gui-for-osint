@@ -22,6 +22,7 @@ import traceback
 import urllib.request
 from urllib.parse import quote, urlsplit, urlunsplit
 from pathlib import Path
+from collections import deque
 import webbrowser
 import threading
 import tkinter as tk
@@ -30,23 +31,27 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v2.2026.0721"
+APP_VERSION = "v2.2026.0722"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
-APP_WINDOW_DEFAULT_HEIGHT = 980
+APP_WINDOW_DEFAULT_HEIGHT = 790
 APP_WINDOW_MIN_WIDTH = 1050
-APP_WINDOW_MIN_HEIGHT = 840
+APP_WINDOW_MIN_HEIGHT = 700
 APP_WINDOW_SCREEN_MARGIN_WIDTH = 80
-APP_WINDOW_SCREEN_MARGIN_HEIGHT = 120
+APP_WINDOW_SCREEN_MARGIN_HEIGHT = 70
 APP_WINDOW_TITLEBAR_ALLOWANCE = 48
 APP_WINDOW_DEFAULT_TOP_PADDING = 16
 WINDOW_GEOMETRY_CAPTURE_DELAY_MS = 250
-URL_ROW_MIN_HEIGHT = 215
+URL_ROW_MIN_HEIGHT = 112
 CLIPBOARD_SAFE_MAX_BYTES = 4 * 1024 * 1024
 CLIPBOARD_SAFE_MAX_LINES = 50000
+OUTPUT_LOG_BUFFER_MAX_CHARS = 2 * 1024 * 1024
+OUTPUT_LOG_BUFFER_MAX_RECORDS = 20000
+OUTPUT_LOG_ALL_MAX_CHARS = 6 * 1024 * 1024
+OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 42
+SETTINGS_SCHEMA_VERSION = 43
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -67,9 +72,11 @@ APP_TAB_LABELS = [
     "Image Capture",
     "Webpage Capture",
     "Job Queue",
+    "Output Log",
     "Audio/Video Preview",
     "Case Browser",
 ]
+CAPTURE_TAB_LABELS = tuple(APP_TAB_LABELS[:3])
 
 DEFAULT_WEB_PDF_HEADER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
@@ -387,6 +394,8 @@ APP_SETTINGS_DEFAULTS = {
     "last_selected_tab": APP_TAB_LABELS[0],
     "window_geometry": "",
     "window_state": "normal",
+    "output_log_selected_engine": "Audio/Video",
+    "output_log_follow_output": True,
 }
 
 DEFAULT_IMPERSONATE_TARGETS = ["None", "chrome", "edge", "firefox"]
@@ -407,6 +416,8 @@ settings_store = {}
 profile_menu = None
 active_profile_name = DEFAULT_PROFILE_NAME
 settings_state_loading = True
+last_selected_capture_tab = APP_SETTINGS_DEFAULTS["last_selected_tab"]
+last_notebook_tab_label = APP_SETTINGS_DEFAULTS["last_selected_tab"]
 last_normal_window_geometry = ""
 last_non_iconic_window_state = "normal"
 window_state_restore_after_id = None
@@ -789,7 +800,6 @@ CASE_BROWSER_COMPACT_PREVIEW_WRAP = 460
 GUI_LOG_FLUSH_INTERVAL_MS = 75
 GUI_LOG_FLUSH_MAX_ITEMS = 300
 GUI_LOG_FLUSH_MAX_CHARS = 120_000
-GUI_LOG_MAX_VISIBLE_LINES = 10_000
 URL_BOX_AUTOPREVIEW_DEBOUNCE_MS = 650
 URL_BOX_LARGE_AUTOPREVIEW_DEBOUNCE_MS = 1200
 URL_BOX_LARGE_AUTOPREVIEW_LINE_THRESHOLD = 500
@@ -801,10 +811,42 @@ JOB_QUEUE_SAVE_DELAY_MS = 600
 JOB_QUEUE_FILTER_OPTIONS = ["All", "Running", "Pending", "Interrupted", "Failed", "Completed", "Cancelled", "Checked", "Incomplete"]
 main_log_queue = queue.Queue()
 image_log_queue = queue.Queue()
+web_log_queue = queue.Queue()
 main_log_flush_after_id = None
 image_log_flush_after_id = None
+web_log_flush_after_id = None
 settings_autosave_after_id = None
 case_browser_media_probe_semaphore = threading.BoundedSemaphore(CASE_BROWSER_MEDIA_PROBE_CONCURRENCY)
+
+OUTPUT_LOG_ENGINE_LABELS = {
+    "yt-dlp": "Audio/Video",
+    "gallery-dl": "Image",
+    "web-capture": "Webpage",
+}
+OUTPUT_LOG_ENGINE_ALIASES = {
+    "yt-dlp": "yt-dlp",
+    "audio/video": "yt-dlp",
+    "audio-video": "yt-dlp",
+    "audio video": "yt-dlp",
+    "gallery-dl": "gallery-dl",
+    "image": "gallery-dl",
+    "web-capture": "web-capture",
+    "webpage": "web-capture",
+    "web": "web-capture",
+}
+OUTPUT_LOG_VIEW_OPTIONS = ["Audio/Video", "Image", "Webpage", "All Engines"]
+engine_log_buffers = {engine: deque() for engine in OUTPUT_LOG_ENGINE_LABELS}
+engine_log_buffer_chars = {engine: 0 for engine in OUTPUT_LOG_ENGINE_LABELS}
+all_engine_log_records = deque()
+all_engine_log_chars = 0
+engine_log_sequence = 0
+engine_log_lock = threading.RLock()
+output_log_text = None
+output_log_engine_var = None
+output_log_follow_var = None
+output_log_engine_selector = None
+output_log_selected_engine = "Audio/Video"
+output_log_follow_output = True
 
 
 def log_debug_exception(context, exc=None):
@@ -1027,6 +1069,156 @@ def install_global_scroll_recognition(root_widget):
     bind_widget_tree_scroll_events(root_widget)
 
 
+def create_scrollable_options_panel(parent, title, padding=12):
+    """Create a reusable option-panel shell with an automatic vertical scrollbar.
+
+    Controls are created inside the returned content frame. Scrollbar state is
+    only evaluated after the panel and canvas are actually viewable. This avoids
+    Tk changing the grid layout while a hidden canvas still reports a 1x1 size,
+    which could leave the first panel opening visually blank until it was toggled
+    a second time.
+    """
+    panel = ttk.LabelFrame(parent, text=title, padding=0)
+    panel.columnconfigure(0, weight=1)
+    panel.rowconfigure(0, weight=1)
+
+    viewport = ttk.Frame(panel)
+    viewport.grid(row=0, column=0, sticky="nsew")
+    viewport.columnconfigure(0, weight=1)
+    viewport.rowconfigure(0, weight=1)
+
+    canvas = tk.Canvas(viewport, highlightthickness=0, borderwidth=0, height=1)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    content = ttk.Frame(canvas, padding=padding)
+    content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+    scrollbar_visible = {"value": False}
+    refresh_after_id = {"value": None}
+
+    def apply_scroll_state():
+        refresh_after_id["value"] = None
+        try:
+            # Hidden panels and canvases initially report a 1x1 geometry. Do not
+            # add/remove the scrollbar until Tk has completed the mapping pass.
+            if not panel.winfo_viewable() or not canvas.winfo_viewable():
+                return
+
+            viewport_height = int(canvas.winfo_height())
+            viewport_width = int(canvas.winfo_width())
+            if viewport_height <= 1 or viewport_width <= 1:
+                return
+
+            requested_height = max(1, content.winfo_reqheight())
+            requested_width = max(1, content.winfo_reqwidth())
+            canvas.itemconfigure(content_window, width=viewport_width)
+            canvas.configure(
+                scrollregion=(
+                    0,
+                    0,
+                    max(requested_width, viewport_width),
+                    requested_height,
+                )
+            )
+
+            needs_scrollbar = requested_height > viewport_height + 1
+            if needs_scrollbar and not scrollbar_visible["value"]:
+                scrollbar.grid(row=0, column=1, sticky="ns")
+                scrollbar_visible["value"] = True
+            elif not needs_scrollbar and scrollbar_visible["value"]:
+                scrollbar.grid_remove()
+                scrollbar_visible["value"] = False
+                canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+    def schedule_scroll_refresh(_event=None, delay_ms=0):
+        try:
+            existing = refresh_after_id.get("value")
+            if existing is not None:
+                try:
+                    panel.after_cancel(existing)
+                except Exception:
+                    pass
+            if delay_ms:
+                refresh_after_id["value"] = panel.after(delay_ms, apply_scroll_state)
+            else:
+                refresh_after_id["value"] = panel.after_idle(apply_scroll_state)
+        except Exception:
+            pass
+
+    def on_canvas_configure(event):
+        try:
+            if event.width > 1:
+                canvas.itemconfigure(content_window, width=event.width)
+        except Exception:
+            pass
+        schedule_scroll_refresh()
+
+    content.bind("<Configure>", schedule_scroll_refresh, add="+")
+    canvas.bind("<Configure>", on_canvas_configure, add="+")
+    bind_widget_scroll_events(canvas)
+    bind_widget_scroll_events(content)
+
+    panel._options_canvas = canvas
+    panel._options_scrollbar = scrollbar
+    panel._options_content = content
+    panel._refresh_options_scroll = schedule_scroll_refresh
+    return panel, content
+
+
+def grid_widget_is_managed(widget):
+    """Return True while a widget is still managed by grid, even if an ancestor is hidden."""
+    try:
+        return str(widget.winfo_manager() or "").strip().lower() == "grid"
+    except Exception:
+        return False
+
+
+def remove_grid_managed_widget(widget):
+    """Remove a grid-managed widget without relying on its current mapped state."""
+    if not grid_widget_is_managed(widget):
+        return False
+    try:
+        widget.grid_remove()
+        return True
+    except Exception:
+        return False
+
+
+def refresh_scrollable_options_panel(panel):
+    """Refresh one reusable option panel after Tk has mapped its full hierarchy."""
+    try:
+        # The first idle callback lets the outer panel map. The short second
+        # pass catches notebook/tab transitions and Windows theme geometry that
+        # settle one event-loop turn later.
+        panel.after_idle(panel._refresh_options_scroll)
+        panel.after(25, panel._refresh_options_scroll)
+    except Exception:
+        pass
+
+
+def add_options_panel_close_button(content, text, command):
+    """Place a normalized Close button directly after an option panel's content."""
+    try:
+        column_count, next_row = content.grid_size()
+    except Exception:
+        column_count, next_row = 1, 0
+    button_frame = ttk.Frame(content)
+    button_frame.grid(
+        row=max(0, next_row),
+        column=0,
+        columnspan=max(1, column_count),
+        sticky="ew",
+        pady=(8, 0),
+    )
+    button_frame.columnconfigure(0, weight=1)
+    button = ttk.Button(button_frame, text=text, command=command)
+    button.grid(row=0, column=1, sticky="e")
+    return button
+
+
 def join_input_file_paths(paths):
     clean_paths = [str(path).strip().strip('"') for path in (paths or []) if str(path).strip()]
     return "; ".join(clean_paths)
@@ -1094,32 +1286,251 @@ def browse_folder(var, title="Select folder"):
         var.set(path)
 
 
-def append_to_log_widget(widget, text):
+
+def normalize_output_log_engine_key(value):
+    normalized = str(value or "").strip().lower()
+    return OUTPUT_LOG_ENGINE_ALIASES.get(normalized, "yt-dlp")
+
+
+def normalize_output_log_view(value):
+    value = str(value or "").strip()
+    if value in OUTPUT_LOG_VIEW_OPTIONS:
+        return value
+    key = normalize_output_log_engine_key(value)
+    return OUTPUT_LOG_ENGINE_LABELS.get(key, "Audio/Video")
+
+
+def trim_log_record_buffer(buffer, current_chars, max_chars, max_records):
+    while buffer and (current_chars > max_chars or len(buffer) > max_records):
+        record = buffer.popleft()
+        current_chars = max(0, current_chars - len(str(record.get("text", ""))))
+    return current_chars
+
+
+def record_engine_log(engine, text):
+    global engine_log_sequence, all_engine_log_chars
+    key = normalize_output_log_engine_key(engine)
     text = str(text or "")
     if not text:
+        return None
+
+    with engine_log_lock:
+        engine_log_sequence += 1
+        record = {
+            "sequence": engine_log_sequence,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "engine": key,
+            "text": text,
+        }
+        engine_log_buffers[key].append(record)
+        engine_log_buffer_chars[key] += len(text)
+        engine_log_buffer_chars[key] = trim_log_record_buffer(
+            engine_log_buffers[key],
+            engine_log_buffer_chars[key],
+            OUTPUT_LOG_BUFFER_MAX_CHARS,
+            OUTPUT_LOG_BUFFER_MAX_RECORDS,
+        )
+
+        all_engine_log_records.append(record)
+        all_engine_log_chars += len(text)
+        all_engine_log_chars = trim_log_record_buffer(
+            all_engine_log_records,
+            all_engine_log_chars,
+            OUTPUT_LOG_ALL_MAX_CHARS,
+            OUTPUT_LOG_ALL_MAX_RECORDS,
+        )
+        return record
+
+
+def format_all_engine_log_record(record):
+    label = OUTPUT_LOG_ENGINE_LABELS.get(record.get("engine"), str(record.get("engine") or "Unknown"))
+    prefix = f"[{record.get('timestamp', '')}] [{label}] "
+    text = str(record.get("text", "") or "")
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return prefix
+    return "".join(prefix + line for line in lines)
+
+
+def get_output_log_display_text(view=None):
+    selected = normalize_output_log_view(view or output_log_selected_engine)
+    with engine_log_lock:
+        if selected == "All Engines":
+            return "".join(format_all_engine_log_record(record) for record in all_engine_log_records)
+        key = normalize_output_log_engine_key(selected)
+        return "".join(str(record.get("text", "")) for record in engine_log_buffers[key])
+
+
+def set_output_log_text_content(value):
+    if not widget_exists(output_log_text):
         return
-
     try:
-        widget.insert("end", text)
-        try:
-            line_count = int(float(widget.index("end-1c")))
-        except Exception:
-            line_count = 0
+        output_log_text.configure(state="normal")
+        output_log_text.delete("1.0", "end")
+        output_log_text.insert("end", str(value or ""))
+        output_log_text.configure(state="disabled")
+        if output_log_follow_output:
+            output_log_text.see("end")
+    except Exception as exc:
+        log_debug_exception("Could not refresh Output Log tab", exc)
 
-        if line_count > GUI_LOG_MAX_VISIBLE_LINES:
-            excess = line_count - GUI_LOG_MAX_VISIBLE_LINES
-            try:
-                widget.delete("1.0", f"{excess + 1}.0")
-            except Exception:
-                pass
 
-        widget.see("end")
-    except Exception:
-        pass
+def refresh_output_log_tab():
+    set_output_log_text_content(get_output_log_display_text())
+
+
+def append_record_to_output_log_tab(record):
+    if not record or not widget_exists(output_log_text):
+        return
+    selected = normalize_output_log_view(output_log_selected_engine)
+    key = record.get("engine")
+    if selected != "All Engines" and normalize_output_log_engine_key(selected) != key:
+        return
+    value = format_all_engine_log_record(record) if selected == "All Engines" else str(record.get("text", ""))
+    try:
+        output_log_text.configure(state="normal")
+        output_log_text.insert("end", value)
+        output_log_text.configure(state="disabled")
+        if output_log_follow_output:
+            output_log_text.see("end")
+    except Exception as exc:
+        log_debug_exception("Could not append to Output Log tab", exc)
+
+
+def append_engine_log(engine, text):
+    append_record_to_output_log_tab(record_engine_log(engine, text))
 
 
 def append_log(text):
-    append_to_log_widget(log_box, text)
+    append_engine_log("yt-dlp", text)
+
+
+def append_log_for_engine(engine, text):
+    key = normalize_output_log_engine_key(engine)
+    if key == "gallery-dl":
+        image_append_log(text)
+    elif key == "web-capture":
+        web_append_log(text)
+    else:
+        append_log(text)
+
+
+def queue_engine_append_log(engine, text):
+    key = normalize_output_log_engine_key(engine)
+    if key == "gallery-dl":
+        queue_image_append_log(text)
+    elif key == "web-capture":
+        queue_web_append_log(text)
+    else:
+        queue_append_log(text)
+
+
+def clear_engine_log_history(engine, refresh=True):
+    global all_engine_log_chars
+    key = normalize_output_log_engine_key(engine)
+    with engine_log_lock:
+        engine_log_buffers[key].clear()
+        engine_log_buffer_chars[key] = 0
+        retained = deque(record for record in all_engine_log_records if record.get("engine") != key)
+        all_engine_log_records.clear()
+        all_engine_log_records.extend(retained)
+        all_engine_log_chars = sum(len(str(record.get("text", ""))) for record in retained)
+    if refresh:
+        refresh_output_log_tab()
+
+
+def clear_all_engine_log_history():
+    global all_engine_log_chars
+    with engine_log_lock:
+        for key in engine_log_buffers:
+            engine_log_buffers[key].clear()
+            engine_log_buffer_chars[key] = 0
+        all_engine_log_records.clear()
+        all_engine_log_chars = 0
+    refresh_output_log_tab()
+
+
+def on_output_log_engine_selected(_event=None):
+    global output_log_selected_engine
+    if output_log_engine_var is not None:
+        output_log_selected_engine = normalize_output_log_view(output_log_engine_var.get())
+    refresh_output_log_tab()
+    schedule_settings_autosave()
+
+
+def on_output_log_follow_changed():
+    global output_log_follow_output
+    if output_log_follow_var is not None:
+        output_log_follow_output = bool(output_log_follow_var.get())
+    if output_log_follow_output and widget_exists(output_log_text):
+        try:
+            output_log_text.see("end")
+        except Exception:
+            pass
+    schedule_settings_autosave()
+
+
+def clear_output_log_display():
+    selected = normalize_output_log_view(output_log_selected_engine)
+    if selected == "All Engines":
+        if not messagebox.askyesno(
+            "Clear all output displays",
+            "Clear the in-memory output display for Audio/Video, Image, and Webpage Capture?\n\n"
+            "This does not delete case log files or stop any capture.",
+            parent=root,
+        ):
+            return
+        clear_all_engine_log_history()
+    else:
+        clear_engine_log_history(normalize_output_log_engine_key(selected))
+
+
+def copy_visible_output_log():
+    value = get_output_log_display_text()
+    if not value:
+        messagebox.showinfo("Output Log", "The selected output display is empty.", parent=root)
+        return
+    copy_text_to_clipboard(
+        value,
+        label=f"{normalize_output_log_view(output_log_selected_engine)} output log",
+        log_func=lambda _message: None,
+    )
+
+
+def save_visible_output_log():
+    value = get_output_log_display_text()
+    if not value:
+        messagebox.showinfo("Output Log", "The selected output display is empty.", parent=root)
+        return
+    selected = normalize_output_log_view(output_log_selected_engine)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", selected.lower()).strip("-") or "output"
+    default_name = f"wavi-{safe_name}-log-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    path = filedialog.asksaveasfilename(
+        parent=root,
+        title="Save Output Log",
+        defaultextension=".txt",
+        initialfile=default_name,
+        filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+    )
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(value)
+        messagebox.showinfo("Output Log", f"Output log saved to:\n\n{path}", parent=root)
+    except Exception as exc:
+        messagebox.showerror("Output Log", f"Could not save the output log:\n\n{exc}", parent=root)
+
+
+def apply_output_log_settings_to_tab():
+    try:
+        if output_log_engine_var is not None:
+            output_log_engine_var.set(normalize_output_log_view(output_log_selected_engine))
+        if output_log_follow_var is not None:
+            output_log_follow_var.set(bool(output_log_follow_output))
+    except Exception:
+        pass
+    refresh_output_log_tab()
 
 
 def collect_log_queue_text(log_queue):
@@ -1135,13 +1546,13 @@ def collect_log_queue_text(log_queue):
         except Exception:
             break
 
+        total_items += 1
         chunk = str(chunk or "")
         if not chunk:
             continue
 
         chunks.append(chunk)
         total_chars += len(chunk)
-        total_items += 1
 
     return "".join(chunks)
 
@@ -1159,8 +1570,12 @@ def flush_named_log_queue(log_queue, append_func, reschedule_func):
 
 
 def schedule_named_log_flush(log_queue, flush_func, after_id_getter, after_id_setter, text, fallback_append_func, debug_label):
+    text = str(text or "")
+    if not text:
+        return
+
     try:
-        log_queue.put(str(text or ""))
+        log_queue.put(text)
         if after_id_getter() is None:
             after_id_setter(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_func))
     except Exception as e:
@@ -1221,6 +1636,33 @@ def queue_image_append_log(text):
         text,
         image_append_log,
         "queue_image_append_log",
+    )
+
+
+def flush_web_log_queue():
+    global web_log_flush_after_id
+    web_log_flush_after_id = None
+    flush_named_log_queue(
+        web_log_queue,
+        web_append_log,
+        lambda: set_web_log_flush_after_id(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_web_log_queue)),
+    )
+
+
+def set_web_log_flush_after_id(value):
+    global web_log_flush_after_id
+    web_log_flush_after_id = value
+
+
+def queue_web_append_log(text):
+    schedule_named_log_flush(
+        web_log_queue,
+        flush_web_log_queue,
+        lambda: web_log_flush_after_id,
+        set_web_log_flush_after_id,
+        text,
+        web_append_log,
+        "queue_web_append_log",
     )
 
 
@@ -1727,7 +2169,7 @@ def update_date_filter_day_values(prefix, initialize_missing=False):
         pass
 
 
-def update_date_filter_states(*args):
+def update_date_filter_states(*_args):
     try:
         after_state = "readonly" if date_after_enabled_var.get() else "disabled"
         before_state = "readonly" if date_before_enabled_var.get() else "disabled"
@@ -1985,7 +2427,7 @@ def render_filename_template_example(template, now=None, domains=None, presets=N
     return rendered
 
 
-def update_filename_template_preview(*args):
+def update_filename_template_preview(*_args):
     try:
         now = datetime.now()
         resolved_case = get_resolved_case_name(now=now)
@@ -2082,7 +2524,7 @@ def render_gallery_filename_template_example(template, now=None, domains=None, p
     return rendered
 
 
-def update_image_filename_template_preview(*args):
+def update_image_filename_template_preview(*_args):
     try:
         now = datetime.now()
         resolved_case = get_resolved_image_case_name(now=now)
@@ -2170,7 +2612,7 @@ def case_folder_is_populated(case_folder):
     ignored_files = {".ds_store", "desktop.ini", "thumbs.db"}
 
     try:
-        for root_dir, dir_names, file_names in os.walk(case_folder):
+        for _root_dir, dir_names, file_names in os.walk(case_folder):
             dir_names[:] = [name for name in dir_names if name.lower() not in ignored_dirs]
 
             for file_name in file_names:
@@ -2183,7 +2625,7 @@ def case_folder_is_populated(case_folder):
     return False
 
 
-def update_case_folder_preview(*args):
+def update_case_folder_preview(*_args):
     try:
         output_root = output_root_var.get().strip()
         resolved_name = get_resolved_case_name()
@@ -2371,30 +2813,31 @@ def query_capture_tool_versions_for_job(settings):
     return versions
 
 
-def log_capture_tool_versions(versions):
-    append_log("Tool and script versions:\n")
-    append_log(f"  App: {versions.get('app', APP_VERSION)}\n")
+def log_capture_tool_versions(versions, log_callback=None):
+    writer = log_callback or append_log
+    writer("Tool and script versions:\n")
+    writer(f"  App: {versions.get('app', APP_VERSION)}\n")
     if versions.get("engine") == "gallery-dl":
-        append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
-        append_log(f"  gallery-dl path: {versions.get('gallery_dl_path', '')}\n")
-        append_log(f"  gallery-dl: {versions.get('gallery_dl', {}).get('version', 'unavailable')}\n\n")
+        writer(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
+        writer(f"  gallery-dl path: {versions.get('gallery_dl_path', '')}\n")
+        writer(f"  gallery-dl: {versions.get('gallery_dl', {}).get('version', 'unavailable')}\n\n")
         return
     if versions.get("engine") == "web-capture":
-        append_log(f"  Web helper script: {versions.get('helper_script', '')}\n")
-        append_log(f"  Deno path: {versions.get('deno_path', '')}\n")
-        append_log(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
-        append_log(f"  Browser path: {versions.get('browser_path', '')}\n")
-        append_log(f"  Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n\n")
+        writer(f"  Web helper script: {versions.get('helper_script', '')}\n")
+        writer(f"  Deno path: {versions.get('deno_path', '')}\n")
+        writer(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
+        writer(f"  Browser path: {versions.get('browser_path', '')}\n")
+        writer(f"  Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n\n")
         return
-    append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
-    append_log(f"  yt-dlp path: {versions.get('yt_dlp_path', '')}\n")
-    append_log(f"  yt-dlp: {versions.get('yt_dlp', {}).get('version', 'unavailable')}\n")
-    append_log(f"  FFmpeg path: {versions.get('ffmpeg_path', '')}\n")
-    append_log(f"  FFmpeg: {versions.get('ffmpeg', {}).get('version', 'unavailable')}\n")
-    append_log(f"  FFprobe path: {versions.get('ffprobe_path', '')}\n")
-    append_log(f"  FFprobe: {versions.get('ffprobe', {}).get('version', 'unavailable')}\n")
-    append_log(f"  Deno path: {versions.get('deno_path', '')}\n")
-    append_log(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n\n")
+    writer(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
+    writer(f"  yt-dlp path: {versions.get('yt_dlp_path', '')}\n")
+    writer(f"  yt-dlp: {versions.get('yt_dlp', {}).get('version', 'unavailable')}\n")
+    writer(f"  FFmpeg path: {versions.get('ffmpeg_path', '')}\n")
+    writer(f"  FFmpeg: {versions.get('ffmpeg', {}).get('version', 'unavailable')}\n")
+    writer(f"  FFprobe path: {versions.get('ffprobe_path', '')}\n")
+    writer(f"  FFprobe: {versions.get('ffprobe', {}).get('version', 'unavailable')}\n")
+    writer(f"  Deno path: {versions.get('deno_path', '')}\n")
+    writer(f"  Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n\n")
 
 
 
@@ -3020,7 +3463,7 @@ def export_case_summary_urls(engine, status):
 
 
 def show_case_summary_actions_menu(engine):
-    main_name, menu_button_name, menu_name = get_case_summary_widget_names(engine)
+    _, menu_button_name, menu_name = get_case_summary_widget_names(engine)
     menu_button = globals().get(menu_button_name)
     menu = globals().get(menu_name)
     if menu_button is None or menu is None:
@@ -3370,7 +3813,7 @@ def read_input_file_for_url_box(prompt_if_missing=True):
 
 
 def load_urls_from_input_file():
-    content, encoding_name, path = read_input_file_for_url_box(prompt_if_missing=True)
+    content, _, path = read_input_file_for_url_box(prompt_if_missing=True)
 
     if content is None:
         return
@@ -3513,7 +3956,7 @@ def initialize_url_box_from_persistence_and_input_files():
     url_box_autoload_ready = True
 
 
-def handle_input_file_var_changed(*args):
+def handle_input_file_var_changed(*_args):
     try:
         schedule_playlist_preview_autoload()
     except Exception:
@@ -3563,7 +4006,7 @@ def initialize_image_url_box_from_persistence_and_input_files():
     auto_populate_image_url_box_from_input_files_if_empty()
 
 
-def handle_image_input_file_var_changed(*args):
+def handle_image_input_file_var_changed(*_args):
     auto_populate_image_url_box_from_input_files_if_empty()
 
 
@@ -3607,7 +4050,7 @@ def initialize_web_url_box_from_persistence_and_input_files():
     auto_populate_web_url_box_from_input_files_if_empty()
 
 
-def handle_web_input_file_var_changed(*args):
+def handle_web_input_file_var_changed(*_args):
     auto_populate_web_url_box_from_input_files_if_empty()
 
 
@@ -3928,7 +4371,7 @@ def get_current_url_list_for_tools(use_all_cache=True):
     return get_url_list_from_widget(urls_text, get_existing_input_file_paths(), log_errors=True)
 
 
-def set_url_box_urls(urls, include_group_headers=False):
+def set_url_box_urls(urls):
     set_text_widget_url_lines(urls_text, urls)
 
 
@@ -5379,8 +5822,8 @@ def get_settings_dict():
         "web_mobile_emulation": bool(web_mobile_emulation_var.get()),
         "web_touch_emulation": bool(web_touch_emulation_var.get()),
         "web_orientation": web_orientation_var.get() if web_orientation_var.get() in {"portrait", "landscape"} else DEFAULTS["web_orientation"],
-        "web_locale": normalize_web_locale(web_locale_var.get()),
-        "web_timezone": normalize_web_timezone(web_timezone_var.get()),
+        "web_locale": normalize_web_environment_text(web_locale_var.get()),
+        "web_timezone": normalize_web_environment_text(web_timezone_var.get()),
         "web_color_scheme": web_color_scheme_var.get() if web_color_scheme_var.get() in {"default", "light", "dark"} else DEFAULTS["web_color_scheme"],
         "web_reduced_motion": bool(web_reduced_motion_var.get()),
         "web_disable_cache": bool(web_disable_cache_var.get()),
@@ -5661,8 +6104,8 @@ def apply_settings_dict(settings):
     web_touch_emulation_var.set(bool(settings.get("web_touch_emulation", DEFAULTS["web_touch_emulation"])))
     saved_web_orientation = str(settings.get("web_orientation", DEFAULTS["web_orientation"]) or DEFAULTS["web_orientation"]).strip()
     web_orientation_var.set(saved_web_orientation if saved_web_orientation in {"portrait", "landscape"} else DEFAULTS["web_orientation"])
-    web_locale_var.set(normalize_web_locale(settings.get("web_locale", DEFAULTS["web_locale"])))
-    web_timezone_var.set(normalize_web_timezone(settings.get("web_timezone", DEFAULTS["web_timezone"])))
+    web_locale_var.set(normalize_web_environment_text(settings.get("web_locale", DEFAULTS["web_locale"])))
+    web_timezone_var.set(normalize_web_environment_text(settings.get("web_timezone", DEFAULTS["web_timezone"])))
     saved_web_color_scheme = str(settings.get("web_color_scheme", DEFAULTS["web_color_scheme"]) or DEFAULTS["web_color_scheme"]).strip()
     web_color_scheme_var.set(saved_web_color_scheme if saved_web_color_scheme in {"default", "light", "dark"} else DEFAULTS["web_color_scheme"])
     web_reduced_motion_var.set(bool(settings.get("web_reduced_motion", DEFAULTS["web_reduced_motion"])))
@@ -5990,6 +6433,13 @@ def get_active_profile_name(store=None):
     return candidate
 
 
+def normalize_capture_tab_label(value):
+    label = str(value or "").strip()
+    if label in CAPTURE_TAB_LABELS:
+        return label
+    return APP_SETTINGS_DEFAULTS["last_selected_tab"]
+
+
 def get_selected_app_tab_label():
     try:
         selected = app_notebook.select()
@@ -5999,6 +6449,12 @@ def get_selected_app_tab_label():
     except Exception:
         pass
     return APP_SETTINGS_DEFAULTS["last_selected_tab"]
+
+
+def get_last_selected_capture_tab_label():
+    return normalize_capture_tab_label(
+        globals().get("last_selected_capture_tab", APP_SETTINGS_DEFAULTS["last_selected_tab"])
+    )
 
 
 def select_app_tab_by_label(label):
@@ -6458,9 +6914,11 @@ def get_app_settings_dict():
         "url_box_persistence": url_box_persistence_var.get(),
         "universal_archive_enabled": universal_archive_enabled_var.get(),
         "active_profile": get_active_profile_name(),
-        "last_selected_tab": get_selected_app_tab_label(),
+        "last_selected_tab": get_last_selected_capture_tab_label(),
         "window_geometry": get_current_window_geometry(),
         "window_state": get_current_window_state(),
+        "output_log_selected_engine": normalize_output_log_view(output_log_selected_engine),
+        "output_log_follow_output": bool(output_log_follow_output),
     }
     settings.update(get_proxy_settings_dict(include_sensitive=False))
     return settings
@@ -6519,8 +6977,24 @@ def apply_app_settings_dict(settings):
     except Exception:
         pass
 
+    global last_selected_capture_tab
+    last_selected_capture_tab = normalize_capture_tab_label(
+        settings.get("last_selected_tab", APP_SETTINGS_DEFAULTS["last_selected_tab"])
+    )
     try:
-        select_app_tab_by_label(settings.get("last_selected_tab", APP_SETTINGS_DEFAULTS["last_selected_tab"]))
+        select_app_tab_by_label(last_selected_capture_tab)
+    except Exception:
+        pass
+
+    global output_log_selected_engine, output_log_follow_output
+    output_log_selected_engine = normalize_output_log_view(
+        settings.get("output_log_selected_engine", APP_SETTINGS_DEFAULTS["output_log_selected_engine"])
+    )
+    output_log_follow_output = bool(
+        settings.get("output_log_follow_output", APP_SETTINGS_DEFAULTS["output_log_follow_output"])
+    )
+    try:
+        apply_output_log_settings_to_tab()
     except Exception:
         pass
 
@@ -6921,12 +7395,10 @@ def get_enabled_domain_preset_matches(urls):
 
 def apply_checked_domain_presets_to_settings(settings, urls):
     merged = settings.copy() if isinstance(settings, dict) else get_settings_dict()
-    applied = []
-
     matches = get_enabled_domain_preset_matches(urls)
 
     # Apply low priority first so higher priority presets override lower priority settings.
-    for name, preset, overlap in matches:
+    for _name, preset, _overlap in matches:
         preset_settings = preset.get("settings", {})
         if isinstance(preset_settings, dict):
             for key in DOMAIN_PRESET_SETTING_KEYS:
@@ -6935,7 +7407,7 @@ def apply_checked_domain_presets_to_settings(settings, urls):
 
     applied = [
         name
-        for name, preset, overlap in sorted(matches, key=lambda item: (-int(item[1].get("priority", 100)), item[0].lower()))
+        for name, _preset, _overlap in sorted(matches, key=lambda item: (-int(item[1].get("priority", 100)), item[0].lower()))
     ]
 
     return merged, applied
@@ -6977,8 +7449,6 @@ def open_domain_presets_window():
             return
     except Exception:
         domain_preset_window = None
-
-    store = ensure_settings_store()
 
     def live_presets():
         return get_domain_presets()
@@ -7795,7 +8265,7 @@ def open_proxy_options_dialog():
         target = f"{protocol}://{address}:{port}" if address and port else protocol
         return f"enabled ({target}; {save_state})"
 
-    def update_control_state(*args):
+    def update_control_state(*_args):
         enabled = normalize_proxy_protocol(local_protocol_var.get()) != "None"
         state = "normal" if enabled else "disabled"
 
@@ -7978,7 +8448,7 @@ def toggle_use_cookies_file_setting():
         append_log(f"Profile setting changed: Use Cookies File {state}\n")
 
 
-def update_web_cookies_file_control_state(*args):
+def update_web_cookies_file_control_state(*_args):
     """Enable Webpage Capture cookie controls only when cookie use is selected."""
     try:
         state = "normal" if web_use_cookies_file_var.get() else "disabled"
@@ -8007,15 +8477,13 @@ def toggle_web_use_cookies_file_setting():
 def configure_capture_tab_row_weights():
     """Keep Capture tab vertical sizing assigned to the intended rows.
 
-    The URL instruction label stays compact, the URL text box keeps the fixed
-    minimum capture-entry height, and the Output Log text box owns remaining
-    vertical slack. Clearing the old rows here prevents stale row weights after
-    Capture tab layout changes.
+    The URL instruction label stays compact and the URL text box owns remaining
+    vertical slack now that capture output is displayed in the dedicated Output Log tab.
     """
     try:
         main.rowconfigure(10, weight=0, minsize=0)
-        main.rowconfigure(11, weight=0, minsize=URL_ROW_MIN_HEIGHT)
-        main.rowconfigure(15, weight=1, minsize=0)
+        main.rowconfigure(11, weight=1, minsize=URL_ROW_MIN_HEIGHT)
+        main.rowconfigure(15, weight=0, minsize=0)
         main.rowconfigure(16, weight=0, minsize=0)
     except Exception:
         pass
@@ -8026,18 +8494,18 @@ def configure_image_capture_tab_row_weights():
     try:
         image_capture_tab.rowconfigure(9, weight=0, minsize=0)
         image_capture_tab.rowconfigure(10, weight=0, minsize=0)
-        image_capture_tab.rowconfigure(11, weight=0, minsize=URL_ROW_MIN_HEIGHT)
-        image_capture_tab.rowconfigure(15, weight=1, minsize=0)
+        image_capture_tab.rowconfigure(11, weight=1, minsize=URL_ROW_MIN_HEIGHT)
+        image_capture_tab.rowconfigure(15, weight=0, minsize=0)
         image_capture_tab.rowconfigure(16, weight=0, minsize=0)
     except Exception:
         pass
 
 
 def configure_web_capture_tab_row_weights():
-    """Keep Webpage Capture tab vertical sizing assigned to the URL and log rows."""
+    """Keep Webpage Capture tab vertical sizing assigned to the URL row."""
     try:
-        web_capture_tab.rowconfigure(12, weight=0, minsize=URL_ROW_MIN_HEIGHT)
-        web_capture_tab.rowconfigure(16, weight=1, minsize=0)
+        web_capture_tab.rowconfigure(12, weight=1, minsize=URL_ROW_MIN_HEIGHT)
+        web_capture_tab.rowconfigure(16, weight=0, minsize=0)
     except Exception:
         pass
 
@@ -8693,6 +9161,14 @@ def normalize_settings_store(raw):
         store["profiles"][DEFAULT_PROFILE_NAME] = make_default_profile_settings()
 
     store["app_settings"] = raw.get("app_settings", {}) if isinstance(raw.get("app_settings", {}), dict) else {}
+    if source_version < 43:
+        saved_geometry = normalize_saved_window_geometry(store["app_settings"].get("window_geometry", ""))
+        if saved_geometry is not None:
+            width, height, x, y = saved_geometry
+            if height > APP_WINDOW_DEFAULT_HEIGHT:
+                store["app_settings"]["window_geometry"] = format_window_geometry(
+                    width, APP_WINDOW_DEFAULT_HEIGHT, x, y
+                )
     store["domain_presets"] = normalize_domain_presets(raw.get("domain_presets", {}))
     store = ensure_app_settings_store(store)
     store = ensure_domain_presets_store(store)
@@ -9251,13 +9727,13 @@ def start_capture():
 
     try:
         preset_decision_urls = get_current_url_lines_for_queue()
-        preset_decision_settings, preset_decision_applied = apply_checked_domain_presets_to_settings(
+        preset_decision_settings, _ = apply_checked_domain_presets_to_settings(
             get_settings_dict(),
             preset_decision_urls,
         )
         effective_concurrency_limit = get_concurrent_capture_limit(preset_decision_settings)
     except Exception:
-        preset_decision_applied = []
+        pass
 
     queue_has_active_or_pending_jobs = False
     try:
@@ -9375,7 +9851,7 @@ def start_capture():
             return
 
     prepare_case_summary_actions_for_run("yt-dlp")
-    log_box.delete("1.0", "end")
+    clear_engine_log_history("yt-dlp")
     append_log("Starting capture...\n\n")
     append_log(f"Settings saved to: {SETTINGS_FILE}\n")
     if resolved_case_name != case_name_var.get().strip():
@@ -10491,7 +10967,7 @@ def show_startup_interrupted_jobs_prompt(count):
         log_debug_exception("Could not display startup interrupted-job prompt", e)
 
 
-def on_job_queue_filter_changed(event=None):
+def on_job_queue_filter_changed(_event=None):
     refresh_job_queue_window()
 
 
@@ -12236,6 +12712,8 @@ def run_queue_job(job):
     global running_process, last_capture_context, job_queue_running_processes
 
     cmd = []
+    job_engine = get_job_engine(job)
+    job_log = lambda text: append_log_for_engine(job_engine, text)
 
     try:
         validate_queue_job_inputs(job)
@@ -12298,23 +12776,23 @@ def run_queue_job(job):
             except Exception:
                 pass
 
-        append_log("\n========== Queue Job Started ==========\n")
-        append_log(f"Job ID: {job['job_id']}\n")
-        append_log(f"Case: {job.get('resolved_case_name', '')}\n")
+        job_log("\n========== Queue Job Started ==========\n")
+        job_log(f"Job ID: {job['job_id']}\n")
+        job_log(f"Case: {job.get('resolved_case_name', '')}\n")
         if job.get("_run_mode") == "continue" and get_job_engine(job) == "gallery-dl":
-            append_log(f"URLs this run: {submitted_url_count} (archive-backed retry for Image Capture)\n")
+            job_log(f"URLs this run: {submitted_url_count} (archive-backed retry for Image Capture)\n")
         elif job.get("_run_mode") == "continue":
-            append_log(f"URLs this run: {submitted_url_count} (continuing from URL {resume_base_completed + 1})\n")
+            job_log(f"URLs this run: {submitted_url_count} (continuing from URL {resume_base_completed + 1})\n")
         else:
-            append_log(f"URLs: {submitted_url_count}\n")
+            job_log(f"URLs: {submitted_url_count}\n")
         if job.get("applied_domain_presets"):
-            append_log(f"Applied active domain presets: {', '.join(job.get('applied_domain_presets', []))}\n")
-        append_log(format_universal_archive_status_line(get_job_engine(job), job.get("settings", {})) + "\n")
-        append_log("\n")
-        log_capture_tool_versions(tool_versions)
-        append_log("Command:\n")
-        append_log(format_command_for_log(cmd))
-        append_log("\n\n")
+            job_log(f"Applied active domain presets: {', '.join(job.get('applied_domain_presets', []))}\n")
+        job_log(format_universal_archive_status_line(get_job_engine(job), job.get("settings", {})) + "\n")
+        job_log("\n")
+        log_capture_tool_versions(tool_versions, log_callback=job_log)
+        job_log("Command:\n")
+        job_log(format_command_for_log(cmd))
+        job_log("\n\n")
 
         start_button.config(state="normal")
         start_menu_button.config(state="normal")
@@ -12326,7 +12804,7 @@ def run_queue_job(job):
         job["status"] = "failed"
         job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         job["exit_code"] = "setup error"
-        append_log(f"\nQueue job setup failed: {e}\n")
+        job_log(f"\nQueue job setup failed: {e}\n")
         cleanup_command_input_file_if_temp(cmd)
         refresh_job_queue_window()
         safe_after(0, run_next_queue_job)
@@ -12360,18 +12838,18 @@ def run_queue_job(job):
                     if archive_payload:
                         try:
                             archive_id = record_web_universal_archive_capture(archive_payload)
-                            queue_append_log(
+                            queue_engine_append_log(job_engine, 
                                 f"Webpage universal archive updated: {archive_id} | "
                                 f"{archive_payload.get('requested_url', '')}\n"
                             )
                         except Exception as archive_error:
-                            queue_append_log(f"WARNING: Webpage universal archive update failed: {archive_error}\n")
+                            queue_engine_append_log(job_engine, f"WARNING: Webpage universal archive update failed: {archive_error}\n")
                         continue
 
                     skip_record = parse_universal_archive_skip_output_line(line)
                     if skip_record:
                         universal_skip_records.append(skip_record)
-                        queue_append_log(format_universal_archive_skip_record_for_log(skip_record) + "\n")
+                        queue_engine_append_log(job_engine, format_universal_archive_skip_record_for_log(skip_record) + "\n")
                         continue
 
                     skip_summary = parse_universal_archive_skip_summary_line(line)
@@ -12381,18 +12859,18 @@ def run_queue_job(job):
 
                     classification_record = parse_web_capture_classification_output_line(line)
                     if classification_record:
-                        queue_append_log(format_web_capture_classification_for_log(classification_record) + "\n")
+                        queue_engine_append_log(job_engine, format_web_capture_classification_for_log(classification_record) + "\n")
                         safe_after(0, handle_queue_output_line, job["job_id"], line)
                         continue
 
-                    queue_append_log(line)
+                    queue_engine_append_log(job_engine, line)
                     if line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t"):
                         safe_after(0, handle_queue_output_line, job["job_id"], line)
 
             exit_code = process.wait()
 
         except Exception as e:
-            queue_append_log(f"\nERROR: {e}\n")
+            queue_engine_append_log(job_engine, f"\nERROR: {e}\n")
             exit_code = 1
         finally:
             cleanup_command_input_file_if_temp(cmd)
@@ -12414,6 +12892,8 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     if not job:
         return
 
+    engine = get_job_engine(job)
+    job_log = lambda text: append_log_for_engine(engine, text)
     job_queue_running_processes.pop(job_id, None)
 
     job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -12421,18 +12901,18 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
 
     if exit_code == 0:
         job["status"] = "completed"
-        append_log(f"\nQueue job completed successfully: {job.get('resolved_case_name', '')}\n")
+        job_log(f"\nQueue job completed successfully: {job.get('resolved_case_name', '')}\n")
         set_status("Queue job completed")
     elif job.get("_interruption_requested"):
         job["status"] = "interrupted"
         job["exit_code"] = "interrupted"
         job["interrupted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         job["interrupted_reason"] = job.get("interrupted_reason") or "Stopped by user."
-        append_log(f"\nQueue job interrupted: {job.get('resolved_case_name', '')}\n")
+        job_log(f"\nQueue job interrupted: {job.get('resolved_case_name', '')}\n")
         set_status("Queue job interrupted")
     else:
         job["status"] = "failed"
-        append_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
+        job_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
         set_status(f"Queue job failed: {exit_code}")
 
     paths = get_case_summary_paths_for_job(job)
@@ -12443,25 +12923,25 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     engine = get_job_engine(job)
     set_case_summary_url_context(engine, paths=paths, settings=summary_settings, job=job)
 
-    append_log("\n========== Queue Job Summary ==========")
-    append_log(f"\nExit code: {exit_code}\n")
-    append_log(f"Submitted URLs: {submitted_url_count}\n")
+    job_log("\n========== Queue Job Summary ==========")
+    job_log(f"\nExit code: {exit_code}\n")
+    job_log(f"Submitted URLs: {submitted_url_count}\n")
     classification_summary = job.get("web_capture_classification_summary", {})
     if isinstance(classification_summary, dict) and any(classification_summary.values()):
-        append_log(
+        job_log(
             "Webpage classifications: "
             f"complete {int(classification_summary.get('complete', 0) or 0)}, "
             f"warnings {int(classification_summary.get('complete_with_warnings', 0) or 0)}, "
             f"partial {int(classification_summary.get('partial', 0) or 0)}, "
             f"failed {int(classification_summary.get('failed', 0) or 0)}\n"
         )
-    append_log(f"Case folder: {paths.get('case_folder', '')}\n")
-    append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary)
-    append_log(f"Total files found: {counts.get('files', 0)}\n")
-    append_log(f"Media files found: {counts.get('media', 0)}\n")
-    append_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
-    append_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
-    append_log("=====================================\n")
+    job_log(f"Case folder: {paths.get('case_folder', '')}\n")
+    append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary, log_callback=job_log)
+    job_log(f"Total files found: {counts.get('files', 0)}\n")
+    job_log(f"Media files found: {counts.get('media', 0)}\n")
+    job_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
+    job_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
+    job_log("=====================================\n")
 
     if job.get("status") == "completed":
         job["summary"] = build_case_summary_for_job(
@@ -12514,7 +12994,7 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
                 job_queue_status_var.set("Queue paused after current job.")
             except Exception:
                 pass
-        append_log("\nJob queue paused after current job.\n")
+        job_log("\nJob queue paused after current job.\n")
         return
 
     safe_after(250, run_next_queue_job)
@@ -12917,7 +13397,7 @@ def terminate_process_tree(process, label="process", timeout_seconds=3):
 
 def flush_log_queues_now():
     """Flush pending queued log text before shutdown destroys the widgets."""
-    global main_log_flush_after_id, image_log_flush_after_id
+    global main_log_flush_after_id, image_log_flush_after_id, web_log_flush_after_id
 
     try:
         main_text = collect_log_queue_text(main_log_queue)
@@ -12933,8 +13413,16 @@ def flush_log_queues_now():
     except Exception as e:
         log_debug_exception("Final image log flush failed", e)
 
+    try:
+        web_text = collect_log_queue_text(web_log_queue)
+        if web_text:
+            web_append_log(web_text)
+    except Exception as e:
+        log_debug_exception("Final Webpage log flush failed", e)
+
     main_log_flush_after_id = None
     image_log_flush_after_id = None
+    web_log_flush_after_id = None
 
 
 def disable_start_controls_for_shutdown():
@@ -13612,7 +14100,7 @@ def open_ytdlp_update_dialog():
 
         start_daemon_thread("worker", worker)
 
-    def on_nightly_select(event=None):
+    def on_nightly_select(_event=None):
         selection = nightly_listbox.curselection()
         if not selection:
             selected_nightly_tag_var.set("")
@@ -13953,7 +14441,7 @@ def open_gallerydl_update_dialog():
 
         start_daemon_thread("worker", worker)
 
-    def on_release_select(event=None):
+    def on_release_select(_event=None):
         selection = release_listbox.curselection()
         if not selection:
             selected_release_tag_var.set("")
@@ -14335,7 +14823,7 @@ def playlist_preview_large_list_guard_required(urls):
     return True
 
 
-def render_playlist_preview_large_list_guard(dialog, urls, silent=False):
+def render_playlist_preview_large_list_guard(dialog, urls):
     global playlist_preview_tab_loaded, playlist_preview_loaded_signature
 
     urls = list(urls or [])
@@ -14459,7 +14947,7 @@ def schedule_playlist_preview_autoload(delay_ms=None):
         if playlist_preview_tab_is_selected():
             try:
                 if playlist_preview_large_list_guard_required(playlist_preview_candidate_urls):
-                    render_playlist_preview_large_list_guard(playlist_preview_tab, playlist_preview_candidate_urls, silent=True)
+                    render_playlist_preview_large_list_guard(playlist_preview_tab, playlist_preview_candidate_urls)
                 else:
                     open_playlist_preview_dialog(silent=True, force_reload=changed)
             except Exception as e:
@@ -14485,13 +14973,52 @@ def handle_playlist_preview_source_changed(event=None):
     schedule_playlist_preview_autoload()
 
 
-def on_notebook_tab_changed(event=None):
+def collapse_capture_tab_options(tab_label, save=False):
+    panel_hide_functions = {
+        "Audio/Video Capture": (
+            "hide_capture_options_panel",
+            "hide_metadata_options_panel",
+            "hide_pacing_options_panel",
+            "hide_advanced_options_panel",
+        ),
+        "Image Capture": (
+            "hide_image_capture_options_panel",
+            "hide_image_advanced_options_panel",
+        ),
+        "Webpage Capture": (
+            "hide_web_capture_options_panel",
+            "hide_web_pdf_options_panel",
+        ),
+    }
+    for function_name in panel_hide_functions.get(str(tab_label or "").strip(), ()):
+        function = globals().get(function_name)
+        if callable(function):
+            try:
+                function(save=save)
+            except Exception:
+                pass
+
+
+def on_notebook_tab_changed(_event=None):
+    global last_selected_capture_tab, last_notebook_tab_label
+
+    selected_label = get_selected_app_tab_label()
+    previous_label = str(globals().get("last_notebook_tab_label", "") or "").strip()
+    loading = bool(globals().get("settings_state_loading", True))
+
+    if previous_label in CAPTURE_TAB_LABELS and previous_label != selected_label:
+        collapse_capture_tab_options(previous_label, save=not loading)
+
+    last_notebook_tab_label = selected_label
+    if selected_label in CAPTURE_TAB_LABELS:
+        last_selected_capture_tab = selected_label
+
     try:
         refresh_context_capture_menu()
     except Exception:
         pass
 
-    if not globals().get("settings_state_loading", True):
+    if not loading:
         schedule_settings_autosave()
 
     if playlist_preview_tab_is_selected():
@@ -14539,7 +15066,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         return
 
     if not preview_limited_note and playlist_preview_large_list_guard_required(urls):
-        render_playlist_preview_large_list_guard(dialog, urls, silent=silent)
+        render_playlist_preview_large_list_guard(dialog, urls)
         return
 
     for child in dialog.winfo_children():
@@ -14559,7 +15086,6 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
     stop_event = threading.Event()
     scan_running = {"value": False}
-    thumbnail_token = {"value": 0}
     thumbnail_image_holder = {"image": None}
     current_detail_record = {"record": None}
     thumbnail_state_lock = threading.Lock()
@@ -15117,7 +15643,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         # Replace JSON-only flags with thumbnail-write flags while preserving cookies/proxy/impersonation/header args.
         cleaned = []
         skip_next = False
-        for index, item in enumerate(cmd[:-1]):
+        for item in cmd[:-1]:
             if skip_next:
                 skip_next = False
                 continue
@@ -16189,7 +16715,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         png_path = os.path.join(preview_cache_folder(), safe_cache_name(source_url), "thumb.png")
         return png_path if os.path.isfile(png_path) else ""
 
-    def wait_thumbnail_cooldown(fetch_kind, key, record):
+    def wait_thumbnail_cooldown(fetch_kind, key):
         if not thumbnail_rate_limit_enabled():
             return thumbnail_desired_key() == key
 
@@ -16224,7 +16750,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             cached_path = cached_fast_thumbnail_path(record)
             if cached_path:
                 return cached_path, ""
-            if not wait_thumbnail_cooldown("fast", key, record):
+            if not wait_thumbnail_cooldown("fast", key):
                 return "", "superseded"
             did_attempt = False
             try:
@@ -16242,7 +16768,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             cached_path = cached_ytdlp_thumbnail_path(record)
             if cached_path:
                 return cached_path, ""
-            if not wait_thumbnail_cooldown("ytdlp", key, record):
+            if not wait_thumbnail_cooldown("ytdlp", key):
                 return "", "superseded"
             did_attempt = False
             try:
@@ -16405,10 +16931,10 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         set_details_text(format_record_details(entry))
         begin_thumbnail_fetch(entry)
 
-    def on_url_tree_select(event=None):
+    def on_url_tree_select(_event=None):
         show_context_for_record(current_url_record())
 
-    def on_entry_tree_select(event=None):
+    def on_entry_tree_select(_event=None):
         entries = selected_entry_records()
         if entries:
             show_context_for_entry(entries[0])
@@ -16520,7 +17046,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             options_panel.grid_remove()
             options_button.configure(text="Preview Options ▾")
 
-    def pack_preview_button(widget):
+    def pack_action_button(widget):
         widget.pack(side="left", padx=(0, 6), pady=2)
         return widget
 
@@ -16532,20 +17058,20 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     url_action_frame = ttk.LabelFrame(dialog, text="Audio/Video Preview Actions", padding=8)
     url_action_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 6))
     action_buttons = []
-    preview_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Preview All", command=lambda: start_preview(False)))
+    preview_all_button = pack_action_button(ttk.Button(url_action_frame, text="Preview All", command=lambda: start_preview(False)))
     action_buttons.append(preview_all_button)
-    preview_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Preview Checked", command=lambda: start_preview(True)))
+    preview_selected_button = pack_action_button(ttk.Button(url_action_frame, text="Preview Checked", command=lambda: start_preview(True)))
     action_buttons.append(preview_selected_button)
-    stop_button = pack_preview_button(ttk.Button(url_action_frame, text="Stop", command=stop_preview, state="disabled"))
-    start_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Start All", command=lambda: start_top_urls(False, top_all_action_description())))
+    stop_button = pack_action_button(ttk.Button(url_action_frame, text="Stop", command=stop_preview, state="disabled"))
+    start_all_button = pack_action_button(ttk.Button(url_action_frame, text="Start All", command=lambda: start_top_urls(False, top_all_action_description())))
     action_buttons.append(start_all_button)
-    start_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Start Included", command=lambda: start_top_urls(True, "included top-level URL(s)")))
+    start_selected_button = pack_action_button(ttk.Button(url_action_frame, text="Start Included", command=lambda: start_top_urls(True, "included top-level URL(s)")))
     action_buttons.append(start_selected_button)
-    queue_all_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue All", command=lambda: queue_top_urls(False, top_all_action_description())))
+    queue_all_button = pack_action_button(ttk.Button(url_action_frame, text="Queue All", command=lambda: queue_top_urls(False, top_all_action_description())))
     action_buttons.append(queue_all_button)
-    queue_selected_button = pack_preview_button(ttk.Button(url_action_frame, text="Queue Included", command=lambda: queue_top_urls(True, "included top-level URL(s)")))
+    queue_selected_button = pack_action_button(ttk.Button(url_action_frame, text="Queue Included", command=lambda: queue_top_urls(True, "included top-level URL(s)")))
     action_buttons.append(queue_selected_button)
-    export_button = pack_preview_button(ttk.Button(url_action_frame, text="Export JSON", command=export_preview_json))
+    export_button = pack_action_button(ttk.Button(url_action_frame, text="Export JSON", command=export_preview_json))
     action_buttons.append(export_button)
 
     url_frame = ttk.LabelFrame(dialog, text="URLs", padding=8)
@@ -16738,20 +17264,16 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     )
     playlist_action_right.grid(row=0, column=2, sticky="e", padx=(6, 0))
 
-    def pack_playlist_action_button(widget):
-        widget.pack(side="left", padx=(0, 6), pady=2)
-        return widget
-
-    playlist_start_all_button = pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start All Items", command=lambda: start_urls_now(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Start Included Items", command=lambda: start_urls_now(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
-    playlist_queue_all_button = pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue All Items", command=lambda: queue_urls(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Queue Included Items", command=lambda: queue_urls(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Copy Included URLs", command=lambda: copy_text_to_clipboard("\n".join(urls_from_entries(current_playlist_entries(True, False))), "included playlist item URL(s)")))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Load Included URLs", command=lambda: set_url_box_from_current_items(False)))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Append Included URLs", command=lambda: set_url_box_from_current_items(True)))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Set Playlist Items", command=set_playlist_items_from_current_selection))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Include All", command=lambda: set_all_current_item_includes(True)))
-    pack_playlist_action_button(ttk.Button(playlist_action_button_frame, text="Exclude All", command=lambda: set_all_current_item_includes(False)))
+    playlist_start_all_button = pack_action_button(ttk.Button(playlist_action_button_frame, text="Start All Items", command=lambda: start_urls_now(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Start Included Items", command=lambda: start_urls_now(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    playlist_queue_all_button = pack_action_button(ttk.Button(playlist_action_button_frame, text="Queue All Items", command=lambda: queue_urls(urls_from_entries(all_action_playlist_entries()), playlist_all_item_description(), playlist_name=get_current_playlist_name())))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Queue Included Items", command=lambda: queue_urls(urls_from_entries(included_entry_records()), "included playlist item URL(s)", playlist_name=get_current_playlist_name())))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Copy Included URLs", command=lambda: copy_text_to_clipboard("\n".join(urls_from_entries(current_playlist_entries(True, False))), "included playlist item URL(s)")))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Load Included URLs", command=lambda: set_url_box_from_current_items(False)))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Append Included URLs", command=lambda: set_url_box_from_current_items(True)))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Set Playlist Items", command=set_playlist_items_from_current_selection))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Include All", command=lambda: set_all_current_item_includes(True)))
+    pack_action_button(ttk.Button(playlist_action_button_frame, text="Exclude All", command=lambda: set_all_current_item_includes(False)))
 
     entry_frame = ttk.LabelFrame(playlist_frame, text="Playlist / Context URLs", padding=8)
     entry_frame.grid(row=1, column=0, sticky="nsew")
@@ -16841,10 +17363,10 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
     extra_action_frame = ttk.Frame(url_action_frame)
     extra_action_frame.pack(side="left", padx=(6, 0))
-    pack_preview_button(ttk.Button(extra_action_frame, text="Preview ✓ All", command=lambda: set_all_url_preview_flags("preview", True)))
-    pack_preview_button(ttk.Button(extra_action_frame, text="Preview ☐ All", command=lambda: set_all_url_preview_flags("preview", False)))
-    pack_preview_button(ttk.Button(extra_action_frame, text="Include ✓ All", command=lambda: set_all_url_preview_flags("include", True)))
-    pack_preview_button(ttk.Button(extra_action_frame, text="Include ☐ All", command=lambda: set_all_url_preview_flags("include", False)))
+    pack_action_button(ttk.Button(extra_action_frame, text="Preview ✓ All", command=lambda: set_all_url_preview_flags("preview", True)))
+    pack_action_button(ttk.Button(extra_action_frame, text="Preview ☐ All", command=lambda: set_all_url_preview_flags("preview", False)))
+    pack_action_button(ttk.Button(extra_action_frame, text="Include ✓ All", command=lambda: set_all_url_preview_flags("include", True)))
+    pack_action_button(ttk.Button(extra_action_frame, text="Include ☐ All", command=lambda: set_all_url_preview_flags("include", False)))
 
     try:
         configure_tk_widget_theme(dialog, get_theme_colors())
@@ -17753,12 +18275,12 @@ def on_download_speed_slider_changed(value=None):
     update_capture_options_summary()
 
 
-def on_download_speed_entry_commit(event=None):
+def on_download_speed_entry_commit(_event=None):
     sync_download_speed_limit_controls_from_var(show_errors=True)
 
 
 
-def update_throttled_rate_state(*args):
+def update_throttled_rate_state(*_args):
     try:
         state = "normal" if throttle_detection_enabled_var.get() else "disabled"
         throttled_rate_entry.configure(state=state)
@@ -17766,7 +18288,7 @@ def update_throttled_rate_state(*args):
         pass
 
 
-def update_http_chunk_size_state(*args):
+def update_http_chunk_size_state(*_args):
     try:
         state = "normal" if http_chunk_size_enabled_var.get() else "disabled"
         http_chunk_size_entry.configure(state=state)
@@ -17774,7 +18296,7 @@ def update_http_chunk_size_state(*args):
         pass
 
 
-def on_throttled_rate_commit(event=None):
+def on_throttled_rate_commit(_event=None):
     normalized = normalize_download_speed_limit_value(throttled_rate_var.get())
     if not normalized or normalized == "disabled":
         messagebox.showerror("Invalid throttled rate", "Enter a value from 1 KiB/s to 1 GiB/s.")
@@ -17784,13 +18306,13 @@ def on_throttled_rate_commit(event=None):
     update_capture_options_summary()
 
 
-def on_http_chunk_size_commit(event=None):
+def on_http_chunk_size_commit(_event=None):
     normalized = normalize_binary_size_value(http_chunk_size_var.get(), DEFAULTS["http_chunk_size"])
     http_chunk_size_var.set(normalized)
     update_capture_options_summary()
 
 
-def update_capture_options_summary(*args):
+def update_capture_options_summary(*_args):
     try:
         capture_mode = normalize_capture_mode(capture_mode_var.get())
 
@@ -17949,11 +18471,7 @@ def update_capture_options_summary(*args):
 
 
 def hide_capture_options_panel(save=False):
-    try:
-        if capture_options_panel.winfo_ismapped():
-            capture_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(capture_options_panel)
 
     capture_options_button.config(text="Capture Options ▾")
 
@@ -17963,11 +18481,7 @@ def hide_capture_options_panel(save=False):
 
 
 def hide_metadata_options_panel(save=False):
-    try:
-        if metadata_options_panel.winfo_ismapped():
-            metadata_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(metadata_options_panel)
 
     metadata_options_button.config(text="Metadata Options ▾")
 
@@ -17977,11 +18491,7 @@ def hide_metadata_options_panel(save=False):
 
 
 def hide_advanced_options_panel(save=False):
-    try:
-        if advanced_options_panel.winfo_ismapped():
-            advanced_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(advanced_options_panel)
 
     advanced_options_button.config(text="Advanced Options ▾")
 
@@ -17991,11 +18501,7 @@ def hide_advanced_options_panel(save=False):
 
 
 def hide_pacing_options_panel(save=False):
-    try:
-        if pacing_options_panel.winfo_ismapped():
-            pacing_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(pacing_options_panel)
 
     pacing_options_button.config(text="Pacing Options ▾")
 
@@ -18024,6 +18530,7 @@ def toggle_capture_options_panel():
     )
     capture_options_panel.tkraise()
     capture_options_button.config(text="Capture Options ▴")
+    refresh_scrollable_options_panel(capture_options_panel)
 
 
 def close_capture_options_panel():
@@ -18050,6 +18557,7 @@ def toggle_metadata_options_panel():
     )
     metadata_options_panel.tkraise()
     metadata_options_button.config(text="Metadata Options ▴")
+    refresh_scrollable_options_panel(metadata_options_panel)
 
 
 def close_metadata_options_panel():
@@ -18111,7 +18619,7 @@ def update_playlist_options_state():
         pass
 
 
-def update_playlist_metadata_visibility(*args):
+def update_playlist_metadata_visibility(*_args):
     try:
         sidecars_enabled = normalize_capture_mode(capture_mode_var.get()) in {"media", "metadata_only"}
 
@@ -18148,6 +18656,7 @@ def toggle_advanced_options_panel():
     )
     advanced_options_panel.tkraise()
     advanced_options_button.config(text="Advanced Options ▴")
+    refresh_scrollable_options_panel(advanced_options_panel)
 
 
 def close_advanced_options_panel():
@@ -18174,6 +18683,7 @@ def toggle_pacing_options_panel():
     )
     pacing_options_panel.tkraise()
     pacing_options_button.config(text="Pacing Options ▴")
+    refresh_scrollable_options_panel(pacing_options_panel)
 
 
 def close_pacing_options_panel():
@@ -18621,7 +19131,7 @@ class Tooltip:
         widget.bind("<Leave>", self.hide)
         widget.bind("<ButtonPress>", self.hide)
 
-    def schedule(self, event=None):
+    def schedule(self, _event=None):
         self.cancel()
         self.after_id = self.widget.after(self.delay, self.show)
 
@@ -18659,7 +19169,7 @@ class Tooltip:
         )
         label.pack()
 
-    def hide(self, event=None):
+    def hide(self, _event=None):
         self.cancel()
 
         if self.window:
@@ -18739,7 +19249,7 @@ class TreeviewHoverTooltip:
         )
         label.pack()
 
-    def hide(self, event=None):
+    def hide(self, _event=None):
         self.cancel()
         self.current_item = ""
         self.current_text = ""
@@ -18841,7 +19351,7 @@ class LazyTreeviewThumbnailPreview:
                 pass
             self.after_id = None
 
-    def hide(self, event=None):
+    def hide(self, _event=None):
         self.cancel()
         self.request_id += 1
         self.current_item = ""
@@ -19177,7 +19687,6 @@ def open_case_browser(select_tab=True, silent=False):
         except Exception:
             pass
 
-    browser_file_map = {}
     tree_path_map = {}
     image_refs = []
     file_render_generation = {"value": 0}
@@ -19236,7 +19745,7 @@ def open_case_browser(select_tab=True, silent=False):
             # During window construction, render_files/get_selected_browser_folder are defined later.
             pass
 
-    def schedule_browser_search_refresh(*args):
+    def schedule_browser_search_refresh(*_args):
         try:
             if browser_search_after_id["value"]:
                 root.after_cancel(browser_search_after_id["value"])
@@ -19497,7 +20006,7 @@ def open_case_browser(select_tab=True, silent=False):
         except Exception as e:
             log_debug_exception("Case Browser scrollregion update failed", e)
 
-    def configure_content(event=None):
+    def configure_content(_event=None):
         sync_case_browser_canvas_layout()
         sync_case_browser_scrollregion()
         try:
@@ -19523,7 +20032,6 @@ def open_case_browser(select_tab=True, silent=False):
     paned.add(right_frame, weight=4)
 
     case_browser_ignored_folder_names = {".gui-cache", "__pycache__"}
-    case_browser_ignored_file_names = {".ds_store", "desktop.ini", "thumbs.db"}
 
     def build_folder_tree_snapshot(folder_path, max_depth=4, depth=0):
         if depth > max_depth:
@@ -19982,7 +20490,7 @@ def open_case_browser(select_tab=True, silent=False):
             else:
                 browser_status_var.set(f"{folder_path} - compact list showing {len(files)} / {total_count} file(s)")
 
-        def get_selected_compact_path(event=None):
+        def get_selected_compact_path(_event=None):
             selection = file_tree.selection()
             if not selection:
                 return ""
@@ -20324,7 +20832,7 @@ def open_case_browser(select_tab=True, silent=False):
 
             worker_count = min(CASE_BROWSER_MEDIA_PROBE_CONCURRENCY, probe_queue.qsize())
 
-            def worker(worker_index):
+            def worker():
                 while not APP_CLOSING and case_browser_active_token is load_token and render_generation == file_render_generation["value"]:
                     try:
                         path = probe_queue.get_nowait()
@@ -20377,7 +20885,7 @@ def open_case_browser(select_tab=True, silent=False):
                             pass
 
             for worker_index in range(worker_count):
-                start_daemon_thread(f"case_browser_media_probe_{worker_index + 1}", worker, worker_index)
+                start_daemon_thread(f"case_browser_media_probe_{worker_index + 1}", worker)
 
         render_next_card_batch()
 
@@ -20424,7 +20932,7 @@ def open_case_browser(select_tab=True, silent=False):
         start_daemon_thread("worker", worker)
 
 
-    def on_tree_select(event=None):
+    def on_tree_select(_event=None):
         selection = tree.selection()
         if not selection:
             return
@@ -20491,7 +20999,7 @@ def open_case_browser(select_tab=True, silent=False):
             if not os.path.isdir(search_root):
                 continue
 
-            for root_dir, dir_names, file_names in os.walk(search_root):
+            for root_dir, _dir_names, file_names in os.walk(search_root):
                 for file_name in file_names:
                     lowered = file_name.lower()
                     if lowered.startswith("sha256-manifest") and lowered.endswith(".csv"):
@@ -21240,13 +21748,7 @@ def get_web_browser_version_info(browser_path):
 
 
 def web_append_log(text):
-    try:
-        append_to_log_widget(web_log_box, text)
-    except Exception:
-        try:
-            append_log(text)
-        except Exception:
-            pass
+    append_engine_log("web-capture", text)
 
 
 def web_set_status(text):
@@ -21479,12 +21981,7 @@ def display_web_environment_preset(value):
     return WEB_ENVIRONMENT_PRESETS.get(key, WEB_ENVIRONMENT_PRESETS["custom"])["label"]
 
 
-def normalize_web_locale(value):
-    text = str(value or "default").strip()
-    return text or "default"
-
-
-def normalize_web_timezone(value):
+def normalize_web_environment_text(value):
     text = str(value or "default").strip()
     return text or "default"
 
@@ -21568,8 +22065,8 @@ def get_web_settings_dict():
         "web_mobile_emulation": bool(web_mobile_emulation_var.get()),
         "web_touch_emulation": bool(web_touch_emulation_var.get()),
         "web_orientation": web_orientation_var.get() if web_orientation_var.get() in {"portrait", "landscape"} else DEFAULTS["web_orientation"],
-        "web_locale": normalize_web_locale(web_locale_var.get()),
-        "web_timezone": normalize_web_timezone(web_timezone_var.get()),
+        "web_locale": normalize_web_environment_text(web_locale_var.get()),
+        "web_timezone": normalize_web_environment_text(web_timezone_var.get()),
         "web_color_scheme": web_color_scheme_var.get() if web_color_scheme_var.get() in {"default", "light", "dark"} else DEFAULTS["web_color_scheme"],
         "web_reduced_motion": bool(web_reduced_motion_var.get()),
         "web_disable_cache": bool(web_disable_cache_var.get()),
@@ -21699,7 +22196,7 @@ def render_web_filename_template_example(template, now=None, resolved_case_name=
     return rendered or "webpage-capture"
 
 
-def update_web_filename_template_preview(*args):
+def update_web_filename_template_preview(*_args):
     try:
         resolved_case = get_resolved_web_case_name(now=datetime.now())
         capture_mode = web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport", "both"} else "full_page"
@@ -21744,7 +22241,7 @@ def insert_web_filename_template_tag(tag):
         web_filename_template_var.set(f"{current}{tag}")
 
 
-def update_web_case_folder_preview(*args):
+def update_web_case_folder_preview(*_args):
     try:
         output_root = web_output_root_var.get().strip()
         resolved_name = get_resolved_web_case_name(now=datetime.now())
@@ -21798,7 +22295,7 @@ def get_web_pdf_page_behavior_label(value=None):
     return mapping.get(behavior, mapping[DEFAULTS["web_pdf_page_behavior"]])
 
 
-def update_web_options_summary(*args):
+def update_web_options_summary(*_args):
     try:
         capture_mode = {
             "full_page": "Full page",
@@ -21858,7 +22355,7 @@ def update_web_options_summary(*args):
         preference_flags = []
         if web_color_scheme_var.get() != "default": preference_flags.append(web_color_scheme_var.get())
         if web_reduced_motion_var.get(): preference_flags.append("reduced motion")
-        preference_text = f"locale {normalize_web_locale(web_locale_var.get())}; timezone {normalize_web_timezone(web_timezone_var.get())}"
+        preference_text = f"locale {normalize_web_environment_text(web_locale_var.get())}; timezone {normalize_web_environment_text(web_timezone_var.get())}"
         if preference_flags: preference_text += "; " + ", ".join(preference_flags)
         storage_label = {
             "none": "keep site storage",
@@ -21962,7 +22459,7 @@ def update_web_options_summary(*args):
         pass
 
 
-def update_web_readiness_options_state(*args):
+def update_web_readiness_options_state(*_args):
     selector_state = "normal" if web_wait_selector_enabled_var.get() else "disabled"
     for widget in globals().get("web_wait_selector_widgets", []):
         try:
@@ -21979,7 +22476,7 @@ def update_web_readiness_options_state(*args):
     update_web_options_summary()
 
 
-def update_web_capture_options_state(*args):
+def update_web_capture_options_state(*_args):
     full_page_enabled = web_capture_mode_var.get() in {"full_page", "both"}
     scroll_state = "normal" if full_page_enabled and web_lazy_scroll_var.get() else "disabled"
     for widget in globals().get("web_lazy_scroll_widgets", []):
@@ -22013,7 +22510,7 @@ def update_web_capture_options_state(*args):
     update_web_options_summary()
 
 
-def update_web_evidence_options_state(*args):
+def update_web_evidence_options_state(*_args):
     try:
         state = "normal" if (web_save_network_report_var.get() or web_save_failed_request_report_var.get()) else "disabled"
         for widget in globals().get("web_network_query_mode_widgets", []):
@@ -22023,7 +22520,7 @@ def update_web_evidence_options_state(*args):
         pass
 
 
-def update_web_pdf_options_state(*args):
+def update_web_pdf_options_state(*_args):
     enabled = bool(web_create_pdf_var.get())
     state = "normal" if enabled else "disabled"
     for widget in globals().get("web_pdf_option_widgets", []):
@@ -22070,11 +22567,7 @@ def update_web_pdf_options_state(*args):
 
 
 def hide_web_capture_options_panel(save=False):
-    try:
-        if web_capture_options_panel.winfo_ismapped():
-            web_capture_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(web_capture_options_panel)
     try:
         web_capture_options_button.config(text="Capture Options ▾")
     except Exception:
@@ -22086,9 +22579,9 @@ def hide_web_capture_options_panel(save=False):
 
 def hide_web_pdf_options_panel(save=False):
     try:
-        if web_pdf_options_panel.winfo_ismapped():
+        if grid_widget_is_managed(web_pdf_options_panel):
             sync_web_pdf_templates_from_widgets(schedule_autosave=False)
-            web_pdf_options_panel.grid_remove()
+            remove_grid_managed_widget(web_pdf_options_panel)
     except Exception:
         pass
     try:
@@ -22117,6 +22610,7 @@ def toggle_web_capture_options_panel():
     )
     web_capture_options_panel.tkraise()
     web_capture_options_button.config(text="Capture Options ▴")
+    refresh_scrollable_options_panel(web_capture_options_panel)
 
 
 def close_web_capture_options_panel():
@@ -22140,6 +22634,7 @@ def toggle_web_pdf_options_panel():
     )
     web_pdf_options_panel.tkraise()
     web_pdf_options_button.config(text="PDF Options ▴")
+    refresh_scrollable_options_panel(web_pdf_options_panel)
 
 
 def close_web_pdf_options_panel():
@@ -22346,10 +22841,10 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     orientation = str(settings.get("web_orientation", DEFAULTS["web_orientation"]) or DEFAULTS["web_orientation"]).strip()
     if orientation not in {"portrait", "landscape"}:
         raise ValueError("Webpage Capture orientation must be Portrait or Landscape.")
-    locale = normalize_web_locale(settings.get("web_locale", DEFAULTS["web_locale"]))
+    locale = normalize_web_environment_text(settings.get("web_locale", DEFAULTS["web_locale"]))
     if locale != "default" and (len(locale) > 35 or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", locale)):
         raise ValueError("Webpage Capture locale must be default or a BCP 47-style value such as en-CA.")
-    timezone_value = normalize_web_timezone(settings.get("web_timezone", DEFAULTS["web_timezone"]))
+    timezone_value = normalize_web_environment_text(settings.get("web_timezone", DEFAULTS["web_timezone"]))
     if timezone_value != "default" and (len(timezone_value) > 100 or not re.fullmatch(r"[A-Za-z0-9_+./-]+", timezone_value)):
         raise ValueError("Webpage Capture timezone must be default or an IANA-style value such as America/Toronto.")
     color_scheme = str(settings.get("web_color_scheme", DEFAULTS["web_color_scheme"]) or DEFAULTS["web_color_scheme"]).strip()
@@ -22550,8 +23045,8 @@ def make_web_capture_config(job, preflight_only=False):
         "mobile_emulation": bool(settings.get("web_mobile_emulation", DEFAULTS["web_mobile_emulation"])),
         "touch_emulation": bool(settings.get("web_touch_emulation", DEFAULTS["web_touch_emulation"])),
         "orientation": settings.get("web_orientation", DEFAULTS["web_orientation"]),
-        "locale": normalize_web_locale(settings.get("web_locale", DEFAULTS["web_locale"])),
-        "timezone": normalize_web_timezone(settings.get("web_timezone", DEFAULTS["web_timezone"])),
+        "locale": normalize_web_environment_text(settings.get("web_locale", DEFAULTS["web_locale"])),
+        "timezone": normalize_web_environment_text(settings.get("web_timezone", DEFAULTS["web_timezone"])),
         "color_scheme": settings.get("web_color_scheme", DEFAULTS["web_color_scheme"]),
         "reduced_motion": bool(settings.get("web_reduced_motion", DEFAULTS["web_reduced_motion"])),
         "disable_cache": bool(settings.get("web_disable_cache", DEFAULTS["web_disable_cache"])),
@@ -22978,7 +23473,7 @@ def start_web_capture():
         "paths": get_expected_web_run_paths_for_values(settings.get("web_output_root", settings.get("output_root", "")), resolved_case_name),
     }
     prepare_case_summary_actions_for_run("web-capture")
-    web_log_box.delete("1.0", "end")
+    clear_engine_log_history("web-capture")
     web_append_log("Starting Webpage Capture...\n\n")
     web_append_log(f"Resolved case: {resolved_case_name}\n")
     web_append_log(f"Browser: {settings.get('web_browser_path', '')}\n")
@@ -23585,6 +24080,7 @@ main = ttk.Frame(app_notebook, padding=8)
 image_capture_tab = ttk.Frame(app_notebook, padding=8)
 web_capture_tab = ttk.Frame(app_notebook, padding=8)
 job_queue_tab = ttk.Frame(app_notebook, padding=0)
+output_log_tab = ttk.Frame(app_notebook, padding=0)
 playlist_preview_tab = ttk.Frame(app_notebook, padding=0)
 case_browser_tab = ttk.Frame(app_notebook, padding=0)
 
@@ -23592,6 +24088,7 @@ app_notebook.add(main, text="Audio/Video Capture")
 app_notebook.add(image_capture_tab, text="Image Capture")
 app_notebook.add(web_capture_tab, text="Webpage Capture")
 app_notebook.add(job_queue_tab, text="Job Queue")
+app_notebook.add(output_log_tab, text="Output Log")
 app_notebook.add(playlist_preview_tab, text="Audio/Video Preview")
 app_notebook.add(case_browser_tab, text="Case Browser")
 
@@ -23599,6 +24096,48 @@ job_queue_tab.columnconfigure(0, weight=1)
 job_queue_tab.rowconfigure(0, weight=0)
 job_queue_tab.rowconfigure(1, weight=1)
 job_queue_tab.rowconfigure(2, weight=0)
+
+output_log_tab.columnconfigure(0, weight=1)
+output_log_tab.rowconfigure(1, weight=1)
+
+output_log_toolbar = ttk.Frame(output_log_tab, padding=(10, 10, 10, 6))
+output_log_toolbar.grid(row=0, column=0, sticky="ew")
+output_log_toolbar.columnconfigure(1, weight=1)
+
+ttk.Label(output_log_toolbar, text="Engine").grid(row=0, column=0, sticky="w", padx=(0, 6))
+output_log_engine_var = tk.StringVar(value=normalize_output_log_view(output_log_selected_engine))
+output_log_engine_selector = ttk.Combobox(
+    output_log_toolbar,
+    textvariable=output_log_engine_var,
+    values=OUTPUT_LOG_VIEW_OPTIONS,
+    state="readonly",
+    width=18,
+)
+output_log_engine_selector.grid(row=0, column=1, sticky="w")
+output_log_engine_selector.bind("<<ComboboxSelected>>", on_output_log_engine_selected)
+
+output_log_follow_var = tk.BooleanVar(value=bool(output_log_follow_output))
+ttk.Checkbutton(
+    output_log_toolbar,
+    text="Follow output",
+    variable=output_log_follow_var,
+    command=on_output_log_follow_changed,
+).grid(row=0, column=2, sticky="e", padx=(12, 8))
+ttk.Button(output_log_toolbar, text="Clear Display", command=clear_output_log_display).grid(row=0, column=3, sticky="e")
+
+output_log_text = scrolledtext.ScrolledText(output_log_tab, wrap="word", state="disabled")
+output_log_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
+
+output_log_actions = ttk.Frame(output_log_tab, padding=(10, 0, 10, 10))
+output_log_actions.grid(row=2, column=0, sticky="ew")
+ttk.Button(output_log_actions, text="Copy Visible", command=copy_visible_output_log).pack(side="left")
+ttk.Button(output_log_actions, text="Save Visible...", command=save_visible_output_log).pack(side="left", padx=(6, 0))
+ttk.Label(
+    output_log_actions,
+    text="Clear Display affects only the in-memory viewer; case log files are not deleted.",
+).pack(side="right")
+
+apply_output_log_settings_to_tab()
 
 playlist_preview_tab.columnconfigure(0, weight=1)
 playlist_preview_tab.rowconfigure(0, weight=1)
@@ -23724,7 +24263,7 @@ def get_active_capture_tab_context():
     return ""
 
 
-def refresh_context_capture_menu(event=None):
+def refresh_context_capture_menu(_event=None):
     global capture_menu_visible
 
     context = get_active_capture_tab_context()
@@ -24054,7 +24593,7 @@ capture_options_summary_label = ttk.Label(
 )
 capture_options_summary_label.grid(row=0, column=4, sticky="ew")
 
-def update_capture_options_summary_wrap(event=None):
+def update_capture_options_summary_wrap(_event=None):
     try:
         width = max(
             360,
@@ -24115,7 +24654,7 @@ ttk.Label(
     text="Paste URLs below, one per line. If this box is used, it overrides the Input File(s) field.",
 ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 2))
 
-urls_text = scrolledtext.ScrolledText(main, height=8, wrap="word")
+urls_text = scrolledtext.ScrolledText(main, height=5, wrap="word")
 urls_text.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
 urls_text.bind("<<Modified>>", handle_playlist_preview_source_changed)
 urls_text.edit_modified(False)
@@ -24243,14 +24782,8 @@ copy_summary_split_frame.grid(row=0, column=4, sticky="ew")
 
 ttk.Label(main, textvariable=status_var).grid(row=13, column=0, columnspan=4, sticky="w", pady=(0, 3))
 
-ttk.Label(main, text="Output Log").grid(row=14, column=0, columnspan=4, sticky="w", pady=(0, 2))
-
-log_box = scrolledtext.ScrolledText(main, height=14, wrap="word")
-log_box.grid(row=15, column=0, columnspan=4, sticky="nsew")
-
 if FRESH_STARTUP_MESSAGES:
-    log_box.insert("end", "\n".join(FRESH_STARTUP_MESSAGES) + "\n")
-    log_box.see("end")
+    append_log("\n".join(FRESH_STARTUP_MESSAGES) + "\n")
 
 
 # ---------------- Image Capture / gallery-dl ----------------
@@ -24259,10 +24792,7 @@ image_url_view_mode = "all"
 image_url_all_view_cache = []
 
 def image_append_log(text):
-    try:
-        append_to_log_widget(image_log_box, text)
-    except Exception:
-        append_log(text)
+    append_engine_log("gallery-dl", text)
 
 
 def image_set_status(text):
@@ -24462,7 +24992,7 @@ def get_resolved_image_case_name(now=None, domains=None, presets=None, playlist=
     return safe_case_name(rendered)
 
 
-def update_image_case_folder_preview(*args):
+def update_image_case_folder_preview(*_args):
     try:
         output_root = image_output_root_var.get().strip()
         resolved_name = get_resolved_image_case_name(now=datetime.now())
@@ -24538,7 +25068,7 @@ def delete_current_image_case_folder():
     except Exception as e:
         messagebox.showerror("Delete failed", f"Could not delete the Image Capture case folder:\n\n{e}")
 
-def update_image_cookies_file_control_state(*args):
+def update_image_cookies_file_control_state(*_args):
     state = "normal" if image_use_cookies_file_var.get() else "disabled"
     for widget in (image_cookies_file_entry, image_cookies_file_browse_button):
         try:
@@ -24923,13 +25453,13 @@ def start_image_capture():
 
     try:
         preset_decision_urls = get_image_url_list()
-        preset_decision_settings, preset_decision_applied = apply_checked_domain_presets_to_settings(
+        preset_decision_settings, _ = apply_checked_domain_presets_to_settings(
             get_image_settings_dict(),
             preset_decision_urls,
         )
         effective_concurrency_limit = get_image_concurrent_capture_limit(preset_decision_settings)
     except Exception:
-        preset_decision_applied = []
+        pass
 
     queue_has_active_or_pending_jobs = False
     try:
@@ -25049,7 +25579,7 @@ def start_image_capture():
         "paths": get_expected_image_run_paths_for_values(settings.get("image_output_root", settings.get("output_root", "")), resolved_case_name),
     }
     prepare_case_summary_actions_for_run("gallery-dl")
-    image_log_box.delete("1.0", "end")
+    clear_engine_log_history("gallery-dl")
     image_append_log("Starting Image Capture...\n\n")
     if direct_recovery_job_id:
         image_append_log(f"Recovery job saved to Job Queue: {direct_recovery_job_id}\n")
@@ -25132,7 +25662,7 @@ def show_image_start_capture_menu():
             pass
 
 
-def update_image_options_state(*args):
+def update_image_options_state(*_args):
     try:
         max_state = "normal" if image_max_items_enabled_var.get() else "disabled"
         range_state = "normal" if image_item_range_enabled_var.get() else "disabled"
@@ -25170,7 +25700,7 @@ def get_image_pacing_summary(value=None):
     return labels.get(value, labels["normal"])
 
 
-def update_image_options_summary(*args):
+def update_image_options_summary(*_args):
     try:
         metadata_parts = []
         if image_write_metadata_var.get():
@@ -25207,11 +25737,7 @@ def update_image_options_summary(*args):
 
 
 def hide_image_capture_options_panel(save=False):
-    try:
-        if image_capture_options_panel.winfo_ismapped():
-            image_capture_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(image_capture_options_panel)
 
     try:
         image_capture_options_button.config(text="Capture Options ▾")
@@ -25224,11 +25750,7 @@ def hide_image_capture_options_panel(save=False):
 
 
 def hide_image_advanced_options_panel(save=False):
-    try:
-        if image_advanced_options_panel.winfo_ismapped():
-            image_advanced_options_panel.grid_remove()
-    except Exception:
-        pass
+    remove_grid_managed_widget(image_advanced_options_panel)
 
     try:
         image_advanced_options_button.config(text="Advanced Options ▾")
@@ -25258,6 +25780,7 @@ def toggle_image_capture_options_panel():
     )
     image_capture_options_panel.tkraise()
     image_capture_options_button.config(text="Capture Options ▴")
+    refresh_scrollable_options_panel(image_capture_options_panel)
 
 
 def close_image_capture_options_panel():
@@ -25282,6 +25805,7 @@ def toggle_image_advanced_options_panel():
     )
     image_advanced_options_panel.tkraise()
     image_advanced_options_button.config(text="Advanced Options ▴")
+    refresh_scrollable_options_panel(image_advanced_options_panel)
 
 
 def close_image_advanced_options_panel():
@@ -25408,7 +25932,7 @@ def build_image_capture_tab():
     image_options_summary_label = ttk.Label(options, textvariable=image_options_summary_var, wraplength=760, justify="left")
     image_options_summary_label.grid(row=0, column=2, sticky="ew")
 
-    def update_image_options_summary_wrap(event=None):
+    def update_image_options_summary_wrap(_event=None):
         try:
             width = max(
                 360,
@@ -25464,7 +25988,7 @@ def build_image_capture_tab():
 
     ttk.Label(image_capture_tab, text="Paste image/gallery URLs below, one per line. If this box is used, it overrides the Input File(s) field.").grid(row=10, column=0, columnspan=4, sticky="w", pady=(4, 2))
     global image_urls_text
-    image_urls_text = scrolledtext.ScrolledText(image_capture_tab, height=8, wrap="word")
+    image_urls_text = scrolledtext.ScrolledText(image_capture_tab, height=5, wrap="word")
     image_urls_text.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
     image_button_frame = ttk.Frame(image_capture_tab)
     image_button_frame.grid(row=11, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
@@ -25517,10 +26041,6 @@ def build_image_capture_tab():
     image_summary_split.grid(row=0, column=4, sticky="ew")
 
     ttk.Label(image_capture_tab, textvariable=image_status_var).grid(row=13, column=0, columnspan=4, sticky="w", pady=(0, 3))
-    ttk.Label(image_capture_tab, text="Output Log").grid(row=14, column=0, columnspan=4, sticky="w", pady=(0, 2))
-    global image_log_box
-    image_log_box = scrolledtext.ScrolledText(image_capture_tab, height=14, wrap="word")
-    image_log_box.grid(row=15, column=0, columnspan=4, sticky="nsew")
     update_image_cookies_file_control_state()
     update_image_case_folder_preview()
     update_image_filename_template_preview()
@@ -25535,8 +26055,8 @@ def build_web_capture_tab():
     web_capture_tab.columnconfigure(1, weight=1)
     web_capture_tab.columnconfigure(2, weight=1)
     web_capture_tab.columnconfigure(3, weight=0)
-    web_capture_tab.rowconfigure(12, minsize=URL_ROW_MIN_HEIGHT, weight=0)
-    web_capture_tab.rowconfigure(16, weight=1)
+    web_capture_tab.rowconfigure(12, minsize=URL_ROW_MIN_HEIGHT, weight=1)
+    web_capture_tab.rowconfigure(16, weight=0)
 
     def add_file_row(row, label, var, directory=False):
         ttk.Label(web_capture_tab, text=label).grid(row=row, column=0, sticky="w", pady=1)
@@ -25666,7 +26186,7 @@ def build_web_capture_tab():
     )
     web_options_summary_label.grid(row=0, column=2, sticky="ew")
 
-    def update_web_options_summary_wrap(event=None):
+    def update_web_options_summary_wrap(_event=None):
         try:
             width = max(
                 360,
@@ -25714,7 +26234,7 @@ def build_web_capture_tab():
     ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(4, 2))
 
     global web_urls_text
-    web_urls_text = scrolledtext.ScrolledText(web_capture_tab, height=8, wrap="word")
+    web_urls_text = scrolledtext.ScrolledText(web_capture_tab, height=5, wrap="word")
     web_urls_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
     buttons = ttk.Frame(web_capture_tab)
     buttons.grid(row=12, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
@@ -25804,12 +26324,6 @@ def build_web_capture_tab():
     ttk.Label(web_capture_tab, textvariable=web_status_var).grid(
         row=14, column=0, columnspan=4, sticky="w", pady=(0, 3)
     )
-    ttk.Label(web_capture_tab, text="Output Log").grid(
-        row=15, column=0, columnspan=4, sticky="w", pady=(0, 2)
-    )
-    global web_log_box
-    web_log_box = scrolledtext.ScrolledText(web_capture_tab, height=14, wrap="word")
-    web_log_box.grid(row=16, column=0, columnspan=4, sticky="nsew")
 
     update_web_cookies_file_control_state()
     update_web_case_folder_preview()
@@ -25824,17 +26338,17 @@ build_web_capture_tab()
 # current controls remain easy to reach while later passes can expand each
 # category without making the overlay excessively tall. Only one raised Webpage
 # options panel remains visible at a time.
-web_capture_options_panel = ttk.LabelFrame(web_capture_tab, text="Capture Options", padding=8)
-web_capture_options_panel.columnconfigure(0, weight=1)
+web_capture_options_panel, web_capture_options_content = create_scrollable_options_panel(web_capture_tab, 'Capture Options', padding=8)
+web_capture_options_content.columnconfigure(0, weight=1)
 
 ttk.Label(
-    web_capture_options_panel,
+    web_capture_options_content,
     text="Configure the visual capture, page readiness, scrolling, browser environment, and supplemental evidence outputs.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-web_capture_options_notebook = ttk.Notebook(web_capture_options_panel)
+web_capture_options_notebook = ttk.Notebook(web_capture_options_content)
 web_capture_options_notebook.grid(row=1, column=0, sticky="ew")
 
 # Capture tab: primary visual artifacts, image encoding, retries, and concurrency.
@@ -26369,24 +26883,20 @@ ttk.Label(
     wraplength=245, justify="left",
 ).pack(anchor="w", pady=(5, 0))
 
-web_capture_button_frame = ttk.Frame(web_capture_options_panel)
-web_capture_button_frame.grid(row=2, column=0, sticky="ew", pady=(0, 0))
-web_capture_button_frame.columnconfigure(0, weight=1)
-ttk.Button(
-    web_capture_button_frame,
-    text="Close Capture Options",
-    command=close_web_capture_options_panel,
-).grid(row=0, column=1, sticky="e")
+add_options_panel_close_button(
+    web_capture_options_content,
+    "Close Capture Options",
+    close_web_capture_options_panel,
+)
 web_capture_options_panel.grid_remove()
 
-# PDF settings use a compact tabbed overlay so the close action remains
-# visible even on shorter displays. The notebook separates source behavior,
+# PDF settings use the same scrollable option-panel shell. The notebook separates source behavior,
 # page geometry, and header/footer templates without changing the underlying
 # Webpage Capture settings or helper configuration.
-web_pdf_options_panel = ttk.LabelFrame(web_capture_tab, text="PDF Options", padding=10)
-web_pdf_options_panel.columnconfigure(0, weight=1)
+web_pdf_options_panel, web_pdf_options_content = create_scrollable_options_panel(web_capture_tab, 'PDF Options', padding=10)
+web_pdf_options_content.columnconfigure(0, weight=1)
 
-web_pdf_heading_frame = ttk.Frame(web_pdf_options_panel)
+web_pdf_heading_frame = ttk.Frame(web_pdf_options_content)
 web_pdf_heading_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 ttk.Checkbutton(
     web_pdf_heading_frame,
@@ -26410,7 +26920,7 @@ def register_web_pdf_live_widget(widget):
     web_pdf_live_widgets.append(widget)
     return register_web_pdf_widget(widget)
 
-web_pdf_notebook = ttk.Notebook(web_pdf_options_panel)
+web_pdf_notebook = ttk.Notebook(web_pdf_options_content)
 web_pdf_notebook.grid(row=1, column=0, sticky="ew")
 
 # General tab: source choice, common output switches, and live-page-only layout handling.
@@ -26665,14 +27175,11 @@ for web_pdf_template_widget in (web_pdf_header_text, web_pdf_footer_text):
     web_pdf_template_widget.bind("<KeyRelease>", on_web_pdf_template_edit)
     web_pdf_template_widget.bind("<FocusOut>", on_web_pdf_template_edit)
 
-web_pdf_button_frame = ttk.Frame(web_pdf_options_panel)
-web_pdf_button_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-web_pdf_button_frame.columnconfigure(0, weight=1)
-ttk.Button(
-    web_pdf_button_frame,
-    text="Close PDF Options",
-    command=close_web_pdf_options_panel,
-).grid(row=0, column=1, sticky="e")
+add_options_panel_close_button(
+    web_pdf_options_content,
+    "Close PDF Options",
+    close_web_pdf_options_panel,
+)
 web_pdf_options_panel.grid_remove()
 
 for web_option_var in (
@@ -26785,20 +27292,19 @@ update_web_options_summary()
 # Image Capture inline option panels. These intentionally mirror the
 # Audio/Video Capture tab pattern: button row on the main tab, collapsible
 # in-tab panels below it, and a compact semicolon-separated summary label.
-image_capture_options_panel = ttk.LabelFrame(image_capture_tab, text="Capture Options", padding=12)
-image_capture_options_panel.columnconfigure(0, weight=1)
-image_capture_options_panel.columnconfigure(1, weight=1)
-image_capture_options_panel.columnconfigure(2, weight=1)
-image_capture_options_panel.rowconfigure(3, weight=1)
+image_capture_options_panel, image_capture_options_content = create_scrollable_options_panel(image_capture_tab, 'Capture Options', padding=12)
+image_capture_options_content.columnconfigure(0, weight=1)
+image_capture_options_content.columnconfigure(1, weight=1)
+image_capture_options_content.columnconfigure(2, weight=1)
 
 ttk.Label(
-    image_capture_options_panel,
+    image_capture_options_content,
     text="These options are passed to the gallery-dl image capture script. Defaults favor repeatable image/gallery capture with useful metadata sidecars.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
-image_mode_frame = ttk.LabelFrame(image_capture_options_panel, text="Capture Mode", padding=8)
+image_mode_frame = ttk.LabelFrame(image_capture_options_content, text="Capture Mode", padding=8)
 image_mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 ttk.Radiobutton(
     image_mode_frame,
@@ -26815,7 +27321,7 @@ ttk.Radiobutton(
     command=update_image_options_summary,
 ).pack(anchor="w", pady=2)
 
-image_archive_frame = ttk.LabelFrame(image_capture_options_panel, text="Archive Mode", padding=8)
+image_archive_frame = ttk.LabelFrame(image_capture_options_content, text="Archive Mode", padding=8)
 image_archive_frame.grid(row=1, column=1, sticky="nsew", padx=(0, 8), pady=(0, 8))
 for text, value in (
     ("Use case gallery-dl archive", "use"),
@@ -26830,7 +27336,7 @@ for text, value in (
         command=update_image_options_summary,
     ).pack(anchor="w", pady=2)
 
-image_limits_frame = ttk.LabelFrame(image_capture_options_panel, text="Item Limits", padding=8)
+image_limits_frame = ttk.LabelFrame(image_capture_options_content, text="Item Limits", padding=8)
 image_limits_frame.grid(row=1, column=2, sticky="nsew", pady=(0, 8))
 image_max_check = ttk.Checkbutton(
     image_limits_frame,
@@ -26860,7 +27366,7 @@ image_limits_frame.columnconfigure(1, weight=1)
 image_max_item_widgets = [image_max_entry]
 image_item_range_widgets = [image_range_entry]
 
-image_metadata_frame = ttk.LabelFrame(image_capture_options_panel, text="Metadata Sidecars", padding=8)
+image_metadata_frame = ttk.LabelFrame(image_capture_options_content, text="Metadata Sidecars", padding=8)
 image_metadata_frame.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(0, 8))
 ttk.Checkbutton(
     image_metadata_frame,
@@ -26883,27 +27389,25 @@ ttk.Checkbutton(
 for col in (0, 1, 2):
     image_metadata_frame.columnconfigure(col, weight=1)
 
-image_capture_button_frame = ttk.Frame(image_capture_options_panel)
-image_capture_button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(4, 0))
-ttk.Button(
-    image_capture_button_frame,
-    text="Close Capture Options",
-    command=close_image_capture_options_panel,
-).pack(side="right")
+add_options_panel_close_button(
+    image_capture_options_content,
+    "Close Capture Options",
+    close_image_capture_options_panel,
+)
 image_capture_options_panel.grid_remove()
 
-image_advanced_options_panel = ttk.LabelFrame(image_capture_tab, text="Advanced Options", padding=12)
-image_advanced_options_panel.columnconfigure(0, weight=1, uniform="image_advanced")
-image_advanced_options_panel.columnconfigure(1, weight=1, uniform="image_advanced")
+image_advanced_options_panel, image_advanced_options_content = create_scrollable_options_panel(image_capture_tab, 'Advanced Options', padding=12)
+image_advanced_options_content.columnconfigure(0, weight=1, uniform="image_advanced")
+image_advanced_options_content.columnconfigure(1, weight=1, uniform="image_advanced")
 
 ttk.Label(
-    image_advanced_options_panel,
+    image_advanced_options_content,
     text="These settings control gallery-dl pacing, retries, and timeout behavior.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
 
-image_pacing_frame = ttk.LabelFrame(image_advanced_options_panel, text="Pacing Preset", padding=8)
+image_pacing_frame = ttk.LabelFrame(image_advanced_options_content, text="Pacing Preset", padding=8)
 image_pacing_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
 for text, value in (
     (get_image_pacing_label("fast"), "fast"),
@@ -26918,7 +27422,7 @@ for text, value in (
         command=update_image_options_summary,
     ).pack(anchor="w", pady=2)
 
-image_retry_frame = ttk.LabelFrame(image_advanced_options_panel, text="Retries and Timeout", padding=8)
+image_retry_frame = ttk.LabelFrame(image_advanced_options_content, text="Retries and Timeout", padding=8)
 image_retry_frame.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
 ttk.Label(image_retry_frame, text="Retries").grid(row=0, column=0, sticky="w", pady=3)
 ttk.Entry(image_retry_frame, textvariable=image_retries_var, width=12).grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
@@ -26936,31 +27440,28 @@ image_concurrent_captures_menu.grid(row=2, column=1, sticky="w", padx=(8, 0), pa
 image_retry_frame.columnconfigure(1, weight=1)
 
 
-image_advanced_button_frame = ttk.Frame(image_advanced_options_panel)
-image_advanced_button_frame.grid(row=4, column=0, columnspan=2, sticky="e", pady=(4, 0))
-ttk.Button(
-    image_advanced_button_frame,
-    text="Close Advanced Options",
-    command=close_image_advanced_options_panel,
-).pack(side="right")
+add_options_panel_close_button(
+    image_advanced_options_content,
+    "Close Advanced Options",
+    close_image_advanced_options_panel,
+)
 image_advanced_options_panel.grid_remove()
 
 update_image_options_summary()
 
-capture_options_panel = ttk.LabelFrame(main, text="Capture Options", padding=12)
-capture_options_panel.columnconfigure(0, weight=1)
-capture_options_panel.columnconfigure(1, weight=1)
-capture_options_panel.columnconfigure(2, weight=1)
-capture_options_panel.rowconfigure(5, weight=1)
+capture_options_panel, capture_options_content = create_scrollable_options_panel(main, 'Capture Options', padding=12)
+capture_options_content.columnconfigure(0, weight=1)
+capture_options_content.columnconfigure(1, weight=1)
+capture_options_content.columnconfigure(2, weight=1)
 
 ttk.Label(
-    capture_options_panel,
+    capture_options_content,
     text="These options are passed to the underlying yt-dlp capture script. Defaults prioritize OSINT-friendly sidecar metadata while keeping the workflow simple.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
-mode_frame = ttk.LabelFrame(capture_options_panel, text="Capture Mode", padding=8)
+mode_frame = ttk.LabelFrame(capture_options_content, text="Capture Mode", padding=8)
 mode_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 ttk.Radiobutton(
     mode_frame,
@@ -26991,7 +27492,7 @@ ttk.Radiobutton(
     command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 
-scope_frame = ttk.LabelFrame(capture_options_panel, text="Source Scope", padding=8)
+scope_frame = ttk.LabelFrame(capture_options_content, text="Source Scope", padding=8)
 scope_frame.grid(row=1, column=1, sticky="nsew", padx=8, pady=(0, 8))
 ttk.Radiobutton(
     scope_frame,
@@ -27008,7 +27509,7 @@ ttk.Radiobutton(
     command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 
-format_frame = ttk.LabelFrame(capture_options_panel, text="Format", padding=8)
+format_frame = ttk.LabelFrame(capture_options_content, text="Format", padding=8)
 format_frame.grid(row=1, column=2, sticky="nsew", padx=(8, 0), pady=(0, 8))
 format_frame.columnconfigure(1, weight=1)
 
@@ -27042,7 +27543,7 @@ ttk.Checkbutton(
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
 
 
-archive_frame = ttk.LabelFrame(capture_options_panel, text="Archive Mode", padding=8)
+archive_frame = ttk.LabelFrame(capture_options_content, text="Archive Mode", padding=8)
 archive_frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
 ttk.Radiobutton(
     archive_frame,
@@ -27066,10 +27567,10 @@ ttk.Radiobutton(
     command=update_capture_options_summary,
 ).pack(anchor="w", pady=2)
 
-date_outer_frame = ttk.LabelFrame(capture_options_panel, text="Date Filters", padding=8)
+date_outer_frame = ttk.LabelFrame(capture_options_content, text="Date Filters", padding=8)
 date_outer_frame.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=8, pady=(0, 8))
 
-playlist_frame = ttk.LabelFrame(capture_options_panel, text="Playlist Options", padding=8)
+playlist_frame = ttk.LabelFrame(capture_options_content, text="Playlist Options", padding=8)
 playlist_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 playlist_frame.columnconfigure(1, weight=1)
 playlist_frame.columnconfigure(3, weight=0)
@@ -27152,7 +27653,7 @@ ttk.Label(
     justify="left",
 ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
-output_record_frame = ttk.LabelFrame(capture_options_panel, text="Output Records", padding=8)
+output_record_frame = ttk.LabelFrame(capture_options_content, text="Output Records", padding=8)
 output_record_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 output_record_frame.columnconfigure(1, weight=1)
 output_record_frame.columnconfigure(3, weight=1)
@@ -27279,31 +27780,27 @@ update_date_filter_states()
 update_playlist_options_state()
 
 
-capture_button_frame = ttk.Frame(capture_options_panel)
-capture_button_frame.grid(row=5, column=0, columnspan=3, sticky="ne", pady=(8, 0))
-
-ttk.Button(
-    capture_button_frame,
-    text="Close Capture Options",
-    command=close_capture_options_panel,
-).pack(side="left", padx=6)
+add_options_panel_close_button(
+    capture_options_content,
+    "Close Capture Options",
+    close_capture_options_panel,
+)
 
 capture_options_panel.grid_remove()
 
-metadata_options_panel = ttk.LabelFrame(main, text="Metadata Options", padding=12)
-metadata_options_panel.columnconfigure(0, weight=1)
-metadata_options_panel.columnconfigure(1, weight=1)
-metadata_options_panel.columnconfigure(2, weight=1)
-metadata_options_panel.rowconfigure(4, weight=1)
+metadata_options_panel, metadata_options_content = create_scrollable_options_panel(main, 'Metadata Options', padding=12)
+metadata_options_content.columnconfigure(0, weight=1)
+metadata_options_content.columnconfigure(1, weight=1)
+metadata_options_content.columnconfigure(2, weight=1)
 
 ttk.Label(
-    metadata_options_panel,
+    metadata_options_content,
     text="Sidecar options create separate files. Embed options modify the final media container and apply in Media + sidecars or Media + Embedded mode.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
-artifact_frame = ttk.LabelFrame(metadata_options_panel, text="Sidecar Artifacts", padding=8)
+artifact_frame = ttk.LabelFrame(metadata_options_content, text="Sidecar Artifacts", padding=8)
 artifact_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 artifact_frame.columnconfigure(0, weight=1)
 artifact_frame.columnconfigure(1, weight=1)
@@ -27347,7 +27844,7 @@ ttk.Label(
     justify="left",
 ).grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(6, 0))
 
-embed_frame = ttk.LabelFrame(metadata_options_panel, text="Embed Options", padding=8)
+embed_frame = ttk.LabelFrame(metadata_options_content, text="Embed Options", padding=8)
 embed_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 embed_frame.columnconfigure(0, weight=1)
 embed_frame.columnconfigure(1, weight=1)
@@ -27380,32 +27877,29 @@ ttk.Label(
     justify="left",
 ).grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
 
-metadata_button_frame = ttk.Frame(metadata_options_panel)
-metadata_button_frame.grid(row=4, column=0, columnspan=3, sticky="ne", pady=(8, 0))
-
-ttk.Button(
-    metadata_button_frame,
-    text="Close Metadata Options",
-    command=close_metadata_options_panel,
-).pack(side="left", padx=6)
+add_options_panel_close_button(
+    metadata_options_content,
+    "Close Metadata Options",
+    close_metadata_options_panel,
+)
 
 metadata_options_panel.grid_remove()
 update_playlist_metadata_visibility()
 update_metadata_options_state()
 
-advanced_options_panel = ttk.LabelFrame(main, text="Advanced Options", padding=12)
-advanced_options_panel.columnconfigure(0, weight=1)
-advanced_options_panel.columnconfigure(1, weight=1)
-advanced_options_panel.columnconfigure(2, weight=1)
+advanced_options_panel, advanced_options_content = create_scrollable_options_panel(main, 'Advanced Options', padding=12)
+advanced_options_content.columnconfigure(0, weight=1)
+advanced_options_content.columnconfigure(1, weight=1)
+advanced_options_content.columnconfigure(2, weight=1)
 
 ttk.Label(
-    advanced_options_panel,
+    advanced_options_content,
     text="Advanced controls for filtering, impersonation, failure behavior, and queue concurrency.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
-keyword_frame = ttk.LabelFrame(advanced_options_panel, text="Match / Reject Keywords", padding=8)
+keyword_frame = ttk.LabelFrame(advanced_options_content, text="Match / Reject Keywords", padding=8)
 keyword_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 keyword_frame.columnconfigure(1, weight=1)
 
@@ -27424,7 +27918,7 @@ ttk.Label(
     justify="left",
 ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-impersonate_frame = ttk.LabelFrame(advanced_options_panel, text="Impersonate Target", padding=8)
+impersonate_frame = ttk.LabelFrame(advanced_options_content, text="Impersonate Target", padding=8)
 impersonate_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 impersonate_frame.columnconfigure(1, weight=1)
 
@@ -27459,7 +27953,7 @@ ttk.Checkbutton(
     command=lambda: target_status_var.set("Impersonate targets: Not checked"),
 ).grid(row=1, column=2, sticky="e", pady=(6, 0))
 
-failure_rate_options_row = ttk.Frame(advanced_options_panel)
+failure_rate_options_row = ttk.Frame(advanced_options_content)
 failure_rate_options_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 failure_rate_options_row.columnconfigure(0, weight=1, uniform="advanced_half")
 failure_rate_options_row.columnconfigure(1, weight=1, uniform="advanced_half")
@@ -27511,30 +28005,27 @@ ttk.Label(
     justify="left",
 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-advanced_button_frame = ttk.Frame(advanced_options_panel)
-advanced_button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(8, 0))
-
-ttk.Button(
-    advanced_button_frame,
-    text="Close Advanced Options",
-    command=close_advanced_options_panel,
-).pack(side="left", padx=6)
+add_options_panel_close_button(
+    advanced_options_content,
+    "Close Advanced Options",
+    close_advanced_options_panel,
+)
 
 advanced_options_panel.grid_remove()
 
-pacing_options_panel = ttk.LabelFrame(main, text="Pacing Options", padding=12)
-pacing_options_panel.columnconfigure(0, weight=1)
-pacing_options_panel.columnconfigure(1, weight=1)
-pacing_options_panel.columnconfigure(2, weight=1)
+pacing_options_panel, pacing_options_content = create_scrollable_options_panel(main, 'Pacing Options', padding=12)
+pacing_options_content.columnconfigure(0, weight=1)
+pacing_options_content.columnconfigure(1, weight=1)
+pacing_options_content.columnconfigure(2, weight=1)
 
 ttk.Label(
-    pacing_options_panel,
+    pacing_options_content,
     text="Controls for request pacing, retries, throttle detection, transfer limits, fragments, and HTTP chunking.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
 
-pacing_top_row = ttk.Frame(pacing_options_panel)
+pacing_top_row = ttk.Frame(pacing_options_content)
 pacing_top_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 pacing_top_row.columnconfigure(0, weight=1)
 pacing_top_row.columnconfigure(1, weight=1)
@@ -27575,7 +28066,7 @@ ttk.Label(
     justify="left",
 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-download_speed_frame = ttk.LabelFrame(pacing_options_panel, text="Download Speed Limit", padding=8)
+download_speed_frame = ttk.LabelFrame(pacing_options_content, text="Download Speed Limit", padding=8)
 download_speed_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 download_speed_frame.columnconfigure(1, weight=1)
 
@@ -27614,7 +28105,7 @@ ttk.Label(
 
 sync_download_speed_limit_controls_from_var(show_errors=False)
 
-pacing_bottom_row = ttk.Frame(pacing_options_panel)
+pacing_bottom_row = ttk.Frame(pacing_options_content)
 pacing_bottom_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
 pacing_bottom_row.columnconfigure(0, weight=1)
 pacing_bottom_row.columnconfigure(1, weight=1)
@@ -27671,14 +28162,11 @@ fragments_menu = ttk.Combobox(
 fragments_menu.grid(row=0, column=1, sticky="w", pady=3)
 fragments_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
 
-pacing_button_frame = ttk.Frame(pacing_options_panel)
-pacing_button_frame.grid(row=4, column=0, columnspan=3, sticky="e", pady=(8, 0))
-
-ttk.Button(
-    pacing_button_frame,
-    text="Close Pacing Options",
-    command=close_pacing_options_panel,
-).pack(side="left", padx=6)
+add_options_panel_close_button(
+    pacing_options_content,
+    "Close Pacing Options",
+    close_pacing_options_panel,
+)
 
 pacing_options_panel.grid_remove()
 

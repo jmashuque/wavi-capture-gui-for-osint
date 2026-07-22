@@ -2,6 +2,15 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v2.2026.0722](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v2.2026.0722) - Output Log and Capture Layout Improvements
+
+- Added a dedicated Output Log tab for live Audio/Video, Image, Webpage, and combined capture output, with follow, copy, save, and clear controls.
+- Removed the embedded output logs from the capture tabs and reduced the main window height for a more compact layout.
+- Added dynamically scrollable option panels across all capture engines, with Close buttons positioned directly after each panel’s content.
+- Fixed option panels occasionally appearing blank the first time they were opened.
+- Changed startup behavior to reopen the last selected capture tab rather than a queue, log, preview, or browser tab.
+- Added automatic collapsing of capture option panels when switching away from their capture tab.
+
 ## [v2.2026.0721](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v2.2026.0721) - Large PDF Reliability and Window Placement
 
 - Added streamed, atomic PDF writing with bounded memory use, partial-file cleanup, and improved browser/CDP failure diagnostics.

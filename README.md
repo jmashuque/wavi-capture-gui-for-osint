@@ -17,11 +17,13 @@ A portable Windows GUI for approved audio/video/image and rendered webpage captu
   - [Capture Images](#capture-images)
   - [Capture a Webpage](#capture-a-webpage)
   - [Use the Job Queue](#use-the-job-queue)
+  - [Review Capture Output](#review-capture-output)
   - [Resume Interrupted Captures](#resume-interrupted-captures)
   - [Preview Audio/Video Links](#preview-audiovideo-links)
   - [Review a Case](#review-a-case)
 - [Advanced Usage](#advanced-usage)
   - [Portable Layout](#portable-layout)
+  - [Output Log](#output-log)
   - [Audio/Video Capture](#audiovideo-capture)
   - [Image Capture](#image-capture)
   - [Webpage Capture](#webpage-capture)
@@ -37,12 +39,13 @@ A portable Windows GUI for approved audio/video/image and rendered webpage captu
 
 `Webpage/Audio/Video/Image Capture GUI for OSINT` (`WAVI Capture GUI for OSINT`) is a local, portable interface for repeatable capture work in managed environments.
 
-The app has six main tabs:
+The app has seven main tabs:
 
 - **Audio/Video Capture** for `yt-dlp` captures.
 - **Image Capture** for `gallery-dl` captures.
 - **Webpage Capture** for extension-free full-page, initial-viewport, or combined PNG/JPEG/WebP captures, with optional PDF output, using Deno and an isolated Chromium-browser profile.
 - **Job Queue** for staged, concurrent, and recoverable jobs.
+- **Output Log** for live Audio/Video, Image, Webpage, or combined capture output.
 - **Audio/Video Preview** for metadata, thumbnails, playlist/context review, and queueing from preview results.
 - **Case Browser** for local review, thumbnails, metadata, and hash verification.
 
@@ -58,8 +61,12 @@ The app does not bundle capture tools or make authorization decisions. Tools, cr
 
 <p align="center">
   <img src="/screenshots/main4.png" alt="job queue tab" width="31%">
-  <img src="/screenshots/main5.png" alt="audio/video preview tab" width="31%">
-  <img src="/screenshots/main6.png" alt="case browser tab" width="31%">
+  <img src="/screenshots/main5.png" alt="output log tab" width="31%">
+  <img src="/screenshots/main6.png" alt="audio/video preview tab" width="31%">
+</p>
+
+<p align="center">
+  <img src="/screenshots/main7.png" alt="case browser tab" width="31%">
 </p>
 
 ## Intended Users
@@ -219,7 +226,9 @@ Do this once before the first capture, or whenever you prepare a fresh copy of W
 
 6. Click **Start Capture** and leave WAVI open until the run finishes.
 
-7. Review the output log, then open the case folder and confirm the expected files, logs, and manifest are present. After a successful run, the main **Copy Case Summary** button copies a plain-text record of the case paths, file counts, tool versions, and effective capture options. Use its **▼** menu to copy or export the case's captured URLs or failed URLs. URL lists are filtered to the current capture engine and case name. WAVI refuses oversized clipboard copies instead of truncating them; use **Export** for a complete large list.
+7. Review live capture output in **Output Log**. Select **Audio/Video**, **Image**, **Webpage**, or **All Engines**. **Follow output** keeps the newest messages visible; **Copy Visible**, **Save Visible**, and **Clear Display** act only on the selected view and do not delete case log files.
+
+8. Open the case folder and confirm the expected files, logs, and manifest are present. After a successful run, the main **Copy Case Summary** button copies a plain-text record of the case paths, file counts, tool versions, and effective capture options. Use its **▼** menu to copy or export the case's captured URLs or failed URLs. URL lists are filtered to the current capture engine and case name. WAVI refuses oversized clipboard copies instead of truncating them; use **Export** for a complete large list.
 
 ### Capture Audio or Video
 
@@ -268,6 +277,10 @@ Use **Job Queue** when you want to prepare several captures before running them.
 5. Review failed or interrupted jobs after the run.
 
 The Job Queue is also where interrupted work is resumed when **Job Persistence** is enabled.
+
+### Review Capture Output
+
+Use **Output Log** to review live direct or queued capture output for one capture engine or **All Engines**. The durable case logs remain under each case folder regardless of what is cleared from **Output Log**.
 
 ### Resume Interrupted Captures
 
@@ -331,6 +344,15 @@ Recommended layout:
 - keep active Output Roots local and non-synced
 - avoid running active captures from network shares
 - treat cookies, URL lists, logs, archives, preview exports, and case metadata as sensitive operational data
+
+### Output Log
+
+The **Output Log** tab shows live direct and queued capture output. The **Engine** selector provides **Audio/Video**, **Image**, **Webpage**, and **All Engines** views. The combined view merges records in timestamp order.
+
+- **Follow output** scrolls to new messages. Disable it while reviewing earlier output.
+- **Copy Visible** uses WAVI's shared clipboard safeguards and refuses oversized content without truncating or replacing the current clipboard.
+- **Save Visible** writes the complete selected view as UTF-8 text without the clipboard limit.
+- **Clear Display** clears only the selected view. It does not delete timestamped case logs, captured artifacts, URL histories, archives, or queue state. Clearing **All Engines** requires confirmation.
 
 ### Audio/Video Capture
 
@@ -540,16 +562,14 @@ Cookies, proxy settings, domain presets, and gallery-dl stable/dev update checks
 
 Webpage Capture uses `script-webcapture.ps1`, `script-webcapture.ts`, `deno.exe`, and a selected installed Chromium-family browser. The editable **Browser Path** dropdown detects common stable and preview-channel installations of Edge, Chrome, Brave, Vivaldi, Chromium, Opera, and Arc from standard folders, Windows App Paths and registered-browser entries, and `PATH`. Manual browsing remains available for portable or uncommon installations, and preflight verifies that the selected executable actually supports the required headless DevTools workflow. It communicates with the newly launched browser over the loopback Chrome DevTools Protocol connection and does not require a browser extension, Selenium, WebDriver, Playwright, Puppeteer, or downloaded packages.
 
-The tab follows the same compact options workflow as the other capture tabs:
+Webpage Capture controls include:
 
 - The URL box uses the same twelve-button toolbar as Audio/Video and Image Capture: **Load**, **Append**, **Save**, **Clear**, **Strip**, **Copy**, **Failed/All**, **Group**, **Statistics**, **Normalize**, **Duplicates**, and **Validate**. Webpage capture classifications update the shared `gui-captured-urls.txt` and `gui-failed-urls.txt` history files under the selected Output Root, allowing **Failed** to filter the current webpage URL set without reading the output log.
 - **Capture Options** opens a five-tab overlay. The **Capture** tab selects full-page, initial-viewport, or combined output; PNG, JPEG, or WebP encoding; JPEG/WebP quality; capture-stage retries; and concurrency. The **Readiness** tab controls the navigation milestone, maximum navigation duration, network-quiet duration and settling limit, optional CSS-selector and literal-text conditions, a shared condition timeout, an additional final wait, and the action taken when a readiness check times out. The **Scrolling & Stability** tab controls bounded lazy-load scrolling, continued-growth detection and its outcome, safe single-image and segmented-capture limits, segment overlap, final page remeasurement, animation/transition and scrollbar stabilization, and fixed/sticky-element handling. The **Environment & State** tab provides desktop, tablet, mobile, and custom browser-environment presets; viewport, device scale, mobile-layout, touch, and orientation controls; locale, timezone, colour-scheme, and reduced-motion preferences; cache, service-worker, reload, site-storage, and between-URL cookie controls. The **Evidence Outputs** tab adds optional MHTML, final-response HTML, serialized rendered DOM, sanitized network, failed-request, console, and TLS/browser-security reports, plus failure screenshot/metadata collection after a final capture failure. Network evidence omits request bodies, redacts sensitive headers, and can redact query-string values. **Requested site only** imports cookies applicable to the submitted hostname; **Entire cookies file** imports every valid row for redirect and SSO compatibility.
-- **PDF Options** opens a compact tabbed overlay with **Source & Output**, **Page Layout**, **Large PDFs**, and **Header & Footer** sections. The Close button remains in a fixed footer so it stays visible on shorter displays. The overlay supports two PDF sources: **Live Page (searchable)** for Chromium `Page.printToPDF` output and **Captured PNG (visual match)** for image-based PDF output built from the captured PNG. Live Page also includes layout choices for handling repeated fixed or sticky webpage overlays and bounded large-PDF handling.
-- Opening either options panel closes the other; the arrow indicator changes while a panel is open, and closing a panel saves the current settings.
-- A semicolon-delimited summary appears beside the two buttons and includes capture mode, image encoding and quality, capture retries, the active readiness strategy, scrolling, concurrency, cookies-file state, and PDF settings.
+- **PDF Options** opens a compact tabbed overlay with **Source & Output**, **Page Layout**, **Large PDFs**, and **Header & Footer** sections. It supports two PDF sources: **Live Page (searchable)** for Chromium `Page.printToPDF` output and **Captured PNG (visual match)** for image-based PDF output built from the captured PNG. Live Page also includes layout choices for handling repeated fixed or sticky webpage overlays and bounded large-PDF handling.
 - **Case Name** and **Filename Template** provide **Insert Tag** menus, including `%engine%`, which resolves to `webpage` on this tab. The filename preview reflects full-page, initial-viewport, or combined output, uses the selected image extension, and shows the optional PDF filename when PDF output is enabled.
 
-The first-version security boundary is intentionally narrow:
+Webpage Capture security boundaries:
 
 - approved `http://` and `https://` pages only
 - optional user-selected Netscape `cookies.txt` input, disabled by default and imported according to the selected **Requested site only** or **Entire cookies file** scope
@@ -568,13 +588,13 @@ Before each URL, WAVI applies the selected cache and service-worker policy, opti
 
 When **Reload once without cache** is enabled, WAVI completes the configured readiness cycle for the initial navigation, reloads the page with Chromium's cache bypass, and performs the readiness cycle again before capture. The sidecar records both cycles, cache and service-worker state, storage origins cleared, whether cookies were cleared before import, and the final effective browser environment.
 
-Full-page mode can scroll in bounded steps to trigger lazy content and stop after stable-height checks, the configured time limit, or a continued-growth cycle limit. If a page keeps growing, WAVI can capture the loaded portion as **Partial**, capture it as **Complete with warnings**, or fail the URL. The helper remeasures the page immediately before capture when enabled. User-configurable single-image height and pixel limits remain bounded by WAVI's hard safety ceilings; pages beyond those limits are captured as numbered vertical segments using the selected segment height, overlap, and maximum count. Reaching the scroll-time or segment-count limit marks the result partial rather than silently treating an incomplete page as a complete capture.
+Full-page mode can scroll in bounded steps to trigger lazy content and stop after stable-height checks, the configured time limit, or a continued-growth cycle limit. If a page keeps growing, WAVI can capture the loaded portion as **Partial**, capture it as **Complete with warnings**, or fail the URL. Enable final page remeasurement when page dimensions should be refreshed immediately before capture. User-configurable single-image height and pixel limits remain bounded by WAVI's hard safety ceilings; pages beyond those limits are captured as numbered vertical segments using the selected segment height, overlap, and maximum count. Reaching the scroll-time or segment-count limit marks the result partial rather than silently treating an incomplete page as a complete capture.
 
 Optional stabilization can disable CSS animations, disable CSS transitions, hide scrollbars, and preserve, neutralize, or hide likely fixed/sticky navigation elements. These changes apply only during visual image capture, are removed afterward, and are recorded as presentation-altering actions. Initial-viewport mode captures the configured viewport before lazy-load scrolling. Combined mode saves both views in the same run. PNG remains the lossless default; JPEG and WebP use the selected quality value and are recorded as lossy in the sidecar. Capture-stage failures can be retried up to two times; each retry re-navigates the URL and rebuilds the temporary page state before another visual-capture attempt.
 
-Optional PDF output has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. This PDF source requires PNG image output; JPEG and WebP remain available with Live Page PDF or without PDF. For this mode, Deno temporarily serves the generated image-only document and PNG slices from a randomized endpoint bound only to `127.0.0.1`; the endpoint is shut down immediately after PDF creation and does not upload the images externally. If segmentation is intentionally bounded, Captured PNG PDF uses only the successfully captured image height rather than generating blank pages for the uncaptured remainder.
+Optional PDF output has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. This PDF source requires PNG image output; JPEG and WebP remain available with Live Page PDF or without PDF. Captured PNG PDF uses only local loopback resources and does not upload the images externally. If segmentation is intentionally bounded, Captured PNG PDF uses only the successfully captured image height rather than generating blank pages for the uncaptured remainder.
 
-Both PDF modes request Chromium's stream-based PDF transfer and write the result to disk in bounded chunks instead of receiving the complete PDF as one base64 response. WAVI writes to a temporary `.pdf.partial` file, verifies that a nonempty PDF signature was received, closes the DevTools stream, and only then renames the file to `.pdf`. The partial file is removed after a failed transfer. Per-read and overall safety timeouts prevent a stalled stream from remaining open indefinitely. PDF artifacts and sidecars record the transfer mode, bytes, chunks, elapsed time, and memory-preparation result; failures include available DevTools close details, browser exit status, and a bounded Chromium diagnostic tail. Before printing, WAVI releases completed screenshot data and requests best-effort renderer garbage collection to reduce avoidable memory pressure. These protections reduce WebSocket and helper-memory failures but cannot guarantee that Chromium itself will successfully lay out every exceptionally large page.
+Both PDF modes write to a temporary `.pdf.partial` file and rename it only after a valid PDF is received. Failed transfers remove the partial file. Per-read and overall timeouts prevent stalled PDF creation from remaining open indefinitely. PDF artifacts and sidecars record transfer details and available browser diagnostics. Exceptionally large pages may still exceed Chromium's layout limits.
 
 The **Large PDFs** tab applies to **Live Page** PDF output only. **Automatic** uses a lightweight estimate based on the current document height, paper size, margins, orientation, and scale; when the estimate reaches the configured threshold, WAVI writes numbered streamed files such as `_print_part001.pdf`. **Single PDF** always requests one streamed PDF. **Split into parts** always uses sequential Chromium page ranges. **Fail above safety limit** refuses Live Page PDF creation when the estimated page count exceeds the configured maximum. A manually entered **Pages** range takes precedence and is generated as one streamed PDF. Split sets are bounded by **Pages per part**, **Maximum total pages**, and **Maximum parts**. WAVI preserves completed parts after a later-part failure or safety limit, marks the PDF result and overall capture **Partial**, and writes a `_print.pdfset.json` descriptor containing the requested ranges, hashes, sizes, transport details, completion state, and termination reason. The page estimate is only a policy aid; Chromium print CSS can change the actual page count, so split completion is determined from the sequential print ranges rather than from the estimate alone.
 
@@ -611,7 +631,7 @@ After a successful direct or queued Webpage capture, **Copy Case Summary** provi
 
 The JSON sidecar records the requested and final URLs, redirect chain, main-document status and headers, page title, browser/version, effective environment preset, viewport, device scale, mobile/touch/orientation state, locale, timezone, colour scheme, reduced-motion preference, cache and service-worker policy, storage-clearing actions, between-URL cookie clearing, no-cache reload cycles, viewport and content dimensions, detailed readiness timing and outcomes, readiness timeout actions, selector/text condition results, page measurements before and after scrolling, scrolling termination and growth-limit results, configured and effective segmentation limits, segment overlap and truncation, visual-stabilization actions and affected-element counts, selected image format and quality, capture attempt and prior retry errors, non-sensitive cookie-import counts when enabled, PDF settings, the selected PDF capture mode, large-PDF policy/estimate/split-set results, any live-webpage behavior results, paginated-PNG PDF layout details when used, requested Evidence Outputs and their completion/errors, available browser security metadata, console/failed-request/network counts, output files, SHA256 hashes, and the final **Complete**, **Complete with warnings**, **Partial**, or **Failed** capture-completeness classification. When PDF output is requested but the browser cannot create it, the URL is left incomplete for queue/recovery purposes rather than being marked fully successful. A partial but successfully bounded visual capture is marked complete for queue/recovery while remaining explicitly classified as partial in the log and sidecar. The screenshot is a rendered visual capture of what the selected browser presented at the recorded time; it is not a server-side archive or an authenticity determination.
 
-Browser automation can still be blocked by enterprise browser policy, Defender for Endpoint, WDAC/AppLocker, ASR, or Controlled Folder Access. The tab's preflight is designed to test the isolated-profile and loopback-debugging workflow before a capture starts.
+Browser automation can still be blocked by enterprise browser policy, Defender for Endpoint, WDAC/AppLocker, ASR, or Controlled Folder Access. Preflight tests the isolated browser profile and loopback DevTools connection before capture.
 
 ### Job Queue, Persistence, and Recovery
 
@@ -667,11 +687,9 @@ Common state files:
 - `universal-download-archive.txt`, `universal-gallerydl-archive.sqlite3`, and `universal-webcapture-archive.sqlite3` when universal archives are enabled
 - case-level `manifests/gui-job-recovery-<job-id>.json` files for recovery details
 
-The **Default** profile is used on first launch. After that, WAVI restores the last selected profile at startup. Capture-setting changes are saved back to the active profile during autosave, when switching profiles, and when the app closes, so custom-profile edits no longer flow into **Default**. Use **Profile > Save Current Settings to Profile...** to create a new profile or deliberately overwrite an existing one.
+The **Default** profile is used initially. Changes are saved to the active profile. Use **Profile > Save Current Settings to Profile...** to create a new profile or deliberately overwrite an existing one.
 
-The last selected main tab, the main window's normal size and position, and whether the window was maximized are app-level settings and are restored at startup. WAVI never reopens minimized. Saved positions are matched to the appropriate monitor work area, including monitors with negative desktop coordinates, and invalid or off-screen geometry is moved back to an accessible display. On first launch, WAVI opens centered and slightly toward the top of the monitor work area so lower controls remain above the taskbar.
-
-`python gui.py --fresh` clears app settings/state files, Job Queue persistence, URL-box persistence, app-owned temp files, the app debug log, universal archives, GUI cache folders under known Output Roots, and narrow app-owned atomic write temp files. It also reads saved Job Queue state before deleting it so older job-only Output Roots can be cleaned. It does not delete captured case folders, media files, cookies, binaries, scripts, case logs, manifests, or case-specific capture archives.
+`python gui.py --fresh` clears app settings/state files, Job Queue persistence, URL-box persistence, app-owned temp files, the app debug log, universal archives, GUI cache folders under known Output Roots, and narrow app-owned atomic write temp files. It does not delete captured case folders, media files, cookies, binaries, scripts, case logs, manifests, or case-specific capture archives.
 
 ## Cookies Handling
 
