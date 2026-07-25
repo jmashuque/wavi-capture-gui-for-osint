@@ -479,6 +479,10 @@ function renderFilenameTemplate(template, context) {
     "%domain%": safeFileComponent(context.domain, "unknown-domain", 90),
     "%title%": safeFileComponent(context.title, "untitled", 120),
     "%index%": String(context.index).padStart(3, "0"),
+    "%urlindex%": String(context.index).padStart(3, "0"),
+    "%overlayindex%": String(context.overlayIndex == null ? 0 : context.overlayIndex).padStart(3, "0"),
+    "%profile%": safeFileComponent(context.profile, "unknown-profile", 120),
+    "%contentid%": safeFileComponent(context.contentId, "unknown-content", 120),
     "%mode%": context.mode === "viewport" ? "viewport" : (context.mode === "both" ? "full-page-and-viewport" : "full-page"),
     "%case%": safeFileComponent(context.caseName, "case", 120),
   };
@@ -986,6 +990,7 @@ async function captureFailureEvidence(client, config, url, index, browserVersion
   try { domain = new URL(pageInfo.final_url || url).hostname || domain; } catch { /* fallback */ }
   const baseName = renderFilenameTemplate(config.filename_template, {
     date: new Date(), domain, title: pageInfo.title || "capture-failure", index,
+    profile: deriveWebpageProfile(pageInfo.final_url, url),
     mode: normalizeCaptureMode(config.capture_mode), caseName: config.case_name || "",
   });
   let screenshotPath = "";
@@ -1126,14 +1131,14 @@ async function applyPdfPageBehavior(client, behavior) {
     }
 
     const cssRules = selected.map((item) => {
-      const selector = "[" + ATTR + "=\"" + item.id + "\"]";
+      const selector = '[' + ATTR + '="' + item.id + '"]';
       return MODE === "hide_likely_navigation_overlays"
         ? selector + "{display:none !important; visibility:hidden !important;}"
         : selector + "{position:static !important; top:auto !important; right:auto !important; bottom:auto !important; left:auto !important; inset:auto !important; transform:none !important;}";
     });
     const styleTag = document.createElement("style");
     styleTag.id = STYLE_ID;
-    styleTag.textContent = cssRules.join("\n");
+    styleTag.textContent = cssRules.join("\\n");
     (document.head || document.documentElement).appendChild(styleTag);
 
     return {
@@ -3218,6 +3223,1628 @@ async function performReadinessCycle(client, config, networkState, warnings, com
   };
 }
 
+const IMMUTABLE_INTERACTIVE_BLOCK_TERMS = [
+  "follow", "unfollow", "like", "unlike", "react", "share", "repost", "retweet",
+  "send", "message", "comment", "reply", "subscribe", "unsubscribe", "join", "invite",
+  "block", "mute", "report", "sign in", "signin", "log in", "login", "sign up", "signup",
+  "register", "submit", "confirm", "approve", "delete", "remove", "edit", "upload",
+  "publish", "buy", "purchase", "checkout", "cart", "payment", "donate", "book",
+  "reserve", "download", "install", "open app", "launch app", "call", "mailto", "tel:",
+  "javascript:", "cookie preferences", "cookie settings", "accept cookies", "notifications",
+];
+
+const GENERIC_INTERACTIVE_TRIGGER_TERMS = [
+  "image", "img", "media", "card", "post", "photo", "picture", "video", "tile",
+  "figure", "preview", "detail", "details", "story", "reel", "gallery", "slide",
+  "album", "attachment", "thumb", "carousel", "slideshow", "viewer", "lightbox",
+  "zoom", "expand", "permalink",
+];
+
+const INTERACTIVE_MEDIA_ROUTE_MARKERS = [
+  "reel", "reels", "photo", "photos", "p", "post", "posts", "tv", "video", "videos",
+  "story", "stories", "highlight", "highlights", "media", "image", "images", "gallery",
+  "galleries", "album", "albums", "attachment", "attachments", "status", "statuses",
+];
+
+function normalizeInteractiveCaptureScope(value) {
+  const scope = String(value || "overlay_only").trim();
+  if (["overlay_only", "viewport_only", "overlay_and_viewport"].includes(scope)) return scope;
+  return "overlay_only";
+}
+
+function normalizeInteractiveRules(rules) {
+  const allowed = new Set(["trigger", "overlay", "close", "next", "previous", "any"]);
+  const output = [];
+  const seen = new Set();
+  for (const rule of Array.isArray(rules) ? rules : []) {
+    const category = allowed.has(String(rule?.category || "").trim().toLowerCase())
+      ? String(rule.category).trim().toLowerCase()
+      : "any";
+    const term = String(rule?.term || "").trim();
+    if (!term || term.length > 200) continue;
+    const key = `${category}|${term.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push({ category, term });
+  }
+  return output;
+}
+
+function interactiveRulesForCategory(rules, category) {
+  return normalizeInteractiveRules(rules)
+    .filter((rule) => rule.category === category || rule.category === "any")
+    .map((rule) => rule.term);
+}
+
+async function dispatchMouseClick(client, point) {
+  const x = Math.max(1, Number(point?.x) || 1);
+  const y = Math.max(1, Number(point?.y) || 1);
+  await client.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" }, 10000);
+  await client.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 }, 10000);
+  await client.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 }, 10000);
+}
+
+async function dispatchEscapeKey(client) {
+  await client.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 }, 10000);
+  await client.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 }, 10000);
+}
+
+async function getInteractiveOverlayFingerprints(client, rules) {
+  const overlayTerms = interactiveRulesForCategory(rules, "overlay");
+  return await evaluate(client, `(() => {
+    const TERMS = ${JSON.stringify(overlayTerms)};
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const descriptor = (el) => [
+      el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.getAttribute("aria-modal"),
+      el.id, el.className, el.getAttribute("title"), el.getAttribute("aria-labelledby"),
+      el.getAttribute("aria-describedby"), el.getAttribute("data-testid"), el.getAttribute("data-test"),
+      el.getAttribute("data-role"), el.getAttribute("data-state"), el.textContent
+    ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 1600);
+    const visible = (el) => {
+      if (!(el instanceof Element)) return false;
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 80 && rect.height >= 60;
+    };
+    const candidates = new Set();
+    for (const selector of ["dialog", "[role='dialog']", "[aria-modal='true']", "[class*='modal' i]", "[class*='lightbox' i]", "[class*='overlay' i]", "[class*='viewer' i]", "[id*='modal' i]", "[id*='lightbox' i]", "[id*='overlay' i]", "[id*='viewer' i]"]) {
+      for (const el of document.querySelectorAll(selector)) candidates.add(el);
+    }
+    const output = [];
+    for (const el of candidates) {
+      if (!visible(el)) continue;
+      const desc = descriptor(el);
+      const semantic = el.tagName === "DIALOG" || el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
+      if (!semantic && TERMS.length && !TERMS.some((term) => termMatch(desc, term))) continue;
+      const rect = el.getBoundingClientRect();
+      output.push(norm(desc).slice(0, 320) + "|" + Math.round(rect.width) + "x" + Math.round(rect.height) + "|" + Math.round(rect.left) + "," + Math.round(rect.top));
+    }
+    return output;
+  })()`, 30000);
+}
+
+async function discoverInteractiveTrigger(client, config, processedFingerprints) {
+  const whitelist = normalizeInteractiveRules(config?.whitelist_rules);
+  const blacklist = normalizeInteractiveRules(config?.blacklist_rules);
+  const triggerRules = whitelist
+    .filter((rule) => rule.category === "trigger" || rule.category === "any")
+    .map((rule) => ({
+      term: String(rule.term || "").replace(/^safe\s*:/i, "").trim(),
+      explicit_safe: /^safe\s*:/i.test(String(rule.term || "")),
+    }))
+    .filter((rule) => rule.term);
+  const blockedTerms = [...interactiveRulesForCategory(blacklist, "trigger"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const TRIGGER_RULES = ${JSON.stringify(triggerRules)};
+    const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
+    const GENERIC_TERMS = new Set(${JSON.stringify(GENERIC_INTERACTIVE_TRIGGER_TERMS)});
+    const MEDIA_ROUTE_MARKERS = new Set(${JSON.stringify(INTERACTIVE_MEDIA_ROUTE_MARKERS)});
+    const PROCESSED = new Set(${JSON.stringify(Array.from(processedFingerprints || []))});
+    const ATTR = "data-wavi-interactive-trigger";
+    for (const node of document.querySelectorAll("[" + ATTR + "]")) node.removeAttribute(ATTR);
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const visible = (el) => {
+      if (!(el instanceof Element)) return false;
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 24 && rect.height >= 24;
+    };
+    const descriptor = (el) => {
+      const media = el.matches("img,video,picture,figure") ? el : el.querySelector("img,video,picture,figure");
+      return [
+        el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.id, el.className,
+        el.getAttribute("title"), el.getAttribute("alt"), el.getAttribute("href"), el.getAttribute("src"),
+        el.getAttribute("aria-haspopup"), el.getAttribute("aria-controls"), el.getAttribute("aria-expanded"),
+        el.getAttribute("data-testid"), el.getAttribute("data-test"), el.getAttribute("data-role"),
+        el.getAttribute("data-action"), el.getAttribute("data-target"), el.getAttribute("data-toggle"),
+        el.getAttribute("data-id"), el.getAttribute("data-item-id"), el.getAttribute("data-media-id"),
+        media?.getAttribute("alt"), media?.getAttribute("src"), el.innerText
+      ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 2400);
+    };
+    const routeLooksLikeMedia = (href) => {
+      if (!href) return false;
+      try {
+        const url = new URL(href, location.href);
+        const segments = url.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part).toLowerCase());
+        for (let i = 0; i < segments.length; i += 1) {
+          if (MEDIA_ROUTE_MARKERS.has(segments[i]) && Boolean(segments[i + 1])) return true;
+        }
+        if (["id", "media_id", "post_id", "content_id", "photo_id", "video_id"].some((key) => Boolean(url.searchParams.get(key)))) return true;
+        return /\\.(?:jpe?g|png|webp|gif|avif|mp4|webm|mov)(?:$|[?#])/i.test(url.pathname + url.search + url.hash);
+      } catch {
+        return false;
+      }
+    };
+    const explicitOverlaySignal = (el) => {
+      const hasPopup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+      if (["dialog", "true"].includes(hasPopup)) return true;
+      const controls = String(el.getAttribute("aria-controls") || "").trim();
+      if (controls) {
+        const controlled = document.getElementById(controls);
+        if (controlled && (
+          controlled.matches("dialog,[role='dialog'],[aria-modal='true']") ||
+          /modal|dialog|lightbox|overlay|viewer|preview|gallery/i.test(String(controlled.id || "") + " " + String(controlled.className || ""))
+        )) return true;
+      }
+      const target = [el.getAttribute("data-target"), el.getAttribute("data-toggle"), el.getAttribute("data-action")].filter(Boolean).join(" ");
+      return /modal|dialog|lightbox|overlay|viewer|preview|gallery|open[-_ ]?(?:image|photo|video|media|post)/i.test(target);
+    };
+    const candidateElements = [];
+    const seenElements = new Set();
+    for (const raw of document.querySelectorAll("a,button,[role='button'],[role='link'],[tabindex]:not([tabindex='-1']),[onclick],[aria-haspopup],img,video,picture,figure")) {
+      let el = raw;
+      if (raw.matches("img,video,picture,figure")) {
+        const actionableAncestor = raw.closest("a,button,[role='button'],[role='link'],[tabindex]:not([tabindex='-1']),[onclick],[aria-haspopup]");
+        const rawStyle = getComputedStyle(raw);
+        const rawIsActionable = raw.matches("[role='button'],[role='link'],[tabindex]:not([tabindex='-1']),[onclick],[aria-haspopup],[aria-controls],[data-action],[data-target],[data-toggle]") || rawStyle.cursor === "pointer";
+        if (!actionableAncestor && !rawIsActionable) continue;
+        el = actionableAncestor || raw;
+      }
+      if (seenElements.has(el)) continue;
+      seenElements.add(el);
+      candidateElements.push(el);
+    }
+    const pageOrigin = location.origin;
+    const ranked = [];
+    for (const el of candidateElements) {
+      if (!visible(el)) continue;
+      if (el.closest("form")) continue;
+      if (el.matches("input,select,textarea") || el.getAttribute("type") === "submit" || el.getAttribute("type") === "reset") continue;
+      if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
+      const href = el.closest("a")?.href || el.getAttribute("href") || "";
+      if (/^(javascript:|mailto:|tel:)/i.test(href)) continue;
+      if (href) {
+        try { if (new URL(href, location.href).origin !== pageOrigin) continue; } catch { continue; }
+      }
+      const desc = descriptor(el);
+      if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
+      const matchedRules = TRIGGER_RULES.filter((rule) => termMatch(desc, rule.term));
+      const matched = matchedRules.map((rule) => rule.term);
+      const matchedSafeRules = matchedRules.filter((rule) => rule.explicit_safe).map((rule) => rule.term);
+      const hasMedia = Boolean(el.matches("img,video,picture,figure") || el.querySelector("img,video,picture,figure"));
+      const role = String(el.getAttribute("role") || "").toLowerCase();
+      if (!matched.length) continue;
+      if (!hasMedia && !["button", "link"].includes(role) && !el.matches("a,button")) continue;
+      const isLink = Boolean(href) || el.matches("a,[role='link']");
+      const routeMedia = routeLooksLikeMedia(href);
+      const overlaySignal = explicitOverlaySignal(el);
+      const genericOnly = matchedRules.every((rule) => GENERIC_TERMS.has(norm(rule.term)));
+      if (isLink) {
+        if (!routeMedia && !matchedSafeRules.length && genericOnly) continue;
+      } else {
+        if (!overlaySignal && !matchedSafeRules.length) continue;
+        if (genericOnly && !matchedSafeRules.length && !overlaySignal) continue;
+      }
+      const rect = el.getBoundingClientRect();
+      const absoluteY = Math.round(window.scrollY + rect.top);
+      let hrefKey = "";
+      if (href) {
+        try {
+          const url = new URL(href, location.href);
+          hrefKey = String(url.origin || "") + String(url.pathname || "") + String(url.search || "");
+        } catch {
+          hrefKey = String(href);
+        }
+      }
+      const fingerprint = hrefKey
+        ? ("href|" + String(hrefKey || "")).slice(0, 900)
+        : [
+          el.tagName, el.id, el.getAttribute("data-id"), el.getAttribute("data-item-id"),
+          el.getAttribute("data-media-id"), el.getAttribute("aria-label"), el.getAttribute("alt"),
+          norm(el.innerText).slice(0, 180), absoluteY
+        ].map((value) => String(value || "")).join("|").slice(0, 900);
+      if (PROCESSED.has(fingerprint)) continue;
+      const inViewport = rect.bottom > 0 && rect.top < window.innerHeight;
+      const score = matched.length * 10 + (hasMedia ? 8 : 0) + (inViewport ? 5 : 0) + (routeMedia ? 12 : 0) + (overlaySignal ? 10 : 0) + (matchedSafeRules.length ? 15 : 0) + Math.min(5, Math.round((rect.width * rect.height) / 50000));
+      ranked.push({ el, desc, href, fingerprint, matched, matchedSafeRules, score, absoluteY, rect, routeMedia, overlaySignal, genericOnly });
+    }
+    ranked.sort((a, b) => b.score - a.score || a.absoluteY - b.absoluteY);
+    const selected = ranked[0];
+    if (!selected) return null;
+    const id = "trigger-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    selected.el.setAttribute(ATTR, id);
+    selected.el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const rect = selected.el.getBoundingClientRect();
+    return {
+      id,
+      fingerprint: selected.fingerprint,
+      descriptor: selected.desc.slice(0, 1200),
+      matched_terms: selected.matched,
+      matched_safe_rules: selected.matchedSafeRules,
+      href: selected.href,
+      page_url_before: location.href,
+      scroll_x_before: window.scrollX,
+      scroll_y_before: window.scrollY,
+      x: Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2)),
+      y: Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2)),
+      width: rect.width,
+      height: rect.height,
+      absolute_y: selected.absoluteY,
+      qualification: {
+        route_looks_like_media: selected.routeMedia,
+        explicit_overlay_signal: selected.overlaySignal,
+        generic_terms_only: selected.genericOnly,
+        explicit_safe_rule: selected.matchedSafeRules.length > 0,
+      },
+    };
+  })()`, 30000);
+}
+
+async function validateInteractiveTriggerBeforeClick(client, config, trigger) {
+  const whitelist = normalizeInteractiveRules(config?.whitelist_rules);
+  const blacklist = normalizeInteractiveRules(config?.blacklist_rules);
+  const triggerRules = whitelist
+    .filter((rule) => rule.category === "trigger" || rule.category === "any")
+    .map((rule) => ({
+      term: String(rule.term || "").replace(/^safe\s*:/i, "").trim(),
+      explicit_safe: /^safe\s*:/i.test(String(rule.term || "")),
+    }))
+    .filter((rule) => rule.term);
+  const blockedTerms = [...interactiveRulesForCategory(blacklist, "trigger"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const TRIGGER = ${JSON.stringify(trigger || {})};
+    const TRIGGER_RULES = ${JSON.stringify(triggerRules)};
+    const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
+    const GENERIC_TERMS = new Set(${JSON.stringify(GENERIC_INTERACTIVE_TRIGGER_TERMS)});
+    const MEDIA_ROUTE_MARKERS = new Set(${JSON.stringify(INTERACTIVE_MEDIA_ROUTE_MARKERS)});
+    const ATTR = "data-wavi-interactive-trigger";
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const descriptor = (el) => {
+      if (!(el instanceof Element)) return "";
+      const media = el.matches("img,video,picture,figure") ? el : el.querySelector("img,video,picture,figure");
+      return [
+        el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.id, el.className,
+        el.getAttribute("title"), el.getAttribute("alt"), el.getAttribute("href"), el.getAttribute("src"),
+        el.getAttribute("aria-haspopup"), el.getAttribute("aria-controls"), el.getAttribute("aria-expanded"),
+        el.getAttribute("data-testid"), el.getAttribute("data-test"), el.getAttribute("data-role"),
+        el.getAttribute("data-action"), el.getAttribute("data-target"), el.getAttribute("data-toggle"),
+        el.getAttribute("data-id"), el.getAttribute("data-item-id"), el.getAttribute("data-media-id"),
+        media?.getAttribute("alt"), media?.getAttribute("src"), el.innerText
+      ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 2400);
+    };
+    const summarizeElement = (el) => {
+      if (!(el instanceof Element)) return null;
+      return {
+        tag: el.tagName,
+        role: el.getAttribute("role") || "",
+        id: el.id || "",
+        class_name: typeof el.className === "string" ? el.className.slice(0, 400) : "",
+        aria_label: el.getAttribute("aria-label") || "",
+        href: el.closest("a")?.href || el.getAttribute("href") || "",
+        descriptor: descriptor(el).slice(0, 1200),
+      };
+    };
+    const routeLooksLikeMedia = (href) => {
+      if (!href) return false;
+      try {
+        const url = new URL(href, location.href);
+        const segments = url.pathname.split("/").filter(Boolean).map((part) => decodeURIComponent(part).toLowerCase());
+        for (let i = 0; i < segments.length; i += 1) {
+          if (MEDIA_ROUTE_MARKERS.has(segments[i]) && Boolean(segments[i + 1])) return true;
+        }
+        if (["id", "media_id", "post_id", "content_id", "photo_id", "video_id"].some((key) => Boolean(url.searchParams.get(key)))) return true;
+        return /\\.(?:jpe?g|png|webp|gif|avif|mp4|webm|mov)(?:$|[?#])/i.test(url.pathname + url.search + url.hash);
+      } catch {
+        return false;
+      }
+    };
+    const explicitOverlaySignal = (el) => {
+      const hasPopup = String(el.getAttribute("aria-haspopup") || "").toLowerCase();
+      if (["dialog", "true"].includes(hasPopup)) return true;
+      const controls = String(el.getAttribute("aria-controls") || "").trim();
+      if (controls) {
+        const controlled = document.getElementById(controls);
+        if (controlled && (
+          controlled.matches("dialog,[role='dialog'],[aria-modal='true']") ||
+          /modal|dialog|lightbox|overlay|viewer|preview|gallery/i.test(String(controlled.id || "") + " " + String(controlled.className || ""))
+        )) return true;
+      }
+      const target = [el.getAttribute("data-target"), el.getAttribute("data-toggle"), el.getAttribute("data-action")].filter(Boolean).join(" ");
+      return /modal|dialog|lightbox|overlay|viewer|preview|gallery|open[-_ ]?(?:image|photo|video|media|post)/i.test(target);
+    };
+    const el = document.querySelector("[" + ATTR + "=" + CSS.escape(String(TRIGGER.id || "")) + "]");
+    if (!(el instanceof Element)) return { allowed: false, reason: "trigger_missing_before_click" };
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || 1) <= 0.02 || rect.width < 24 || rect.height < 24) {
+      return { allowed: false, reason: "trigger_not_visible_before_click", current_rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+    }
+    if (el.closest("form") || el.matches("input,select,textarea") || el.getAttribute("type") === "submit" || el.getAttribute("type") === "reset") {
+      return { allowed: false, reason: "form_control_blocked_before_click" };
+    }
+    if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") {
+      return { allowed: false, reason: "disabled_control_before_click" };
+    }
+    const desc = descriptor(el);
+    const blockedMatches = BLOCKED_TERMS.filter((term) => termMatch(desc, term));
+    if (blockedMatches.length) {
+      return { allowed: false, reason: "blocked_term_detected_before_click", blocked_terms: blockedMatches.slice(0, 20), descriptor: desc.slice(0, 1200) };
+    }
+    const matchedRules = TRIGGER_RULES.filter((rule) => termMatch(desc, rule.term));
+    if (!matchedRules.length) return { allowed: false, reason: "whitelist_no_longer_matches_before_click", descriptor: desc.slice(0, 1200) };
+    const matchedSafeRules = matchedRules.filter((rule) => rule.explicit_safe).map((rule) => rule.term);
+    const genericOnly = matchedRules.every((rule) => GENERIC_TERMS.has(norm(rule.term)));
+    const href = el.closest("a")?.href || el.getAttribute("href") || "";
+    if (/^(javascript:|mailto:|tel:)/i.test(href)) return { allowed: false, reason: "active_or_external_scheme_blocked_before_click", href };
+    if (href) {
+      try {
+        if (new URL(href, location.href).origin !== location.origin) return { allowed: false, reason: "cross_origin_link_blocked_before_click", href };
+      } catch {
+        return { allowed: false, reason: "invalid_link_before_click", href };
+      }
+    }
+    const isLink = Boolean(href) || el.matches("a,[role='link']");
+    const routeMedia = routeLooksLikeMedia(href);
+    const overlaySignal = explicitOverlaySignal(el);
+    if (isLink) {
+      if (!routeMedia && !matchedSafeRules.length && genericOnly) {
+        return { allowed: false, reason: "ambiguous_generic_link_blocked_before_click", href, matched_terms: matchedRules.map((rule) => rule.term) };
+      }
+    } else {
+      if (!overlaySignal && !matchedSafeRules.length) {
+        return { allowed: false, reason: "non_link_without_overlay_signal_blocked", matched_terms: matchedRules.map((rule) => rule.term) };
+      }
+      if (genericOnly && !matchedSafeRules.length && !overlaySignal) {
+        return { allowed: false, reason: "generic_non_link_blocked_before_click", matched_terms: matchedRules.map((rule) => rule.term) };
+      }
+    }
+    const oldCenterX = Number(TRIGGER.x) || 0;
+    const oldCenterY = Number(TRIGGER.y) || 0;
+    const newCenterX = Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2));
+    const newCenterY = Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2));
+    const centerDistance = Math.hypot(newCenterX - oldCenterX, newCenterY - oldCenterY);
+    const widthChange = Math.abs(rect.width - (Number(TRIGGER.width) || rect.width)) / Math.max(1, Number(TRIGGER.width) || rect.width);
+    const heightChange = Math.abs(rect.height - (Number(TRIGGER.height) || rect.height)) / Math.max(1, Number(TRIGGER.height) || rect.height);
+    const movementThreshold = Math.max(12, Math.min(40, Math.max(rect.width, rect.height) * 0.10));
+    if (centerDistance > movementThreshold || widthChange > 0.20 || heightChange > 0.20) {
+      return {
+        allowed: false,
+        reason: "trigger_moved_materially_before_click",
+        movement: { center_distance_px: centerDistance, threshold_px: movementThreshold, width_change_ratio: widthChange, height_change_ratio: heightChange },
+        original_rect: { center_x: oldCenterX, center_y: oldCenterY, width: Number(TRIGGER.width) || 0, height: Number(TRIGGER.height) || 0 },
+        current_rect: { center_x: newCenterX, center_y: newCenterY, width: rect.width, height: rect.height },
+      };
+    }
+    const hit = document.elementFromPoint(newCenterX, newCenterY);
+    const topmostMatches = hit === el || (hit instanceof Element && el.contains(hit));
+    if (!topmostMatches) {
+      return {
+        allowed: false,
+        reason: "trigger_obscured_before_click",
+        click_point: { x: newCenterX, y: newCenterY },
+        selected_element: summarizeElement(el),
+        hit_tested_element: summarizeElement(hit),
+      };
+    }
+    return {
+      allowed: true,
+      reason: "validated",
+      x: newCenterX,
+      y: newCenterY,
+      href,
+      descriptor: desc.slice(0, 1200),
+      matched_terms: matchedRules.map((rule) => rule.term),
+      matched_safe_rules: matchedSafeRules,
+      route_looks_like_media: routeMedia,
+      explicit_overlay_signal: overlaySignal,
+      generic_terms_only: genericOnly,
+      movement: { center_distance_px: centerDistance, threshold_px: movementThreshold, width_change_ratio: widthChange, height_change_ratio: heightChange },
+      selected_element: summarizeElement(el),
+      hit_tested_element: summarizeElement(hit),
+      click_point: { x: newCenterX, y: newCenterY },
+    };
+  })()`, 30000);
+}
+
+async function findInteractiveOverlay(client, config, baselineFingerprints) {
+  const whitelist = normalizeInteractiveRules(config?.whitelist_rules);
+  const blacklist = normalizeInteractiveRules(config?.blacklist_rules);
+  const overlayTerms = interactiveRulesForCategory(whitelist, "overlay");
+  const blockedTerms = [...interactiveRulesForCategory(blacklist, "overlay"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const OVERLAY_TERMS = ${JSON.stringify(overlayTerms)};
+    const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
+    const BASELINE = new Set(${JSON.stringify(Array.isArray(baselineFingerprints) ? baselineFingerprints : [])});
+    const ATTR = "data-wavi-interactive-overlay";
+    for (const node of document.querySelectorAll("[" + ATTR + "]")) node.removeAttribute(ATTR);
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const visible = (el) => {
+      if (!(el instanceof Element)) return false;
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 100 && rect.height >= 80 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+    };
+    const descriptor = (el) => [
+      el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.getAttribute("aria-modal"),
+      el.id, el.className, el.getAttribute("title"), el.getAttribute("aria-labelledby"),
+      el.getAttribute("aria-describedby"), el.getAttribute("data-testid"), el.getAttribute("data-test"),
+      el.getAttribute("data-role"), el.getAttribute("data-state"), el.innerText
+    ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 2400);
+    const candidates = new Set();
+    for (const selector of ["dialog", "[role='dialog']", "[aria-modal='true']", "[class*='modal' i]", "[class*='lightbox' i]", "[class*='overlay' i]", "[class*='viewer' i]", "[id*='modal' i]", "[id*='lightbox' i]", "[id*='overlay' i]", "[id*='viewer' i]"]) {
+      for (const el of document.querySelectorAll(selector)) candidates.add(el);
+    }
+    for (const el of Array.from(document.body ? document.body.querySelectorAll("*") : []).slice(0, 12000)) {
+      const style = getComputedStyle(el);
+      const z = Number.parseInt(style.zIndex || "0", 10) || 0;
+      if ((style.position === "fixed" || style.position === "sticky") && z >= 10) candidates.add(el);
+    }
+    const ranked = [];
+    for (const el of candidates) {
+      if (!visible(el)) continue;
+      const desc = descriptor(el);
+      if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
+      const semantic = el.tagName === "DIALOG" || el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
+      const matched = OVERLAY_TERMS.filter((term) => termMatch(desc, term));
+      const rect = el.getBoundingClientRect();
+      const areaRatio = Math.min(1, (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight));
+      if (!semantic && !matched.length && areaRatio < 0.30) continue;
+      const fingerprint = norm(desc).slice(0, 320) + "|" + Math.round(rect.width) + "x" + Math.round(rect.height) + "|" + Math.round(rect.left) + "," + Math.round(rect.top);
+      if (BASELINE.has(fingerprint)) continue;
+      const style = getComputedStyle(el);
+      const z = Number.parseInt(style.zIndex || "0", 10) || 0;
+      const score = (semantic ? 30 : 0) + matched.length * 10 + Math.round(areaRatio * 20) + Math.min(10, Math.max(0, z / 100));
+      ranked.push({ el, desc, matched, fingerprint, score, rect });
+    }
+    ranked.sort((a, b) => b.score - a.score);
+    const selected = ranked[0];
+    if (!selected) return null;
+    const id = "overlay-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    selected.el.setAttribute(ATTR, id);
+    const rect = selected.el.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(window.innerWidth, rect.right);
+    const bottom = Math.min(window.innerHeight, rect.bottom);
+    return {
+      id,
+      fingerprint: selected.fingerprint,
+      descriptor: selected.desc.slice(0, 1600),
+      matched_terms: selected.matched,
+      page_url: location.href,
+      viewport_x: left,
+      viewport_y: top,
+      page_x: window.scrollX + left,
+      page_y: window.scrollY + top,
+      width: Math.max(1, right - left),
+      height: Math.max(1, bottom - top),
+      element_width: rect.width,
+      element_height: rect.height,
+      clipped_to_viewport: rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight,
+    };
+  })()`, 30000);
+}
+
+async function waitForInteractiveUrl(client, expectedUrl, timeoutSeconds = 10) {
+  const maximumMs = Math.max(1000, Math.min(30000, Number(timeoutSeconds || 10) * 1000));
+  const started = Date.now();
+  while (Date.now() - started < maximumMs) {
+    const currentUrl = await evaluate(client, "location.href");
+    if (currentUrl === expectedUrl) return { matched: true, elapsed_ms: Date.now() - started, current_url: currentUrl };
+    await delay(150);
+  }
+  return { matched: false, elapsed_ms: Date.now() - started, current_url: await evaluate(client, "location.href") };
+}
+
+async function waitForInteractiveOpenResult(client, config, baselineFingerprints, originalUrl) {
+  const maximumMs = Math.max(1000, Math.min(60000, Number(config?.open_timeout_seconds || 10) * 1000));
+  const started = Date.now();
+  while (Date.now() - started < maximumMs) {
+    const overlay = await findInteractiveOverlay(client, config, baselineFingerprints);
+    if (overlay) {
+      return { kind: "overlay", opened: true, elapsed_ms: Date.now() - started, overlay, current_url: await evaluate(client, "location.href") };
+    }
+    const currentUrl = await evaluate(client, "location.href");
+    if (currentUrl && currentUrl !== originalUrl) {
+      let sameOrigin = false;
+      try { sameOrigin = new URL(currentUrl).origin === new URL(originalUrl).origin; } catch { sameOrigin = false; }
+      return {
+        kind: sameOrigin ? "route_navigation" : "cross_origin_navigation",
+        opened: false,
+        elapsed_ms: Date.now() - started,
+        overlay: null,
+        current_url: currentUrl,
+      };
+    }
+    await delay(150);
+  }
+  return { kind: "timeout", opened: false, elapsed_ms: Date.now() - started, overlay: null, current_url: await evaluate(client, "location.href") };
+}
+
+async function findInteractiveCloseControl(client, config, overlayId) {
+  const whitelist = normalizeInteractiveRules(config?.whitelist_rules);
+  const blacklist = normalizeInteractiveRules(config?.blacklist_rules);
+  const closeTerms = interactiveRulesForCategory(whitelist, "close");
+  const blockedTerms = [...interactiveRulesForCategory(blacklist, "close"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const CLOSE_TERMS = ${JSON.stringify(closeTerms)};
+    const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
+    const overlay = document.querySelector('[data-wavi-interactive-overlay=${JSON.stringify(String(overlayId || ""))}]');
+    if (!overlay) return null;
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const visible = (el) => {
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 12 && rect.height >= 12 && rect.bottom > 0 && rect.top < window.innerHeight;
+    };
+    const descriptor = (el) => [
+      el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.getAttribute("aria-controls"),
+      el.id, el.className, el.getAttribute("title"), el.getAttribute("data-testid"),
+      el.getAttribute("data-action"), el.innerText
+    ].join(" ").slice(0, 1200);
+    const ranked = [];
+    for (const el of overlay.querySelectorAll("button,a,[role='button'],[tabindex]:not([tabindex='-1']),[onclick]")) {
+      if (!visible(el) || el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
+      const desc = descriptor(el);
+      if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
+      const matched = CLOSE_TERMS.filter((term) => termMatch(desc, term));
+      if (!matched.length) continue;
+      const rect = el.getBoundingClientRect();
+      const upperRightBonus = rect.top < window.innerHeight * 0.35 && rect.left > window.innerWidth * 0.55 ? 5 : 0;
+      ranked.push({ el, desc, matched, score: matched.length * 10 + upperRightBonus, rect });
+    }
+    ranked.sort((a, b) => b.score - a.score);
+    const selected = ranked[0];
+    if (!selected) return null;
+    selected.el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const rect = selected.el.getBoundingClientRect();
+    return {
+      descriptor: selected.desc,
+      matched_terms: selected.matched,
+      x: Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2)),
+      y: Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2)),
+    };
+  })()`, 30000);
+}
+
+async function findInteractivePageCloseControl(client, config) {
+  const whitelist = normalizeInteractiveRules(config?.whitelist_rules);
+  const blacklist = normalizeInteractiveRules(config?.blacklist_rules);
+  const closeTerms = interactiveRulesForCategory(whitelist, "close");
+  const blockedTerms = [...interactiveRulesForCategory(blacklist, "close"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const CLOSE_TERMS = ${JSON.stringify(closeTerms)};
+    const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const termMatch = (haystack, term) => {
+      const raw = String(haystack || "").toLowerCase();
+      const rawTerm = String(term || "").toLowerCase().trim();
+      const h = norm(haystack); const t = norm(rawTerm);
+      if (!rawTerm) return false;
+      if (!t) return raw.includes(rawTerm);
+      const exactWords = (" " + h + " ").includes(" " + t + " ");
+      const punctuatedRaw = /[^a-z0-9\s]/.test(rawTerm) && raw.includes(rawTerm);
+      return t.length <= 4 ? (exactWords || punctuatedRaw) : (exactWords || h.includes(t) || punctuatedRaw);
+    };
+    const visible = (el) => {
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 12 && rect.height >= 12 && rect.bottom > 0 && rect.top < window.innerHeight;
+    };
+    const descriptor = (el) => [
+      el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.getAttribute("aria-controls"),
+      el.id, el.className, el.getAttribute("title"), el.getAttribute("data-testid"),
+      el.getAttribute("data-action"), el.getAttribute("href"), el.innerText
+    ].join(" ").slice(0, 1200);
+    const ranked = [];
+    for (const el of document.querySelectorAll("button,a,[role='button'],[tabindex]:not([tabindex='-1']),[onclick]")) {
+      if (!visible(el) || el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
+      if (el.closest("form")) continue;
+      const desc = descriptor(el);
+      if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
+      const matched = CLOSE_TERMS.filter((term) => termMatch(desc, term));
+      if (!matched.length) continue;
+      const rect = el.getBoundingClientRect();
+      const upperRightBonus = rect.top < window.innerHeight * 0.35 && rect.left > window.innerWidth * 0.55 ? 8 : 0;
+      const href = String(el.getAttribute("href") || "");
+      const linkBonus = href && (href === "#" || href.startsWith("/")) ? 2 : 0;
+      ranked.push({ el, desc, matched, score: matched.length * 10 + upperRightBonus + linkBonus, rect });
+    }
+    ranked.sort((a, b) => b.score - a.score);
+    const selected = ranked[0];
+    if (!selected) return null;
+    selected.el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    const rect = selected.el.getBoundingClientRect();
+    return {
+      descriptor: selected.desc,
+      matched_terms: selected.matched,
+      x: Math.max(1, Math.min(window.innerWidth - 1, rect.left + rect.width / 2)),
+      y: Math.max(1, Math.min(window.innerHeight - 1, rect.top + rect.height / 2)),
+    };
+  })()`, 30000);
+}
+
+async function waitForInteractiveOverlayClosed(client, overlayId, timeoutSeconds) {
+  const maximumMs = Math.max(1000, Math.min(30000, Number(timeoutSeconds || 5) * 1000));
+  const started = Date.now();
+  while (Date.now() - started < maximumMs) {
+    const closed = await evaluate(client, `(() => {
+      const el = document.querySelector('[data-wavi-interactive-overlay=${JSON.stringify(String(overlayId || ""))}]');
+      if (!el || !el.isConnected) return true;
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display === "none" || style.visibility === "hidden" || Number(style.opacity || 1) <= 0.02 || rect.width < 2 || rect.height < 2;
+    })()`);
+    if (closed) return { closed: true, elapsed_ms: Date.now() - started };
+    await delay(150);
+  }
+  return { closed: false, elapsed_ms: Date.now() - started };
+}
+
+async function dismissInteractiveOverlay(client, config, overlay) {
+  let closeControl = null;
+  let closeControlError = "";
+  try {
+    closeControl = await findInteractiveCloseControl(client, config, overlay?.id);
+  } catch (error) {
+    closeControlError = String(error?.message || error);
+  }
+  if (closeControl) {
+    try {
+      await dispatchMouseClick(client, closeControl);
+      const result = await waitForInteractiveOverlayClosed(client, overlay?.id, config?.close_timeout_seconds);
+      if (result.closed) {
+        return {
+          ...result,
+          method: "matched_close_control",
+          close_control: closeControl,
+          close_control_error: closeControlError || undefined,
+        };
+      }
+    } catch (error) {
+      closeControlError = String(error?.message || error);
+    }
+  }
+  await dispatchEscapeKey(client);
+  const escapeResult = await waitForInteractiveOverlayClosed(client, overlay?.id, config?.close_timeout_seconds);
+  return {
+    ...escapeResult,
+    method: escapeResult.closed ? "escape" : "failed",
+    close_control: closeControl || null,
+    close_control_error: closeControlError || undefined,
+  };
+}
+
+
+function interactiveMediaReadyTimeoutMs(contentWaitMs) {
+  const base = Math.max(5000, Number(contentWaitMs) || 0);
+  return Math.max(3000, Math.min(15000, base));
+}
+
+async function inspectInteractiveMediaState(client, options = {}) {
+  const scope = String(options?.scope || "page");
+  const overlayId = scope === "overlay" ? String(options?.overlayId || "") : "";
+  return await evaluate(client, `(() => {
+    const SCOPE = ${JSON.stringify(scope)};
+    const OVERLAY_ID = ${JSON.stringify(overlayId)};
+    const root = SCOPE === "overlay"
+      ? document.querySelector('[data-wavi-interactive-overlay=' + JSON.stringify(String(OVERLAY_ID || "")) + ']')
+      : document.body;
+    const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const visible = (el) => {
+      if (!(el instanceof Element)) return false;
+      const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || 1) > 0.02 && rect.width >= 16 && rect.height >= 16 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth;
+    };
+    if (!root) {
+      return {
+        root_found: false,
+        scope: SCOPE,
+        media_candidate_count: 0,
+        ready_media_count: 0,
+        image_ready_count: 0,
+        video_ready_count: 0,
+        background_media_count: 0,
+        background_ready_count: 0,
+        loading_indicator_count: 0,
+        signature: "missing-root",
+      };
+    }
+
+    const mediaNodes = new Set();
+    for (const el of root.querySelectorAll("img,video,canvas,svg,picture img")) mediaNodes.add(el);
+    const loadingNodes = new Set();
+    for (const selector of [
+      "[aria-busy='true']", "[role='progressbar']", "[class*='loading' i]", "[class*='loader' i]",
+      "[class*='spinner' i]", "[class*='skeleton' i]", "[id*='loading' i]", "[id*='spinner' i]",
+      "[data-testid*='loading' i]", "[data-testid*='spinner' i]", "[data-testid*='skeleton' i]"
+    ]) {
+      for (const el of root.querySelectorAll(selector)) loadingNodes.add(el);
+    }
+
+    let visibleMedia = 0;
+    let readyMedia = 0;
+    let readyImages = 0;
+    let readyVideos = 0;
+    let backgroundMedia = 0;
+    let backgroundReady = 0;
+    let maxMediaArea = 0;
+
+    for (const el of mediaNodes) {
+      if (!visible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      const area = Math.round(rect.width * rect.height);
+      if (area > maxMediaArea) maxMediaArea = area;
+      visibleMedia += 1;
+      const tag = String(el.tagName || "").toLowerCase();
+      if (tag === "img") {
+        if (el.complete && Number(el.naturalWidth || 0) > 0 && Number(el.naturalHeight || 0) > 0) {
+          readyMedia += 1;
+          readyImages += 1;
+        }
+      } else if (tag === "video") {
+        const hasFrame = Number(el.readyState || 0) >= 2 && Number(el.videoWidth || 0) > 0 && Number(el.videoHeight || 0) > 0;
+        const hasPoster = Boolean(el.poster) && rect.width >= 40 && rect.height >= 40;
+        if (hasFrame || hasPoster) {
+          readyMedia += 1;
+          readyVideos += 1;
+        }
+      } else if (tag === "canvas") {
+        if (Number(el.width || 0) > 0 && Number(el.height || 0) > 0) readyMedia += 1;
+      } else if (tag === "svg") {
+        if (rect.width >= 24 && rect.height >= 24) readyMedia += 1;
+      }
+    }
+
+    for (const el of Array.from(root.querySelectorAll("*"))) {
+      if (!visible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 80) continue;
+      const style = getComputedStyle(el);
+      const bg = String(style.backgroundImage || "");
+      if (!bg || bg === "none") continue;
+      backgroundMedia += 1;
+      backgroundReady += 1;
+      const area = Math.round(rect.width * rect.height);
+      if (area > maxMediaArea) maxMediaArea = area;
+    }
+
+    let loadingCount = 0;
+    for (const el of loadingNodes) {
+      if (!visible(el)) continue;
+      const desc = norm([
+        el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.id, el.className,
+        el.getAttribute("title"), el.getAttribute("data-testid"), el.textContent
+      ].join(" "));
+      if (desc.includes("loading") || desc.includes("spinner") || desc.includes("progress") || desc.includes("skeleton") || el.getAttribute("aria-busy") === "true" || el.getAttribute("role") === "progressbar") {
+        loadingCount += 1;
+      }
+    }
+
+    const candidateCount = visibleMedia + backgroundMedia;
+    const readyCount = readyMedia + backgroundReady;
+    return {
+      root_found: true,
+      scope: SCOPE,
+      media_candidate_count: candidateCount,
+      ready_media_count: readyCount,
+      image_ready_count: readyImages,
+      video_ready_count: readyVideos,
+      background_media_count: backgroundMedia,
+      background_ready_count: backgroundReady,
+      loading_indicator_count: loadingCount,
+      max_media_area: maxMediaArea,
+      current_url: location.href,
+      signature: [candidateCount, readyCount, readyImages, readyVideos, backgroundMedia, loadingCount, maxMediaArea].join("|"),
+    };
+  })()`, 30000);
+}
+
+async function waitForInteractiveMediaReady(client, options = {}) {
+  const minimumWaitMs = Math.max(0, Math.min(30000, Number(options?.minimum_wait_ms) || 0));
+  const timeoutMs = Math.max(1000, Math.min(30000, Number(options?.timeout_ms) || interactiveMediaReadyTimeoutMs(minimumWaitMs)));
+  const pollMs = Math.max(150, Math.min(1000, Number(options?.poll_ms) || 250));
+  if (minimumWaitMs) await delay(minimumWaitMs);
+  const started = Date.now();
+  let lastState = null;
+  let lastSignature = "";
+  let stableCount = 0;
+  while (Date.now() - started < timeoutMs) {
+    const state = await inspectInteractiveMediaState(client, options);
+    lastState = state;
+    if (state?.signature && state.signature === lastSignature) stableCount += 1;
+    else stableCount = 1;
+    lastSignature = String(state?.signature || "");
+
+    const noLoading = Number(state?.loading_indicator_count || 0) === 0;
+    const hasReadyMedia = Number(state?.ready_media_count || 0) > 0;
+    const hasMediaCandidates = Number(state?.media_candidate_count || 0) > 0;
+    const stableEnough = stableCount >= 3;
+
+    if (state?.root_found === false) {
+      return { ready: false, reason: "root_not_found", elapsed_ms: Date.now() - started, stable_polls: stableCount, ...(state || {}) };
+    }
+    if (noLoading && hasReadyMedia && stableEnough) {
+      return { ready: true, reason: "ready_media_stable", elapsed_ms: Date.now() - started, stable_polls: stableCount, ...(state || {}) };
+    }
+    if (noLoading && !hasMediaCandidates && stableEnough) {
+      return { ready: true, reason: "stable_without_media_candidates", elapsed_ms: Date.now() - started, stable_polls: stableCount, ...(state || {}) };
+    }
+    if (noLoading && hasMediaCandidates && Number(state?.ready_media_count || 0) >= Number(state?.media_candidate_count || 0) && stableEnough) {
+      return { ready: true, reason: "all_visible_media_ready", elapsed_ms: Date.now() - started, stable_polls: stableCount, ...(state || {}) };
+    }
+    await delay(pollMs);
+  }
+  return { ready: false, reason: "timeout", elapsed_ms: Date.now() - started, stable_polls: stableCount, ...(lastState || {}) };
+}
+
+function normalizeInteractiveMetadataSegment(value) {
+  return decodeURIComponent(String(value || "").trim()).replace(/^@+/, "").trim();
+}
+
+function parseInteractiveRouteMetadata(urlLike) {
+  const fallback = { profile: "", contentId: "", source_url: String(urlLike || "") };
+  if (!urlLike) return fallback;
+  try {
+    const url = new URL(String(urlLike));
+    const segments = url.pathname
+      .split("/")
+      .filter(Boolean)
+      .map(normalizeInteractiveMetadataSegment)
+      .filter(Boolean);
+    const lowerSegments = segments.map((value) => value.toLowerCase());
+    const queryId = normalizeInteractiveMetadataSegment(
+      url.searchParams.get("id") ||
+      url.searchParams.get("media_id") ||
+      url.searchParams.get("post_id") ||
+      url.searchParams.get("content_id") ||
+      "",
+    );
+    const markers = new Set([
+      "reel", "reels", "photo", "photos", "p", "post", "posts", "tv", "video", "videos",
+      "story", "stories", "highlight", "highlights", "media",
+    ]);
+    const profileFirstMarkers = new Set(["story", "stories", "highlight", "highlights"]);
+    const reservedSingleSegments = new Set([
+      "document", "explore", "accounts", "account", "login", "logout", "settings", "about", "help", "privacy", "terms",
+    ]);
+
+    let profile = "";
+    let contentId = queryId;
+    for (let i = 0; i < segments.length; i += 1) {
+      const marker = lowerSegments[i];
+      if (!markers.has(marker)) continue;
+
+      if (i > 0 && !markers.has(lowerSegments[i - 1])) {
+        profile = profile || segments[i - 1];
+      } else if (i === 0 && profileFirstMarkers.has(marker) && segments[i + 1]) {
+        profile = profile || segments[i + 1];
+      }
+
+      if (!contentId) {
+        if (i === 0 && profileFirstMarkers.has(marker)) {
+          contentId = segments[i + 2] || "";
+        } else {
+          contentId = segments[i + 1] || "";
+        }
+      }
+    }
+
+    if (!profile && segments.length === 1 && !reservedSingleSegments.has(lowerSegments[0])) {
+      profile = segments[0];
+    }
+    if (!profile && segments.length >= 2 && !markers.has(lowerSegments[0]) && !reservedSingleSegments.has(lowerSegments[0])) {
+      profile = segments[0];
+    }
+
+    return {
+      profile: profile || "",
+      contentId: contentId || "",
+      source_url: url.href,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function extractInteractiveDescriptorUrls(descriptor) {
+  const matches = String(descriptor || "").match(/https?:\/\/[^\s"'<>]+/gi) || [];
+  return matches.slice(0, 10);
+}
+
+function deriveInteractiveFilenameMetadata(trigger, currentUrl, fallbackUrl) {
+  const candidates = [
+    trigger?.href,
+    currentUrl,
+    fallbackUrl,
+    ...extractInteractiveDescriptorUrls(trigger?.descriptor),
+  ].filter(Boolean);
+  const parsedCandidates = candidates.map(parseInteractiveRouteMetadata);
+  const complete = parsedCandidates.find((parsed) => parsed.profile && parsed.contentId);
+  if (complete) return complete;
+
+  const profileResult = parsedCandidates.find((parsed) => parsed.profile);
+  const contentResult = parsedCandidates.find((parsed) => parsed.contentId);
+  return {
+    profile: profileResult?.profile || "",
+    contentId: contentResult?.contentId || "",
+    source_url: contentResult?.source_url || profileResult?.source_url || "",
+  };
+}
+
+function deriveWebpageProfile(...urlLikes) {
+  for (const urlLike of urlLikes) {
+    const parsed = parseInteractiveRouteMetadata(urlLike);
+    if (parsed.profile) return parsed.profile;
+  }
+  return "unknown-profile";
+}
+
+function renderInteractiveItemBaseName(config, fileNamingContext, itemNumber, metadata) {
+  const template = String(config?.interactive_capture?.filename_template || "%datetime%_%domain%_%title%_interactive-%overlayindex%");
+  const resolvedMetadata = metadata || { profile: "", contentId: "" };
+  return renderFilenameTemplate(template, {
+    date: new Date(),
+    domain: fileNamingContext?.domain || "unknown-domain",
+    title: fileNamingContext?.title || "untitled",
+    index: Number(fileNamingContext?.index) || 1,
+    overlayIndex: Number(itemNumber) || 1,
+    profile: resolvedMetadata.profile || "unknown-profile",
+    contentId: resolvedMetadata.contentId || "unknown-content",
+    mode: fileNamingContext?.mode || "full_page",
+    caseName: fileNamingContext?.caseName || "",
+  });
+}
+
+async function captureInteractiveOverlayArtifacts(client, config, outputFolder, baseName, itemNumber, overlay) {
+  const artifacts = [];
+  const captureScope = normalizeInteractiveCaptureScope(config?.capture_scope);
+
+  if (captureScope !== "viewport_only") {
+    const overlayPath = await uniqueOutputPath(outputFolder, `${baseName}_overlay`, ".png");
+    const overlayResult = await client.send("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: true,
+      clip: {
+        x: Math.max(0, Number(overlay.page_x) || 0),
+        y: Math.max(0, Number(overlay.page_y) || 0),
+        width: Math.max(1, Number(overlay.width) || 1),
+        height: Math.max(1, Number(overlay.height) || 1),
+        scale: 1,
+      },
+    }, 120000);
+    const overlayRecord = await writeCaptureImage(overlayPath, overlayResult.data);
+    artifacts.push({
+      kind: "interactive_overlay_png",
+      role: "interactive_overlay",
+      format: "png",
+      item: itemNumber,
+      path: overlayPath,
+      sha256: overlayRecord.sha256,
+      size_bytes: overlayRecord.bytes,
+      x_css_px: overlay.page_x,
+      y_css_px: overlay.page_y,
+      width_css_px: overlay.width,
+      height_css_px: overlay.height,
+      clipped_to_viewport: Boolean(overlay.clipped_to_viewport),
+      capture_mode: "overlay_clip",
+    });
+  }
+
+  if (captureScope !== "overlay_only") {
+    const viewportPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
+    const viewportResult = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true }, 120000);
+    const viewportRecord = await writeCaptureImage(viewportPath, viewportResult.data);
+    artifacts.push({
+      kind: "interactive_viewport_png",
+      role: "interactive_viewport",
+      format: "png",
+      item: itemNumber,
+      path: viewportPath,
+      sha256: viewportRecord.sha256,
+      size_bytes: viewportRecord.bytes,
+      capture_mode: captureScope === "viewport_only" ? "viewport_only" : "overlay_clip_with_viewport",
+    });
+  }
+  return artifacts;
+}
+
+async function captureInteractiveRouteArtifacts(client, config, outputFolder, baseName, itemNumber) {
+  const artifacts = [];
+  const captureScope = normalizeInteractiveCaptureScope(config?.capture_scope);
+  const viewportResult = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true }, 120000);
+
+  if (captureScope !== "viewport_only") {
+    const overlayPath = await uniqueOutputPath(outputFolder, `${baseName}_overlay`, ".png");
+    const overlayRecord = await writeCaptureImage(overlayPath, viewportResult.data);
+    artifacts.push({
+      kind: "interactive_overlay_png",
+      role: "interactive_overlay",
+      format: "png",
+      item: itemNumber,
+      path: overlayPath,
+      sha256: overlayRecord.sha256,
+      size_bytes: overlayRecord.bytes,
+      capture_mode: "route_viewport",
+    });
+  }
+
+  if (captureScope !== "overlay_only") {
+    const viewportPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
+    const viewportRecord = await writeCaptureImage(viewportPath, viewportResult.data);
+    artifacts.push({
+      kind: "interactive_viewport_png",
+      role: "interactive_viewport",
+      format: "png",
+      item: itemNumber,
+      path: viewportPath,
+      sha256: viewportRecord.sha256,
+      size_bytes: viewportRecord.bytes,
+      capture_mode: "route_viewport",
+    });
+  }
+  return artifacts;
+}
+
+async function restoreInteractiveScrollPosition(client, x, y) {
+  try {
+    await evaluate(client, `window.scrollTo(${JSON.stringify(Number(x) || 0)}, ${JSON.stringify(Number(y) || 0)}); true`);
+  } catch {
+    // Best effort only.
+  }
+}
+
+async function recoverInteractiveNavigation(client, originalUrl, timeoutSeconds = 10) {
+  const current = await evaluate(client, "location.href");
+  if (!current || current === originalUrl) return { needed: false, recovered: true, current_url: current || originalUrl, method: "none" };
+  let sameOrigin = false;
+  try { sameOrigin = new URL(current).origin === new URL(originalUrl).origin; } catch { sameOrigin = false; }
+  if (!sameOrigin) return { needed: true, recovered: false, current_url: current, reason: "cross_origin_navigation", method: "none" };
+  await evaluate(client, "history.back(); true");
+  const waitResult = await waitForInteractiveUrl(client, originalUrl, timeoutSeconds);
+  return waitResult.matched
+    ? { needed: true, recovered: true, current_url: waitResult.current_url, elapsed_ms: waitResult.elapsed_ms, method: "history_back" }
+    : { needed: true, recovered: false, current_url: waitResult.current_url, reason: "history_back_timeout", elapsed_ms: waitResult.elapsed_ms, method: "history_back" };
+}
+
+async function dismissInteractiveRouteView(client, config, originalUrl, scrollState = {}) {
+  const closeControl = await findInteractivePageCloseControl(client, config);
+  if (closeControl) {
+    await dispatchMouseClick(client, closeControl);
+    const waitResult = await waitForInteractiveUrl(client, originalUrl, config?.close_timeout_seconds);
+    if (waitResult.matched) {
+      await restoreInteractiveScrollPosition(client, scrollState.x, scrollState.y);
+      return { closed: true, elapsed_ms: waitResult.elapsed_ms, method: "matched_close_control", close_control: closeControl, current_url: waitResult.current_url };
+    }
+  }
+  await evaluate(client, "history.back(); true");
+  const historyResult = await waitForInteractiveUrl(client, originalUrl, config?.close_timeout_seconds || config?.open_timeout_seconds || 10);
+  if (historyResult.matched) {
+    await restoreInteractiveScrollPosition(client, scrollState.x, scrollState.y);
+    return { closed: true, elapsed_ms: historyResult.elapsed_ms, method: "history_back", close_control: closeControl || null, current_url: historyResult.current_url };
+  }
+  return { closed: false, elapsed_ms: historyResult.elapsed_ms, method: "failed", close_control: closeControl || null, current_url: historyResult.current_url };
+}
+
+function buildInteractiveCaptureReport(settings, state) {
+  return {
+    enabled: true,
+    capture_scope: normalizeInteractiveCaptureScope(settings.capture_scope),
+    maximum_items: state.maximum_items,
+    maximum_candidate_attempts: state.maximum_candidate_attempts,
+    maximum_consecutive_noncaptures: state.maximum_consecutive_noncaptures,
+    whitelist_filename: String(settings.whitelist_filename || "interactive-whitelist.txt"),
+    blacklist_filename: String(settings.blacklist_filename || "interactive-blacklist.txt"),
+    whitelist_rule_count: normalizeInteractiveRules(settings.whitelist_rules).length,
+    blacklist_rule_count: normalizeInteractiveRules(settings.blacklist_rules).length,
+    built_in_block_term_count: IMMUTABLE_INTERACTIVE_BLOCK_TERMS.length,
+    captured_items: state.captured_items,
+    processed_candidates: state.processed_candidates,
+    attempted_candidates: state.attempted_candidates,
+    consecutive_noncaptures: state.consecutive_noncaptures,
+    scan_steps: state.scan_steps,
+    scan_wait_ms: state.scan_wait_ms,
+    stopped_reason: state.stopped_reason,
+    report_in_progress: Boolean(state.report_in_progress),
+    records: state.records,
+    warnings: state.warnings,
+  };
+}
+
+async function persistInteractiveCaptureReport(reportPath, settings, state) {
+  const report = buildInteractiveCaptureReport(settings, state);
+  await Deno.writeTextFile(reportPath, JSON.stringify(report, null, 2) + "\n");
+  return report;
+}
+
+function isWaviTemporaryPdfDocumentUrl(urlLike) {
+  try {
+    const url = new URL(String(urlLike || ""));
+    const loopback = ["127.0.0.1", "localhost", "::1", "[::1]"].includes(String(url.hostname || "").toLowerCase());
+    return loopback && /^\/[a-f0-9]{32}\/document\/?$/i.test(String(url.pathname || ""));
+  } catch {
+    return false;
+  }
+}
+
+async function performInteractiveOverlayCapture(client, config, outputFolder, baseName, fileNamingContext = {}) {
+  const settings = config?.interactive_capture || {};
+  if (!settings.enabled) {
+    return {
+      enabled: false,
+      artifacts: [],
+      records: [],
+      warnings: [],
+      captured_items: 0,
+      processed_candidates: 0,
+      note: "Interactive overlay capture was disabled.",
+    };
+  }
+
+  const interactiveStartUrl = await evaluate(client, "location.href");
+  if (isWaviTemporaryPdfDocumentUrl(interactiveStartUrl)) {
+    const warning = "Interactive overlay capture was skipped because Chromium was on WAVI's temporary Captured PNG PDF document instead of the live source page.";
+    console.log(warning);
+    return {
+      enabled: true,
+      artifacts: [],
+      records: [],
+      warnings: [warning],
+      captured_items: 0,
+      processed_candidates: 0,
+      attempted_candidates: 0,
+      scan_steps: 0,
+      stopped_reason: "temporary_pdf_document_detected",
+      error: "",
+    };
+  }
+
+  const maximumItems = Math.max(1, Math.min(500, Number(settings.maximum_items) || 25));
+  const maximumCandidateAttempts = Math.max(maximumItems, Math.min(1000, Math.max(40, maximumItems * 8)));
+  const maximumConsecutiveNonCaptures = Math.max(5, Math.min(25, Math.ceil(Math.max(maximumItems, 10) / 2)));
+  const contentWaitMs = Math.max(0, Math.min(30000, Number(settings.content_wait_ms) || 0));
+  const scanStepPercent = Math.max(25, Math.min(100, Number(settings.scan_step_percent) || 75));
+  const scanWaitMs = Math.max(250, Math.min(3000, Number(config.scroll_wait_ms) || 500));
+  const processed = new Set();
+  const artifacts = [];
+  const records = [];
+  const warnings = [];
+  const originalState = await evaluate(client, `({ url: location.href, x: window.scrollX, y: window.scrollY })`);
+  const reportPath = await uniqueOutputPath(outputFolder, `${baseName}_interactive-report`, ".json");
+  let capturedItems = 0;
+  let attemptedCandidates = 0;
+  let consecutiveNonCaptures = 0;
+  let scanSteps = 0;
+  let reachedEnd = false;
+  let stoppedReason = "no_more_matching_items";
+
+  const persist = async (reportInProgress = true) => await persistInteractiveCaptureReport(reportPath, settings, {
+    maximum_items: maximumItems,
+    maximum_candidate_attempts: maximumCandidateAttempts,
+    maximum_consecutive_noncaptures: maximumConsecutiveNonCaptures,
+    captured_items: capturedItems,
+    processed_candidates: processed.size,
+    attempted_candidates: attemptedCandidates,
+    consecutive_noncaptures: consecutiveNonCaptures,
+    scan_steps: scanSteps,
+    scan_wait_ms: scanWaitMs,
+    stopped_reason: stoppedReason,
+    report_in_progress: reportInProgress,
+    records,
+    warnings,
+  });
+
+  console.log(
+    `Interactive overlay capture started: maximum ${maximumItems} capture(s), ` +
+    `${maximumCandidateAttempts} candidate attempt(s), stop after ${maximumConsecutiveNonCaptures} consecutive non-captures.`
+  );
+  await persist(true);
+
+  await evaluate(client, "window.scrollTo(0, 0); true");
+  await delay(250);
+
+  while (capturedItems < maximumItems && scanSteps <= 250 && attemptedCandidates < maximumCandidateAttempts) {
+    const trigger = await discoverInteractiveTrigger(client, settings, processed);
+    if (!trigger) {
+      const scan = await evaluate(client, `(() => {
+        const before = window.scrollY;
+        const maximum = Math.max(0, (document.scrollingElement || document.documentElement).scrollHeight - window.innerHeight);
+        const step = Math.max(100, Math.round(window.innerHeight * ${JSON.stringify(scanStepPercent / 100)}));
+        const next = Math.min(maximum, before + step);
+        window.scrollTo(0, next);
+        return { before, next, maximum, at_end: next >= maximum - 2 };
+      })()`);
+      scanSteps += 1;
+      if (scanSteps <= 5 || scanSteps % 10 === 0) {
+        console.log(`Interactive scan step ${scanSteps}: no matching trigger in the current view; scrolling for more items.`);
+      }
+      if (scan?.at_end && Math.abs(Number(scan.next) - Number(scan.before)) < 2) {
+        reachedEnd = true;
+        break;
+      }
+      if (scanSteps <= 3 || scanSteps % 10 === 0) await persist(true);
+      await delay(scanWaitMs);
+      continue;
+    }
+
+    attemptedCandidates += 1;
+    processed.add(trigger.fingerprint);
+    const itemRecord = {
+      candidate: records.length + 1,
+      item: capturedItems + 1,
+      trigger,
+      opened: false,
+      captured: false,
+      dismissed: false,
+      status: "pending",
+      interaction_kind: "unknown",
+      artifacts: [],
+    };
+    console.log(
+      `Interactive candidate ${itemRecord.candidate}: validating ${trigger.href || trigger.descriptor || "matched item"} before click.`
+    );
+    const baseline = await getInteractiveOverlayFingerprints(client, settings.whitelist_rules);
+    await delay(150);
+    const preClickValidation = await validateInteractiveTriggerBeforeClick(client, settings, trigger);
+    itemRecord.pre_click_validation = preClickValidation;
+    itemRecord.final_hit_tested_element = preClickValidation?.hit_tested_element || null;
+    if (!preClickValidation?.allowed) {
+      itemRecord.status = "click_skipped_safety";
+      itemRecord.error = String(preClickValidation?.reason || "pre_click_validation_failed");
+      records.push(itemRecord);
+      consecutiveNonCaptures += 1;
+      warnings.push(`Interactive candidate ${itemRecord.candidate} was skipped by the pre-click safety check: ${itemRecord.error}.`);
+      console.log(`Interactive candidate ${itemRecord.candidate}: skipped by safety check (${itemRecord.error}).`);
+      await persist(true);
+      if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
+        stoppedReason = "maximum_consecutive_noncaptures_reached";
+        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        break;
+      }
+      continue;
+    }
+    console.log(`Interactive candidate ${itemRecord.candidate}: safety validation passed; clicking selected media control.`);
+    try {
+      await dispatchMouseClick(client, preClickValidation);
+    } catch (error) {
+      itemRecord.status = "click_failed";
+      itemRecord.error = String(error?.message || error);
+      records.push(itemRecord);
+      consecutiveNonCaptures += 1;
+      warnings.push(`Interactive candidate ${itemRecord.candidate} could not be clicked: ${itemRecord.error}`);
+      console.log(`Interactive candidate ${itemRecord.candidate}: click failed.`);
+      await persist(true);
+      if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
+        stoppedReason = "maximum_consecutive_noncaptures_reached";
+        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        break;
+      }
+      continue;
+    }
+
+    const opened = await waitForInteractiveOpenResult(client, settings, baseline, trigger.page_url_before);
+    itemRecord.open_wait_ms = opened.elapsed_ms;
+
+    if (opened.kind === "overlay" && opened.overlay) {
+      itemRecord.opened = true;
+      itemRecord.interaction_kind = "overlay";
+      itemRecord.overlay = opened.overlay;
+      console.log(`Interactive candidate ${itemRecord.candidate}: overlay detected.`);
+      const refreshedOverlay = await findInteractiveOverlay(client, settings, []);
+      const activeOverlay = refreshedOverlay || opened.overlay;
+      itemRecord.media_readiness = await waitForInteractiveMediaReady(client, {
+        scope: "overlay",
+        overlayId: activeOverlay?.id,
+        minimum_wait_ms: contentWaitMs,
+        timeout_ms: interactiveMediaReadyTimeoutMs(contentWaitMs),
+      });
+      console.log(
+        `Interactive candidate ${itemRecord.candidate}: media readiness ${itemRecord.media_readiness.ready ? "ready" : "timed out"} ` +
+        `(${String(itemRecord.media_readiness.reason || "unknown").replaceAll("_", " ")}; ` +
+        `${Number(itemRecord.media_readiness.ready_media_count) || 0}/${Number(itemRecord.media_readiness.media_candidate_count) || 0} media ready).`
+      );
+      if (!itemRecord.media_readiness.ready) {
+        warnings.push(`Interactive candidate ${itemRecord.candidate} media readiness timed out before capture; WAVI captured the best available view.`);
+      }
+      try {
+        const interactiveCurrentUrl = await evaluate(client, "location.href");
+        itemRecord.filename_metadata = deriveInteractiveFilenameMetadata(
+          trigger,
+          interactiveCurrentUrl,
+          fileNamingContext?.sourceUrl || "",
+        );
+        const interactiveBaseName = renderInteractiveItemBaseName(
+          config,
+          fileNamingContext,
+          itemRecord.item,
+          itemRecord.filename_metadata,
+        );
+        const itemArtifacts = await captureInteractiveOverlayArtifacts(
+          client, settings, outputFolder, interactiveBaseName, itemRecord.item, activeOverlay,
+        );
+        artifacts.push(...itemArtifacts);
+        itemRecord.artifacts = itemArtifacts.map((artifact) => ({
+          kind: artifact.kind,
+          path: basename(artifact.path),
+          sha256: artifact.sha256,
+          size_bytes: artifact.size_bytes,
+          capture_mode: artifact.capture_mode,
+        }));
+        itemRecord.captured = true;
+        itemRecord.status = "captured";
+        capturedItems += 1;
+        consecutiveNonCaptures = 0;
+        console.log(`Interactive candidate ${itemRecord.candidate}: overlay captured.`);
+      } catch (error) {
+        itemRecord.status = "capture_failed";
+        itemRecord.error = String(error?.message || error);
+        consecutiveNonCaptures += 1;
+        warnings.push(`Interactive candidate ${itemRecord.candidate} overlay capture failed: ${itemRecord.error}`);
+        console.log(`Interactive candidate ${itemRecord.candidate}: overlay capture failed.`);
+      }
+
+      const dismissal = await dismissInteractiveOverlay(client, settings, activeOverlay);
+      itemRecord.dismissal = dismissal;
+      itemRecord.dismissed = Boolean(dismissal.closed);
+      if (!dismissal.closed) {
+        itemRecord.status = itemRecord.captured ? "captured_overlay_not_closed" : "overlay_not_closed";
+        records.push(itemRecord);
+        warnings.push(`Interactive candidate ${itemRecord.candidate} overlay could not be dismissed safely; automatic overlay capture stopped.`);
+        console.log(`Interactive candidate ${itemRecord.candidate}: overlay could not be dismissed safely.`);
+        stoppedReason = "overlay_close_failed";
+        await persist(true);
+        break;
+      }
+      console.log(`Interactive candidate ${itemRecord.candidate}: overlay dismissed by ${dismissal.method}.`);
+      records.push(itemRecord);
+      await persist(true);
+      await delay(250);
+      continue;
+    }
+
+    if (opened.kind === "route_navigation") {
+      itemRecord.interaction_kind = "route_navigation";
+      itemRecord.route_url = opened.current_url;
+      console.log(`Interactive candidate ${itemRecord.candidate}: same-origin route opened at ${opened.current_url}.`);
+      itemRecord.media_readiness = await waitForInteractiveMediaReady(client, {
+        scope: "page",
+        minimum_wait_ms: contentWaitMs,
+        timeout_ms: interactiveMediaReadyTimeoutMs(contentWaitMs),
+      });
+      console.log(
+        `Interactive candidate ${itemRecord.candidate}: media readiness ${itemRecord.media_readiness.ready ? "ready" : "timed out"} ` +
+        `(${String(itemRecord.media_readiness.reason || "unknown").replaceAll("_", " ")}; ` +
+        `${Number(itemRecord.media_readiness.ready_media_count) || 0}/${Number(itemRecord.media_readiness.media_candidate_count) || 0} media ready).`
+      );
+      if (!itemRecord.media_readiness.ready) {
+        warnings.push(`Interactive candidate ${itemRecord.candidate} media readiness timed out before capture; WAVI captured the best available route view.`);
+      }
+      try {
+        itemRecord.filename_metadata = deriveInteractiveFilenameMetadata(
+          trigger,
+          opened.current_url,
+          fileNamingContext?.sourceUrl || "",
+        );
+        const interactiveBaseName = renderInteractiveItemBaseName(
+          config,
+          fileNamingContext,
+          itemRecord.item,
+          itemRecord.filename_metadata,
+        );
+        const itemArtifacts = await captureInteractiveRouteArtifacts(
+          client, settings, outputFolder, interactiveBaseName, itemRecord.item,
+        );
+        artifacts.push(...itemArtifacts);
+        itemRecord.artifacts = itemArtifacts.map((artifact) => ({
+          kind: artifact.kind,
+          path: basename(artifact.path),
+          sha256: artifact.sha256,
+          size_bytes: artifact.size_bytes,
+          capture_mode: artifact.capture_mode,
+        }));
+        itemRecord.captured = true;
+        itemRecord.status = "captured_route_view";
+        capturedItems += 1;
+        consecutiveNonCaptures = 0;
+        console.log(`Interactive candidate ${itemRecord.candidate}: route view captured.`);
+      } catch (error) {
+        itemRecord.status = "route_capture_failed";
+        itemRecord.error = String(error?.message || error);
+        consecutiveNonCaptures += 1;
+        warnings.push(`Interactive candidate ${itemRecord.candidate} route-view capture failed: ${itemRecord.error}`);
+        console.log(`Interactive candidate ${itemRecord.candidate}: route-view capture failed.`);
+      }
+
+      const dismissal = await dismissInteractiveRouteView(client, settings, trigger.page_url_before, {
+        x: trigger.scroll_x_before,
+        y: trigger.scroll_y_before,
+      });
+      itemRecord.dismissal = dismissal;
+      itemRecord.dismissed = Boolean(dismissal.closed);
+      if (!dismissal.closed) {
+        itemRecord.status = itemRecord.captured ? "captured_route_not_closed" : "route_not_closed";
+        records.push(itemRecord);
+        warnings.push(`Interactive candidate ${itemRecord.candidate} route view could not be dismissed safely; automatic overlay capture stopped.`);
+        console.log(`Interactive candidate ${itemRecord.candidate}: route view could not be dismissed safely.`);
+        stoppedReason = "route_close_failed";
+        await persist(true);
+        break;
+      }
+      console.log(`Interactive candidate ${itemRecord.candidate}: route view dismissed by ${dismissal.method}.`);
+      records.push(itemRecord);
+      await persist(true);
+      await delay(250);
+      continue;
+    }
+
+    if (opened.kind === "cross_origin_navigation") {
+      itemRecord.interaction_kind = "cross_origin_navigation";
+      itemRecord.navigation_recovery = {
+        needed: true,
+        recovered: false,
+        current_url: opened.current_url,
+        reason: "cross_origin_navigation",
+      };
+      itemRecord.status = "cross_origin_navigation";
+      records.push(itemRecord);
+      consecutiveNonCaptures += 1;
+      warnings.push(`Interactive candidate ${itemRecord.candidate} navigated cross-origin; automatic overlay capture skipped that item.`);
+      console.log(`Interactive candidate ${itemRecord.candidate}: cross-origin navigation skipped.`);
+      await persist(true);
+      if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
+        stoppedReason = "maximum_consecutive_noncaptures_reached";
+        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        break;
+      }
+      continue;
+    }
+
+    const recovery = await recoverInteractiveNavigation(client, trigger.page_url_before, settings.open_timeout_seconds);
+    itemRecord.navigation_recovery = recovery;
+    itemRecord.interaction_kind = recovery.needed ? "navigation_recovery" : "no_overlay_detected";
+    itemRecord.status = recovery.needed ? "navigation_instead_of_overlay" : "overlay_not_detected";
+    records.push(itemRecord);
+    consecutiveNonCaptures += 1;
+    console.log(
+      recovery.needed
+        ? `Interactive candidate ${itemRecord.candidate}: no overlay detected; returned by ${recovery.method || "history back"}.`
+        : `Interactive candidate ${itemRecord.candidate}: no supported overlay or route detected.`
+    );
+    if (recovery.needed && !recovery.recovered) {
+      warnings.push(`Interactive candidate ${itemRecord.candidate} navigated away and WAVI could not safely return; automatic overlay capture stopped.`);
+      stoppedReason = "navigation_recovery_failed";
+      await persist(true);
+      break;
+    }
+    await persist(true);
+    if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
+      stoppedReason = "maximum_consecutive_noncaptures_reached";
+      warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+      break;
+    }
+  }
+
+  if (capturedItems >= maximumItems) stoppedReason = "maximum_items_reached";
+  else if (attemptedCandidates >= maximumCandidateAttempts && stoppedReason === "no_more_matching_items") stoppedReason = "maximum_candidate_attempts_reached";
+  else if (reachedEnd && stoppedReason === "no_more_matching_items") stoppedReason = "end_of_page_reached";
+  if (scanSteps > 250) stoppedReason = "maximum_scan_steps_reached";
+
+  const unsuccessfulCandidates = records.filter((record) => !record.captured).length;
+  if (capturedItems === 0) {
+    warnings.push("Interactive overlay capture produced no overlay images; no safely matching item opened a supported overlay or route view.");
+  } else if (unsuccessfulCandidates > 0) {
+    warnings.push(
+      `Interactive overlay capture skipped or could not capture ${unsuccessfulCandidates} of ${records.length} processed candidate(s); review the interaction report.`
+    );
+  }
+  if (stoppedReason === "maximum_scan_steps_reached") {
+    warnings.push("Interactive overlay capture reached its bounded page-scan limit before confirming the end of the page.");
+  }
+  if (stoppedReason === "maximum_candidate_attempts_reached") {
+    warnings.push("Interactive overlay capture reached its bounded candidate-attempt limit before reaching the maximum item count.");
+  }
+  if (stoppedReason === "maximum_consecutive_noncaptures_reached") {
+    warnings.push("Interactive overlay capture stopped after too many consecutive non-captures.");
+  }
+
+  try {
+    const current = await evaluate(client, "location.href");
+    if (current === originalState.url) {
+      await restoreInteractiveScrollPosition(client, originalState.x, originalState.y);
+    }
+  } catch {
+    // Restoring the prior position is best effort.
+  }
+
+  await persist(false);
+  const reportInfo = await Deno.stat(reportPath);
+  artifacts.push({
+    kind: "interactive_capture_report_json",
+    role: "interactive_capture_report",
+    path: reportPath,
+    sha256: await sha256File(reportPath),
+    size_bytes: reportInfo.size,
+  });
+  console.log(
+    `Interactive overlay capture finished: ${capturedItems} capture(s) from ${records.length} processed candidate(s); ` +
+    `stop reason: ${String(stoppedReason || "unknown").replaceAll("_", " ")}.`
+  );
+  return {
+    ...buildInteractiveCaptureReport(settings, {
+      maximum_items: maximumItems,
+      maximum_candidate_attempts: maximumCandidateAttempts,
+      maximum_consecutive_noncaptures: maximumConsecutiveNonCaptures,
+      captured_items: capturedItems,
+      processed_candidates: processed.size,
+      attempted_candidates: attemptedCandidates,
+      consecutive_noncaptures: consecutiveNonCaptures,
+      scan_steps: scanSteps,
+      scan_wait_ms: scanWaitMs,
+      stopped_reason: stoppedReason,
+      report_in_progress: false,
+      records,
+      warnings,
+    }),
+    artifacts,
+  };
+}
+
+
 async function captureUrl(client, config, url, index, browserVersion, runContext, attemptInfo = {}) {
   const startedAt = nowIso();
   const warnings = [];
@@ -3488,6 +5115,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       domain,
       title: pageInfo.title,
       index,
+      profile: deriveWebpageProfile(pageInfo.final_url, url),
       mode: captureMode,
       caseName: config.case_name || "",
     });
@@ -3510,6 +5138,17 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       used: null,
     };
     let scrollResult = { performed: false, reason: "Initial viewport-only capture does not scroll before capture." };
+    let interactiveCapture = {
+      enabled: Boolean(config.interactive_capture?.enabled),
+      artifacts: [],
+      records: [],
+      warnings: [],
+      captured_items: 0,
+      processed_candidates: 0,
+      scan_steps: 0,
+      stopped_reason: config.interactive_capture?.enabled ? "not_started" : "disabled",
+      error: "",
+    };
     try {
       stabilizationInfo = await applyCaptureStabilization(client, config);
       const initialMetrics = await client.send("Page.getLayoutMetrics");
@@ -3577,6 +5216,43 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     } finally {
       stabilizationCleanup = await cleanupCaptureStabilization(client);
     }
+    // Interactive capture must run while Chromium is still on the live source page.
+    // Captured PNG PDF generation may navigate to WAVI's temporary loopback /document page.
+    if (config.interactive_capture?.enabled) {
+      try {
+        interactiveCapture = await performInteractiveOverlayCapture(
+          client, config, runContext.webMediaFolder, baseName,
+          { date: captureDate, domain, title: pageInfo.title, index, mode: captureMode, caseName: config.case_name || "", sourceUrl: url },
+        );
+        for (const interactiveWarning of interactiveCapture.warnings || []) {
+          warnings.push(interactiveWarning);
+          console.log(interactiveWarning);
+        }
+        if ((interactiveCapture.warnings || []).length) warningReasons.push("interactive_capture_warning");
+        console.log(
+          `Interactive overlay capture: ${Number(interactiveCapture.captured_items) || 0} captured from ` +
+          `${Number(interactiveCapture.processed_candidates) || 0} candidate(s); stop reason: ` +
+          `${String(interactiveCapture.stopped_reason || "unknown").replaceAll("_", " ")}.`,
+        );
+      } catch (error) {
+        const message = `Interactive overlay capture failed: ${error.message || error}`;
+        interactiveCapture = {
+          enabled: true,
+          artifacts: [],
+          records: [],
+          warnings: [message],
+          captured_items: 0,
+          processed_candidates: 0,
+          scan_steps: 0,
+          stopped_reason: "capture_error",
+          error: message,
+        };
+        warnings.push(message);
+        warningReasons.push("interactive_capture_failed");
+        console.log(message);
+      }
+    }
+
     const pdfArtifacts = [];
     let pdfError = "";
     let pdfBehaviorInfo = {
@@ -3650,7 +5326,17 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       console.log(message);
     }
 
-    const allArtifacts = [...capture.artifacts, ...pdfArtifacts, ...supplementalEvidence.artifacts];
+    const securityMetadata = await getCurrentSecurityMetadata(
+      client, pageInfo, mainResponse, securityState, config.network_query_mode,
+    );
+
+
+    const allArtifacts = [
+      ...capture.artifacts,
+      ...pdfArtifacts,
+      ...supplementalEvidence.artifacts,
+      ...(interactiveCapture.artifacts || []),
+    ];
     if (readinessInfo.timeouts.length) warningReasons.push("readiness_timeout");
     const requestedArtifactErrors = [];
     if (pdfError) {
@@ -3658,6 +5344,9 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       requestedArtifactErrors.push({ artifact: "pdf", error: pdfError });
     }
     requestedArtifactErrors.push(...supplementalEvidence.errors);
+    if (interactiveCapture.error) {
+      requestedArtifactErrors.push({ artifact: "interactive_overlay_capture", error: interactiveCapture.error });
+    }
     const captureCompleteness = buildCaptureCompleteness(
       partialReasons, warningReasons, warnings, requestedArtifactErrors, capture.artifacts.length,
     );
@@ -3759,6 +5448,33 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
           ? "The GUI records the requested and final URL in the app-level Webpage Capture SQLite archive after this capture completes successfully."
           : "The app-level Universal Download Archive setting was disabled for this run.",
       },
+      interactive_capture: {
+        enabled: Boolean(config.interactive_capture?.enabled),
+        capture_scope: normalizeInteractiveCaptureScope(config.interactive_capture?.capture_scope),
+        maximum_items: Math.max(1, Math.min(500, Number(config.interactive_capture?.maximum_items) || 25)),
+        open_timeout_seconds: Math.max(1, Math.min(60, Number(config.interactive_capture?.open_timeout_seconds) || 10)),
+        content_wait_ms: Math.max(0, Math.min(30000, Number(config.interactive_capture?.content_wait_ms) || 0)),
+        close_timeout_seconds: Math.max(1, Math.min(30, Number(config.interactive_capture?.close_timeout_seconds) || 5)),
+        scan_step_percent: Math.max(25, Math.min(100, Number(config.interactive_capture?.scan_step_percent) || 75)),
+        whitelist_filename: String(config.interactive_capture?.whitelist_filename || "interactive-whitelist.txt"),
+        blacklist_filename: String(config.interactive_capture?.blacklist_filename || "interactive-blacklist.txt"),
+        whitelist_rule_count: normalizeInteractiveRules(config.interactive_capture?.whitelist_rules).length,
+        blacklist_rule_count: normalizeInteractiveRules(config.interactive_capture?.blacklist_rules).length,
+        built_in_block_term_count: IMMUTABLE_INTERACTIVE_BLOCK_TERMS.length,
+        captured_items: Number(interactiveCapture.captured_items) || 0,
+        processed_candidates: Number(interactiveCapture.processed_candidates) || 0,
+        scan_steps: Number(interactiveCapture.scan_steps) || 0,
+        stopped_reason: String(interactiveCapture.stopped_reason || ""),
+        record_count: Array.isArray(interactiveCapture.records) ? interactiveCapture.records.length : 0,
+        warnings: Array.isArray(interactiveCapture.warnings) ? interactiveCapture.warnings : [],
+        error: String(interactiveCapture.error || ""),
+        report_created: Array.isArray(interactiveCapture.artifacts) && interactiveCapture.artifacts.some(
+          (artifact) => artifact.kind === "interactive_capture_report_json",
+        ),
+        note: config.interactive_capture?.enabled
+          ? "Candidate controls were selected using the packaged editable whitelist and blacklist plus immutable high-risk action exclusions; user-entered CSS selectors were not required."
+          : "Interactive overlay capture was disabled.",
+      },
       evidence_outputs: {
         requested: supplementalEvidence.requested,
         network_query_mode: normalizeNetworkQueryMode(config.network_query_mode),
@@ -3772,9 +5488,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         sensitive_headers_redacted: ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie"],
         request_bodies_recorded: false,
       },
-      security_metadata: await getCurrentSecurityMetadata(
-        client, pageInfo, mainResponse, securityState, config.network_query_mode,
-      ),
+      security_metadata: securityMetadata,
       pdf_options: {
         enabled: Boolean(config.create_pdf),
         landscape: Boolean(config.pdf_landscape),
@@ -4052,6 +5766,20 @@ async function main() {
       `reload without cache ${config.reload_without_cache ? "on" : "off"}.`,
     );
     await log(`Capture retries: ${Math.max(0, Math.min(2, Number(config.capture_retry_count) || 0))}`);
+    if (config.interactive_capture?.enabled) {
+      await log(
+        `Interactive overlays: enabled (${normalizeInteractiveCaptureScope(config.interactive_capture.capture_scope).replaceAll("_", " ")}; ` +
+        `maximum ${Math.max(1, Math.min(500, Number(config.interactive_capture.maximum_items) || 25))} item(s); ` +
+        `${normalizeInteractiveRules(config.interactive_capture.whitelist_rules).length} whitelist / ` +
+        `${normalizeInteractiveRules(config.interactive_capture.blacklist_rules).length} blacklist rules).`,
+      );
+      await log(
+        `Interactive rule files: ${String(config.interactive_capture.whitelist_filename || "interactive-whitelist.txt")} and ` +
+        `${String(config.interactive_capture.blacklist_filename || "interactive-blacklist.txt")}.`,
+      );
+    } else {
+      await log("Interactive overlays: disabled.");
+    }
     const evidenceLabels = [];
     if (config.save_mhtml) evidenceLabels.push("MHTML");
     if (config.save_response_html) evidenceLabels.push("final response HTML");

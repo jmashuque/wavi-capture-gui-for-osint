@@ -31,7 +31,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v2.2026.0722"
+APP_VERSION = "v3.2026.0725"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -51,7 +51,7 @@ OUTPUT_LOG_ALL_MAX_CHARS = 6 * 1024 * 1024
 OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
-SETTINGS_SCHEMA_VERSION = 43
+SETTINGS_SCHEMA_VERSION = 44
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -63,6 +63,8 @@ WEB_URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-web-url-box.txt")
 UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-download-archive.txt")
 IMAGE_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-gallerydl-archive.sqlite3")
 WEB_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-webcapture-archive.sqlite3")
+WEB_INTERACTIVE_WHITELIST_FILE = os.path.join(ROOT, "interactive-whitelist.txt")
+WEB_INTERACTIVE_BLACKLIST_FILE = os.path.join(ROOT, "interactive-blacklist.txt")
 GUI_TEMP_DIR = os.path.join(ROOT, "gui-temp")
 DEBUG_LOG_FILE = os.path.join(ROOT, "gui-debug.log")
 JOBS_FILE_VERSION = 2
@@ -173,6 +175,14 @@ DEFAULTS = {
     "web_disable_transitions": False,
     "web_hide_scrollbars": False,
     "web_fixed_sticky_behavior": "preserve_layout",
+    "web_interactive_capture_enabled": False,
+    "web_interactive_capture_scope": "overlay_only",
+    "web_interactive_max_items": "25",
+    "web_interactive_open_timeout": "10",
+    "web_interactive_content_wait_ms": "1500",
+    "web_interactive_close_timeout": "5",
+    "web_interactive_scan_step_percent": "75",
+    "web_interactive_filename_template": "%datetime%_%domain%_%title%_interactive-%overlayindex%",
     "web_save_mhtml": False,
     "web_save_response_html": False,
     "web_save_rendered_dom": False,
@@ -455,6 +465,8 @@ url_view_mode = "all"
 url_all_view_cache = []
 domain_preset_window = None
 case_browser_reload_after_id = None
+case_browser_root_watch_after_id = None
+case_browser_loaded_root_state = None
 case_browser_active_token = None
 case_browser_result_queue = queue.Queue()
 case_browser_result_poller_running = False
@@ -797,6 +809,7 @@ CASE_BROWSER_COMPACT_PREVIEW_DELAY_MS = 600
 CASE_BROWSER_COMPACT_PREVIEW_MAX_WIDTH = 320
 CASE_BROWSER_COMPACT_PREVIEW_MAX_HEIGHT = 240
 CASE_BROWSER_COMPACT_PREVIEW_WRAP = 460
+CASE_BROWSER_ROOT_WATCH_INTERVAL_MS = 1000
 GUI_LOG_FLUSH_INTERVAL_MS = 75
 GUI_LOG_FLUSH_MAX_ITEMS = 300
 GUI_LOG_FLUSH_MAX_CHARS = 120_000
@@ -1684,6 +1697,10 @@ def get_theme_colors():
             "select_fg": "#FFFFFF",
             "button_bg": "#333333",
             "button_active": "#404040",
+            "main_tab_inactive": "#303030",
+            "main_tab_active": "#3A3A3A",
+            "main_tab_selected": "#1E1E1E",
+            "main_tab_border": "#555555",
             "preflight_fg": "#7DB7FF",
             "start_fg": "#63C46B",
             "stop_fg": "#FF6B6B",
@@ -1703,12 +1720,103 @@ def get_theme_colors():
         "select_fg": "#FFFFFF",
         "button_bg": "#F0F0F0",
         "button_active": "#E5E5E5",
+        "main_tab_inactive": "#D0D0D0",
+        "main_tab_active": "#E4E4E4",
+        "main_tab_selected": "#FFFFFF",
+        "main_tab_border": "#B5B5B5",
         "preflight_fg": "#003366",
         "start_fg": "green",
         "stop_fg": "red",
         "copy_fg": "#8A6500",
         "text_insert": "#000000",
     }
+
+
+MAIN_TAB_STYLE_IMAGES = {}
+MAIN_TAB_STYLE_ELEMENT = "WaviMainNotebook.tab"
+
+
+def paint_main_tab_style_image(image, fill_color, border_color):
+    """Paint a scalable tab background image with a visible one-pixel edge."""
+    try:
+        width = max(4, int(image.width()))
+        height = max(4, int(image.height()))
+        image.put(border_color, to=(0, 0, width, height))
+        image.put(fill_color, to=(1, 1, width - 1, height - 1))
+    except Exception:
+        pass
+
+
+def replace_ttk_layout_element(layout_items, old_name, new_name):
+    replaced = []
+    for element_name, options in layout_items:
+        copied_options = dict(options)
+        children = copied_options.get("children")
+        if children:
+            copied_options["children"] = replace_ttk_layout_element(children, old_name, new_name)
+        if element_name == old_name:
+            element_name = new_name
+        replaced.append((element_name, copied_options))
+    return replaced
+
+
+def configure_main_notebook_tab_style(style, colors):
+    """Use image-backed tab fills because native Windows ttk themes ignore tab background maps."""
+    for name in ("inactive", "active", "selected"):
+        if name not in MAIN_TAB_STYLE_IMAGES:
+            MAIN_TAB_STYLE_IMAGES[name] = tk.PhotoImage(master=root, width=18, height=18)
+
+    paint_main_tab_style_image(
+        MAIN_TAB_STYLE_IMAGES["inactive"],
+        colors["main_tab_inactive"],
+        colors["main_tab_border"],
+    )
+    paint_main_tab_style_image(
+        MAIN_TAB_STYLE_IMAGES["active"],
+        colors["main_tab_active"],
+        colors["main_tab_border"],
+    )
+    paint_main_tab_style_image(
+        MAIN_TAB_STYLE_IMAGES["selected"],
+        colors["main_tab_selected"],
+        colors["main_tab_border"],
+    )
+
+    try:
+        style.element_create(
+            MAIN_TAB_STYLE_ELEMENT,
+            "image",
+            MAIN_TAB_STYLE_IMAGES["inactive"],
+            ("selected", MAIN_TAB_STYLE_IMAGES["selected"]),
+            ("active", MAIN_TAB_STYLE_IMAGES["active"]),
+            border=2,
+            sticky="nsew",
+        )
+    except tk.TclError:
+        # The custom element already exists in the active theme.
+        pass
+
+    try:
+        base_layout = style.layout("TNotebook.Tab")
+        custom_layout = replace_ttk_layout_element(
+            base_layout,
+            "Notebook.tab",
+            MAIN_TAB_STYLE_ELEMENT,
+        )
+        style.layout("Bottom.TNotebook.Tab", custom_layout)
+    except Exception:
+        pass
+
+    style.configure(
+        "Bottom.TNotebook.Tab",
+        foreground=colors["fg"],
+        padding=(14, 7),
+        borderwidth=0,
+    )
+    style.map(
+        "Bottom.TNotebook.Tab",
+        foreground=[("selected", colors["fg"]), ("disabled", colors["disabled"])],
+    )
 
 
 def mark_theme_dynamic_container(widget):
@@ -1911,6 +2019,7 @@ def apply_app_theme():
             background=[("selected", colors["field"]), ("active", colors["button_active"])],
             foreground=[("selected", colors["fg"]), ("disabled", colors["disabled"])],
         )
+        configure_main_notebook_tab_style(style, colors)
         style.configure("Treeview", background=colors["field"], fieldbackground=colors["field"], foreground=colors["fg"])
         style.configure("Treeview.Heading", background=colors["panel"], foreground=colors["fg"])
 
@@ -2352,8 +2461,12 @@ WEB_FILENAME_TAGS = [
     ("%domain%", "example.com"),
     ("%title%", "Sample Page Title"),
     ("%index%", "001"),
+    ("%urlindex%", "001"),
+    ("%profile%", "sample-profile"),
     ("%mode%", "full-page"),
 ]
+
+WEB_INTERACTIVE_FILENAME_TAGS = WEB_FILENAME_TAGS + [("%overlayindex%", "001"), ("%contentid%", "content-12345")]
 
 
 def filename_template_has_ext_placeholder(template):
@@ -3220,6 +3333,14 @@ def build_web_case_summary_text(exit_code, submitted_url_count, paths, versions,
         f"  Environment: {display_web_environment_preset(settings.get('web_environment_preset', DEFAULTS['web_environment_preset']))}; {settings.get('web_viewport_width', DEFAULTS['web_viewport_width'])} × {settings.get('web_viewport_height', DEFAULTS['web_viewport_height'])}; scale {settings.get('web_device_scale_factor', DEFAULTS['web_device_scale_factor'])}",
         f"  Readiness: {_web_readiness_event_label(settings.get('web_readiness_event'))}; network quiet {settings.get('web_network_quiet_ms', DEFAULTS['web_network_quiet_ms'])} ms; settle limit {settings.get('web_network_settle_timeout', DEFAULTS['web_network_settle_timeout'])} seconds",
         f"  Lazy-load scrolling: {_summary_enabled(settings.get('web_lazy_scroll', DEFAULTS['web_lazy_scroll']))}",
+        (
+            f"  Interactive overlays: Enabled; output "
+            f"{get_web_interactive_capture_scope_label(settings.get('web_interactive_capture_scope', DEFAULTS['web_interactive_capture_scope']))}; "
+            f"maximum {settings.get('web_interactive_max_items', DEFAULTS['web_interactive_max_items'])} items; "
+            f"filename template {settings.get('web_interactive_filename_template', DEFAULTS['web_interactive_filename_template'])}; packaged whitelist/blacklist rules"
+            if settings.get('web_interactive_capture_enabled', DEFAULTS['web_interactive_capture_enabled'])
+            else "  Interactive overlays: Disabled"
+        ),
         (
             f"  PDF: {_summary_enabled(settings.get('web_create_pdf', DEFAULTS['web_create_pdf']))}; "
             f"source {get_web_pdf_capture_mode_label(settings.get('web_pdf_capture_mode'))}; "
@@ -5861,6 +5982,14 @@ def get_settings_dict():
         "web_disable_transitions": bool(web_disable_transitions_var.get()),
         "web_hide_scrollbars": bool(web_hide_scrollbars_var.get()),
         "web_fixed_sticky_behavior": web_fixed_sticky_behavior_var.get() if web_fixed_sticky_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_fixed_sticky_behavior"],
+        "web_interactive_capture_enabled": bool(web_interactive_capture_enabled_var.get()),
+        "web_interactive_capture_scope": normalize_web_interactive_capture_scope(web_interactive_capture_scope_var.get()),
+        "web_interactive_max_items": normalize_positive_int_string(web_interactive_max_items_var.get(), DEFAULTS["web_interactive_max_items"]),
+        "web_interactive_open_timeout": normalize_positive_int_string(web_interactive_open_timeout_var.get(), DEFAULTS["web_interactive_open_timeout"]),
+        "web_interactive_content_wait_ms": normalize_nonnegative_int_string(web_interactive_content_wait_ms_var.get(), DEFAULTS["web_interactive_content_wait_ms"]),
+        "web_interactive_close_timeout": normalize_positive_int_string(web_interactive_close_timeout_var.get(), DEFAULTS["web_interactive_close_timeout"]),
+        "web_interactive_scan_step_percent": normalize_positive_int_string(web_interactive_scan_step_percent_var.get(), DEFAULTS["web_interactive_scan_step_percent"]),
+        "web_interactive_filename_template": web_interactive_filename_template_var.get().strip(),
         "web_save_mhtml": bool(web_save_mhtml_var.get()),
         "web_save_response_html": bool(web_save_response_html_var.get()),
         "web_save_rendered_dom": bool(web_save_rendered_dom_var.get()),
@@ -6155,6 +6284,15 @@ def apply_settings_dict(settings):
     web_hide_scrollbars_var.set(bool(settings.get("web_hide_scrollbars", DEFAULTS["web_hide_scrollbars"])))
     saved_web_fixed_behavior = str(settings.get("web_fixed_sticky_behavior", DEFAULTS["web_fixed_sticky_behavior"]) or DEFAULTS["web_fixed_sticky_behavior"]).strip()
     web_fixed_sticky_behavior_var.set(saved_web_fixed_behavior if saved_web_fixed_behavior in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_fixed_sticky_behavior"])
+    web_interactive_capture_enabled_var.set(bool(settings.get("web_interactive_capture_enabled", DEFAULTS["web_interactive_capture_enabled"])))
+    saved_interactive_scope = str(settings.get("web_interactive_capture_scope", DEFAULTS["web_interactive_capture_scope"]) or DEFAULTS["web_interactive_capture_scope"]).strip()
+    web_interactive_capture_scope_var.set(display_web_interactive_capture_scope(saved_interactive_scope))
+    web_interactive_max_items_var.set(normalize_positive_int_string(settings.get("web_interactive_max_items", DEFAULTS["web_interactive_max_items"]), DEFAULTS["web_interactive_max_items"]))
+    web_interactive_open_timeout_var.set(normalize_positive_int_string(settings.get("web_interactive_open_timeout", DEFAULTS["web_interactive_open_timeout"]), DEFAULTS["web_interactive_open_timeout"]))
+    web_interactive_content_wait_ms_var.set(normalize_nonnegative_int_string(settings.get("web_interactive_content_wait_ms", DEFAULTS["web_interactive_content_wait_ms"]), DEFAULTS["web_interactive_content_wait_ms"]))
+    web_interactive_close_timeout_var.set(normalize_positive_int_string(settings.get("web_interactive_close_timeout", DEFAULTS["web_interactive_close_timeout"]), DEFAULTS["web_interactive_close_timeout"]))
+    web_interactive_scan_step_percent_var.set(normalize_positive_int_string(settings.get("web_interactive_scan_step_percent", DEFAULTS["web_interactive_scan_step_percent"]), DEFAULTS["web_interactive_scan_step_percent"]))
+    web_interactive_filename_template_var.set(settings.get("web_interactive_filename_template", DEFAULTS["web_interactive_filename_template"]))
     web_save_mhtml_var.set(bool(settings.get("web_save_mhtml", DEFAULTS["web_save_mhtml"])))
     web_save_response_html_var.set(bool(settings.get("web_save_response_html", DEFAULTS["web_save_response_html"])))
     web_save_rendered_dom_var.set(bool(settings.get("web_save_rendered_dom", DEFAULTS["web_save_rendered_dom"])))
@@ -6195,6 +6333,8 @@ def apply_settings_dict(settings):
     web_pdf_max_parts_var.set(normalize_positive_int_string(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]), DEFAULTS["web_pdf_max_parts"]))
     try:
         update_web_pdf_options_state()
+        update_web_interactive_options_state()
+        update_web_interactive_filename_template_preview()
         update_web_evidence_options_state()
         update_web_case_folder_preview()
         update_web_options_summary()
@@ -9968,6 +10108,7 @@ def start_capture():
             safe_after(0, lambda: start_button.config(state="normal"))
             safe_after(0, lambda: start_menu_button.config(state="normal"))
             safe_after(0, lambda: stop_button.config(state="disabled"))
+            safe_after(0, schedule_case_browser_autoload, 250)
 
     start_daemon_thread("worker", worker)
 
@@ -12979,6 +13120,7 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     job.pop("_interruption_requested", None)
 
     refresh_job_queue_window()
+    schedule_case_browser_autoload(delay_ms=250)
 
     if not get_running_queue_jobs():
         start_button.config(state="normal")
@@ -15030,6 +15172,11 @@ def on_notebook_tab_changed(_event=None):
             except Exception:
                 pass
 
+    if selected_label == "Case Browser":
+        try:
+            ensure_case_browser_output_root_current(delay_ms=50)
+        except Exception as e:
+            log_debug_exception("Case Browser tab refresh check failed", e)
 
 
 
@@ -19526,6 +19673,8 @@ class LazyTreeviewThumbnailPreview:
 BROWSER_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
 BROWSER_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".opus", ".wav", ".aac", ".flac"}
 BROWSER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif"}
+BROWSER_PDF_EXTENSIONS = {".pdf"}
+BROWSER_SIDECAR_EXTENSIONS = {".json", ".txt", ".description", ".url", ".webloc", ".srt", ".vtt", ".log", ".csv"}
 
 
 def is_browser_video_file(path):
@@ -19540,8 +19689,20 @@ def is_browser_image_file(path):
     return os.path.splitext(path)[1].lower() in BROWSER_IMAGE_EXTENSIONS
 
 
+def is_browser_pdf_file(path):
+    return os.path.splitext(path)[1].lower() in BROWSER_PDF_EXTENSIONS
+
+
 def is_browser_media_file(path):
     return is_browser_video_file(path) or is_browser_audio_file(path) or is_browser_image_file(path)
+
+
+def is_browser_case_file(path):
+    return (
+        is_browser_media_file(path)
+        or is_browser_pdf_file(path)
+        or os.path.splitext(path)[1].lower() in BROWSER_SIDECAR_EXTENSIONS
+    )
 
 
 def enqueue_case_browser_ui(callback):
@@ -19627,6 +19788,69 @@ def show_case_browser_placeholder(message):
         pass
 
 
+def get_case_browser_output_root_state(value=None):
+    raw_path = output_root_var.get().strip() if value is None else str(value or "").strip()
+    if not raw_path:
+        return ("", False)
+
+    try:
+        normalized = os.path.normcase(
+            os.path.abspath(os.path.expanduser(os.path.expandvars(raw_path)))
+        )
+    except Exception:
+        normalized = raw_path
+
+    try:
+        exists = os.path.isdir(raw_path)
+    except Exception:
+        exists = False
+
+    return (normalized, bool(exists))
+
+
+def ensure_case_browser_output_root_current(delay_ms=100):
+    if get_case_browser_output_root_state() != case_browser_loaded_root_state:
+        schedule_case_browser_autoload(delay_ms=delay_ms)
+
+
+def poll_case_browser_output_root():
+    global case_browser_root_watch_after_id
+
+    case_browser_root_watch_after_id = None
+    if APP_CLOSING:
+        return
+
+    try:
+        ensure_case_browser_output_root_current(delay_ms=100)
+    except Exception as e:
+        log_debug_exception("Case Browser Output Root watcher failed", e)
+
+    try:
+        case_browser_root_watch_after_id = safe_after(
+            CASE_BROWSER_ROOT_WATCH_INTERVAL_MS,
+            poll_case_browser_output_root,
+        )
+    except Exception as e:
+        log_debug_exception("Case Browser Output Root watcher scheduling failed", e)
+        case_browser_root_watch_after_id = None
+
+
+def start_case_browser_output_root_watcher():
+    global case_browser_root_watch_after_id
+
+    if case_browser_root_watch_after_id or APP_CLOSING:
+        return
+
+    try:
+        case_browser_root_watch_after_id = safe_after(
+            250,
+            poll_case_browser_output_root,
+        )
+    except Exception as e:
+        log_debug_exception("Could not start Case Browser Output Root watcher", e)
+        case_browser_root_watch_after_id = None
+
+
 def schedule_case_browser_autoload(delay_ms=500):
     global case_browser_reload_after_id
 
@@ -19656,9 +19880,10 @@ def on_output_root_changed(*args):
 
 
 def open_case_browser(select_tab=True, silent=False):
-    global case_browser_active_token
+    global case_browser_active_token, case_browser_loaded_root_state
 
     output_root = output_root_var.get().strip()
+    case_browser_loaded_root_state = get_case_browser_output_root_state(output_root)
     load_token = object()
     case_browser_active_token = load_token
 
@@ -19886,7 +20111,7 @@ def open_case_browser(select_tab=True, silent=False):
     filter_menu = ttk.Combobox(
         browser_controls,
         textvariable=browser_filter_var,
-        values=["All", "Media", "Video", "Audio", "Metadata/JSON", "Logs/Text", "Subtitles", "Images", "URL shortcuts"],
+        values=["All", "Media", "Video", "Audio", "Images", "PDFs", "Metadata/JSON", "Logs/Text", "Subtitles", "URL shortcuts"],
         state="readonly",
         width=16,
     )
@@ -20251,7 +20476,7 @@ def open_case_browser(select_tab=True, silent=False):
         ext = os.path.splitext(path)[1].lower()
 
         if selected_filter == "All":
-            return is_browser_media_file(path) or ext in {".json", ".txt", ".description", ".url", ".webloc", ".srt", ".vtt", ".log", ".csv"}
+            return is_browser_case_file(path)
 
         if selected_filter == "Media":
             return is_browser_media_file(path)
@@ -20273,6 +20498,9 @@ def open_case_browser(select_tab=True, silent=False):
 
         if selected_filter == "Images":
             return is_browser_image_file(path)
+
+        if selected_filter == "PDFs":
+            return is_browser_pdf_file(path)
 
         if selected_filter == "URL shortcuts":
             return ext in {".url", ".webloc"}
@@ -20354,6 +20582,8 @@ def open_case_browser(select_tab=True, silent=False):
             return "Audio"
         if is_browser_image_file(path):
             return "Image"
+        if is_browser_pdf_file(path):
+            return "PDF"
         if ext in {".json", ".csv"}:
             return "Metadata"
         if ext in {".log", ".txt", ".description"}:
@@ -20404,7 +20634,7 @@ def open_case_browser(select_tab=True, silent=False):
             elif os.path.normcase(os.path.abspath(folder_path)) == os.path.normcase(os.path.abspath(output_root)):
                 message = "No captured case files found. Preview-only cache folders are hidden."
             else:
-                message = "No media or sidecar files found in this folder."
+                message = "No supported case files found in this folder."
             ttk.Label(content_frame, text=message).grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
@@ -20524,7 +20754,8 @@ def open_case_browser(select_tab=True, silent=False):
         clear_content("summary")
         total_count = len(files) if total_count is None else total_count
         media_count = sum(1 for path in files if is_browser_media_file(path))
-        sidecar_count = max(0, len(files) - media_count)
+        pdf_count = sum(1 for path in files if is_browser_pdf_file(path))
+        sidecar_count = max(0, len(files) - media_count - pdf_count)
         browser_status_var.set(f"{folder_path} - large folder summary for {len(files)} / {total_count} file(s)")
 
         content_frame.columnconfigure(0, weight=1)
@@ -20539,7 +20770,7 @@ def open_case_browser(select_tab=True, silent=False):
         ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
         message = (
-            f"This folder has {len(files)} matching file(s) ({media_count} media, {sidecar_count} sidecar/text). "
+            f"This folder has {len(files)} matching file(s) ({media_count} media, {pdf_count} PDF, {sidecar_count} sidecar/text). "
             "To keep the GUI responsive, the Case Browser does not render thousands of file cards automatically."
         )
         ttk.Label(summary, text=message, wraplength=900, justify="left").grid(row=1, column=0, sticky="ew", pady=(0, 12))
@@ -20593,7 +20824,7 @@ def open_case_browser(select_tab=True, silent=False):
             elif os.path.normcase(os.path.abspath(folder_path)) == os.path.normcase(os.path.abspath(output_root)):
                 message = "No captured case files found. Preview-only cache folders are hidden."
             else:
-                message = "No media or sidecar files found in this folder."
+                message = "No supported case files found in this folder."
             ttk.Label(content_frame, text=message).grid(row=0, column=0, sticky="w", padx=12, pady=12)
             return
 
@@ -22037,6 +22268,106 @@ def mark_web_environment_preset_custom(*_args):
         web_environment_preset_var.set(display)
 
 
+WEB_INTERACTIVE_RULE_CATEGORIES = {"trigger", "overlay", "close", "next", "previous", "any"}
+WEB_INTERACTIVE_CAPTURE_SCOPE_LABELS = {
+    "Overlay only": "overlay_only",
+    "Viewport only": "viewport_only",
+    "Overlay and viewport": "overlay_and_viewport",
+}
+
+
+def normalize_web_interactive_capture_scope(value):
+    raw = str(value or "").strip()
+    if raw in WEB_INTERACTIVE_CAPTURE_SCOPE_LABELS.values():
+        return raw
+    return WEB_INTERACTIVE_CAPTURE_SCOPE_LABELS.get(raw, DEFAULTS["web_interactive_capture_scope"])
+
+
+def display_web_interactive_capture_scope(value):
+    normalized = normalize_web_interactive_capture_scope(value)
+    for label, stored in WEB_INTERACTIVE_CAPTURE_SCOPE_LABELS.items():
+        if stored == normalized:
+            return label
+    return "Overlay only"
+
+
+def get_web_interactive_capture_scope_label(value=None, compact=False):
+    normalized = normalize_web_interactive_capture_scope(
+        web_interactive_capture_scope_var.get() if value is None else value
+    )
+    if normalized == "viewport_only":
+        return "viewport only"
+    if normalized == "overlay_and_viewport":
+        return "overlay + viewport" if compact else "overlay and viewport"
+    return "overlay only"
+
+
+def load_web_interactive_rules(path, label):
+    path = os.path.abspath(str(path or ""))
+    if not os.path.isfile(path):
+        raise ValueError(f"{label} is missing: {path}")
+    rules = []
+    seen = set()
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig").splitlines()
+    except UnicodeError as exc:
+        raise ValueError(f"{label} must be UTF-8 text: {exc}") from exc
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" in line:
+            category, term = line.split("|", 1)
+            category = category.strip().lower()
+            term = term.strip()
+        else:
+            category, term = "any", line
+        if category not in WEB_INTERACTIVE_RULE_CATEGORIES:
+            raise ValueError(
+                f"{label} line {line_number} uses unsupported category '{category}'. "
+                "Use trigger, overlay, close, next, previous, or any."
+            )
+        if len(term) < 1 or len(term) > 200:
+            raise ValueError(f"{label} line {line_number} must contain a term from 1 to 200 characters.")
+        key = (category, term.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        rules.append({"category": category, "term": term})
+        if len(rules) > 5000:
+            raise ValueError(f"{label} contains more than 5000 active rules.")
+    if not rules:
+        raise ValueError(f"{label} contains no active rules.")
+    return rules
+
+
+def get_web_interactive_rule_summary():
+    whitelist = load_web_interactive_rules(WEB_INTERACTIVE_WHITELIST_FILE, "Interactive whitelist")
+    blacklist = load_web_interactive_rules(WEB_INTERACTIVE_BLACKLIST_FILE, "Interactive blacklist")
+    whitelist_categories = {rule["category"] for rule in whitelist}
+    if "trigger" not in whitelist_categories and "any" not in whitelist_categories:
+        raise ValueError("Interactive whitelist must contain at least one trigger or any rule.")
+    if "overlay" not in whitelist_categories and "any" not in whitelist_categories:
+        raise ValueError("Interactive whitelist must contain at least one overlay or any rule.")
+    return {
+        "whitelist": whitelist,
+        "blacklist": blacklist,
+        "whitelist_count": len(whitelist),
+        "blacklist_count": len(blacklist),
+        "whitelist_file": WEB_INTERACTIVE_WHITELIST_FILE,
+        "blacklist_file": WEB_INTERACTIVE_BLACKLIST_FILE,
+    }
+
+
+def open_web_interactive_rule_file(path, label):
+    try:
+        if not os.path.isfile(path):
+            raise ValueError(f"{label} is missing: {path}")
+        os.startfile(path)
+    except Exception as exc:
+        messagebox.showerror(f"Open {label} failed", str(exc))
+
+
 def get_web_settings_dict():
     browser_path = resolve_web_browser_path(web_browser_path_var.get())
     deno_path = resolve_web_deno_path(web_deno_path_var.get())
@@ -22104,6 +22435,14 @@ def get_web_settings_dict():
         "web_disable_transitions": bool(web_disable_transitions_var.get()),
         "web_hide_scrollbars": bool(web_hide_scrollbars_var.get()),
         "web_fixed_sticky_behavior": web_fixed_sticky_behavior_var.get() if web_fixed_sticky_behavior_var.get() in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"} else DEFAULTS["web_fixed_sticky_behavior"],
+        "web_interactive_capture_enabled": bool(web_interactive_capture_enabled_var.get()),
+        "web_interactive_capture_scope": normalize_web_interactive_capture_scope(web_interactive_capture_scope_var.get()),
+        "web_interactive_max_items": normalize_positive_int_string(web_interactive_max_items_var.get(), DEFAULTS["web_interactive_max_items"]),
+        "web_interactive_open_timeout": normalize_positive_int_string(web_interactive_open_timeout_var.get(), DEFAULTS["web_interactive_open_timeout"]),
+        "web_interactive_content_wait_ms": normalize_nonnegative_int_string(web_interactive_content_wait_ms_var.get(), DEFAULTS["web_interactive_content_wait_ms"]),
+        "web_interactive_close_timeout": normalize_positive_int_string(web_interactive_close_timeout_var.get(), DEFAULTS["web_interactive_close_timeout"]),
+        "web_interactive_scan_step_percent": normalize_positive_int_string(web_interactive_scan_step_percent_var.get(), DEFAULTS["web_interactive_scan_step_percent"]),
+        "web_interactive_filename_template": web_interactive_filename_template_var.get().strip(),
         "web_save_mhtml": bool(web_save_mhtml_var.get()),
         "web_save_response_html": bool(web_save_response_html_var.get()),
         "web_save_rendered_dom": bool(web_save_rendered_dom_var.get()),
@@ -22185,6 +22524,8 @@ def render_web_filename_template_example(template, now=None, resolved_case_name=
         "%domain%": "example.com",
         "%title%": "Sample Page Title",
         "%index%": "001",
+        "%urlindex%": "001",
+        "%profile%": "sample-profile",
         "%mode%": {"viewport": "viewport", "both": "full-page-and-viewport"}.get(capture_mode, "full-page"),
         "%case%": safe_case_name(str(resolved_case_name or "Case-Sample")),
     }
@@ -22239,6 +22580,76 @@ def insert_web_filename_template_tag(tag):
     except Exception:
         current = web_filename_template_var.get()
         web_filename_template_var.set(f"{current}{tag}")
+
+
+# render_web_filename_template_example() sanitizes and resolves every common tag except the
+# interactive-only overlay index tag, so this helper resolves that tag before final sanitization.
+def render_web_interactive_filename_template_example(template, now=None, resolved_case_name=None, capture_mode=None, overlay_index="001"):
+    template = str(template or "").strip()
+    if not template:
+        raise ValueError("Filename Template cannot be blank.")
+
+    now_utc = now or datetime.now(timezone.utc)
+    if getattr(now_utc, "tzinfo", None) is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(timezone.utc)
+
+    sample_values = {
+        "%date%": now_utc.strftime("%Y%m%d"),
+        "%time%": now_utc.strftime("%H%M%S"),
+        "%datetime%": now_utc.strftime("%Y%m%d-%H%M%S"),
+        "%engine%": get_capture_engine_template_value("web-capture"),
+        "%domain%": "example.com",
+        "%title%": "Sample Page Title",
+        "%index%": "001",
+        "%urlindex%": "001",
+        "%overlayindex%": str(overlay_index or "001").zfill(3),
+        "%profile%": "sample-profile",
+        "%contentid%": "content-12345",
+        "%mode%": {"viewport": "viewport", "both": "full-page-and-viewport"}.get(capture_mode, "full-page"),
+        "%case%": safe_case_name(str(resolved_case_name or "Case-Sample")),
+    }
+    rendered = template
+    for tag, value in sample_values.items():
+        rendered = rendered.replace(tag, value)
+    rendered = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", rendered)
+    rendered = re.sub(r"\s+", " ", rendered).strip().rstrip(". ")
+    return rendered or "interactive-overlay"
+
+
+
+def update_web_interactive_filename_template_preview(*_args):
+    try:
+        resolved_case = get_resolved_web_case_name(now=datetime.now())
+        example = render_web_interactive_filename_template_example(
+            web_interactive_filename_template_var.get(),
+            now=datetime.now(timezone.utc),
+            resolved_case_name=resolved_case,
+            capture_mode=web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport", "both"} else "full_page",
+            overlay_index="001",
+        )
+        interactive_scope = normalize_web_interactive_capture_scope(web_interactive_capture_scope_var.get())
+        examples = []
+        if interactive_scope in {"overlay_only", "overlay_and_viewport"}:
+            examples.append(f"{example}_overlay.png")
+        if interactive_scope in {"viewport_only", "overlay_and_viewport"}:
+            examples.append(f"{example}_viewport.png")
+        web_interactive_filename_template_preview_var.set(f"Resolved interactive output example(s): {'; '.join(examples)}")
+    except Exception as e:
+        try:
+            web_interactive_filename_template_preview_var.set(f"Resolved interactive file name example: unavailable ({e})")
+        except Exception:
+            pass
+
+
+def insert_web_interactive_filename_template_tag(tag):
+    try:
+        web_interactive_filename_template_entry.insert("insert", tag)
+        web_interactive_filename_template_entry.focus_set()
+    except Exception:
+        current = web_interactive_filename_template_var.get()
+        web_interactive_filename_template_var.set(f"{current}{tag}")
 
 
 def update_web_case_folder_preview(*_args):
@@ -22384,6 +22795,14 @@ def update_web_options_summary(*_args):
         if web_save_failure_screenshot_var.get(): evidence_labels.append("failure screenshot")
         evidence_text = ", ".join(evidence_labels) if evidence_labels else "None"
 
+        if web_interactive_capture_enabled_var.get():
+            interactive_scope = get_web_interactive_capture_scope_label(compact=True)
+            interactive_text = (
+                f"On ({interactive_scope}; max {normalize_positive_int_string(web_interactive_max_items_var.get(), DEFAULTS['web_interactive_max_items'])}; template {web_interactive_filename_template_var.get().strip() or DEFAULTS['web_interactive_filename_template']}; rules files)"
+            )
+        else:
+            interactive_text = "Off"
+
         if web_create_pdf_var.get():
             pdf_parts = [
                 get_web_pdf_capture_mode_label(),
@@ -22446,6 +22865,7 @@ def update_web_options_summary(*_args):
             f"Lazy scroll: {lazy_text}",
             f"Stability: {stability_text}",
             f"Evidence: {evidence_text}",
+            f"Interactive: {interactive_text}",
             f"Concurrent: {get_web_concurrent_capture_limit()}",
             (
                 f"Cookies: On ({'Requested site only' if web_cookie_scope_var.get() == 'site_only' else 'Entire file'})"
@@ -22507,6 +22927,18 @@ def update_web_capture_options_state(*_args):
             pass
     update_web_readiness_options_state()
     update_web_filename_template_preview()
+    update_web_options_summary()
+
+
+def update_web_interactive_options_state(*_args):
+    enabled = bool(web_interactive_capture_enabled_var.get())
+    state = "normal" if enabled else "disabled"
+    for widget in globals().get("web_interactive_option_widgets", []):
+        try:
+            widget.configure(state=("readonly" if enabled and isinstance(widget, ttk.Combobox) else state))
+        except Exception:
+            pass
+    update_web_interactive_filename_template_preview()
     update_web_options_summary()
 
 
@@ -22927,6 +23359,29 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     fixed_sticky_behavior = str(settings.get("web_fixed_sticky_behavior", DEFAULTS["web_fixed_sticky_behavior"]) or DEFAULTS["web_fixed_sticky_behavior"]).strip()
     if fixed_sticky_behavior not in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"}:
         raise ValueError("Webpage Capture fixed/sticky handling must be Preserve, Neutralize, or Hide likely navigation overlays.")
+    if bool(settings.get("web_interactive_capture_enabled", DEFAULTS["web_interactive_capture_enabled"])):
+        interactive_scope = str(settings.get("web_interactive_capture_scope", DEFAULTS["web_interactive_capture_scope"]) or DEFAULTS["web_interactive_capture_scope"]).strip()
+        if interactive_scope not in {"overlay_only", "viewport_only", "overlay_and_viewport"}:
+            raise ValueError("Webpage Capture interactive capture output must be Overlay only, Viewport only, or Overlay + viewport.")
+        interactive_max_items = int(settings.get("web_interactive_max_items", DEFAULTS["web_interactive_max_items"]))
+        interactive_open_timeout = int(settings.get("web_interactive_open_timeout", DEFAULTS["web_interactive_open_timeout"]))
+        interactive_content_wait_ms = int(settings.get("web_interactive_content_wait_ms", DEFAULTS["web_interactive_content_wait_ms"]))
+        interactive_close_timeout = int(settings.get("web_interactive_close_timeout", DEFAULTS["web_interactive_close_timeout"]))
+        interactive_scan_step_percent = int(settings.get("web_interactive_scan_step_percent", DEFAULTS["web_interactive_scan_step_percent"]))
+        interactive_filename_template = str(settings.get("web_interactive_filename_template", DEFAULTS["web_interactive_filename_template"]) or "").strip()
+        if not interactive_filename_template:
+            raise ValueError("Webpage Capture interactive filename template cannot be blank.")
+        if not 1 <= interactive_max_items <= 500:
+            raise ValueError("Webpage Capture interactive maximum items must be from 1 to 500.")
+        if not 1 <= interactive_open_timeout <= 60:
+            raise ValueError("Webpage Capture interactive open timeout must be from 1 to 60 seconds.")
+        if not 0 <= interactive_content_wait_ms <= 30000:
+            raise ValueError("Webpage Capture interactive content wait must be from 0 to 30000 milliseconds.")
+        if not 1 <= interactive_close_timeout <= 30:
+            raise ValueError("Webpage Capture interactive close timeout must be from 1 to 30 seconds.")
+        if not 25 <= interactive_scan_step_percent <= 100:
+            raise ValueError("Webpage Capture interactive scan step must be from 25 to 100 percent of the viewport.")
+        get_web_interactive_rule_summary()
     network_query_mode = str(settings.get("web_network_query_mode", DEFAULTS["web_network_query_mode"]) or DEFAULTS["web_network_query_mode"]).strip()
     if network_query_mode not in {"redact_values", "include_full"}:
         raise ValueError("Webpage Capture network-report query handling must redact values or include complete query strings.")
@@ -23009,6 +23464,10 @@ def make_web_capture_config(job, preflight_only=False):
     paths = get_expected_run_paths_for_values(output_root, resolved_case_name) if case_folder else {}
     universal_archive_enabled = bool(app_universal_archive_enabled() and not preflight_only)
     universal_archive_skips = get_web_universal_archive_skip_map(urls) if universal_archive_enabled else {}
+    interactive_rules = get_web_interactive_rule_summary() if bool(settings.get("web_interactive_capture_enabled", DEFAULTS["web_interactive_capture_enabled"])) else {
+        "whitelist": [], "blacklist": [], "whitelist_count": 0, "blacklist_count": 0,
+        "whitelist_file": WEB_INTERACTIVE_WHITELIST_FILE, "blacklist_file": WEB_INTERACTIVE_BLACKLIST_FILE,
+    }
     config = {
         "schema_version": 1,
         "app_version": APP_VERSION,
@@ -23084,6 +23543,20 @@ def make_web_capture_config(job, preflight_only=False):
         "disable_transitions": bool(settings.get("web_disable_transitions", DEFAULTS["web_disable_transitions"])),
         "hide_scrollbars": bool(settings.get("web_hide_scrollbars", DEFAULTS["web_hide_scrollbars"])),
         "fixed_sticky_behavior": settings.get("web_fixed_sticky_behavior", DEFAULTS["web_fixed_sticky_behavior"]),
+        "interactive_capture": {
+            "enabled": bool(settings.get("web_interactive_capture_enabled", DEFAULTS["web_interactive_capture_enabled"])),
+            "capture_scope": settings.get("web_interactive_capture_scope", DEFAULTS["web_interactive_capture_scope"]),
+            "filename_template": settings.get("web_interactive_filename_template", DEFAULTS["web_interactive_filename_template"]),
+            "maximum_items": int(settings.get("web_interactive_max_items", DEFAULTS["web_interactive_max_items"])),
+            "open_timeout_seconds": int(settings.get("web_interactive_open_timeout", DEFAULTS["web_interactive_open_timeout"])),
+            "content_wait_ms": int(settings.get("web_interactive_content_wait_ms", DEFAULTS["web_interactive_content_wait_ms"])),
+            "close_timeout_seconds": int(settings.get("web_interactive_close_timeout", DEFAULTS["web_interactive_close_timeout"])),
+            "scan_step_percent": int(settings.get("web_interactive_scan_step_percent", DEFAULTS["web_interactive_scan_step_percent"])),
+            "whitelist_filename": os.path.basename(interactive_rules["whitelist_file"]),
+            "blacklist_filename": os.path.basename(interactive_rules["blacklist_file"]),
+            "whitelist_rules": interactive_rules["whitelist"],
+            "blacklist_rules": interactive_rules["blacklist"],
+        },
         "save_mhtml": bool(settings.get("web_save_mhtml", DEFAULTS["web_save_mhtml"])),
         "save_response_html": bool(settings.get("web_save_response_html", DEFAULTS["web_save_response_html"])),
         "save_rendered_dom": bool(settings.get("web_save_rendered_dom", DEFAULTS["web_save_rendered_dom"])),
@@ -23178,6 +23651,15 @@ def run_web_preflight_check():
             web_append_log(f"Cookie scope: {cookie_scope_label}\n")
         else:
             web_append_log("Cookies file: disabled\n")
+        if settings.get("web_interactive_capture_enabled"):
+            rule_summary = get_web_interactive_rule_summary()
+            scope_label = get_web_interactive_capture_scope_label(settings.get("web_interactive_capture_scope"))
+            web_append_log(
+                f"Interactive overlays: enabled ({scope_label}; maximum {settings.get('web_interactive_max_items')} items; "
+                f"{rule_summary['whitelist_count']} whitelist / {rule_summary['blacklist_count']} blacklist rules)\n"
+            )
+        else:
+            web_append_log("Interactive overlays: disabled\n")
         archive_status = get_universal_archive_status("web-capture", settings)
         if archive_status["effective"]:
             archive_stats = inspect_web_universal_archive(create=True)
@@ -23494,6 +23976,15 @@ def start_web_capture():
     if settings.get("web_image_format") in {"jpeg", "webp"}:
         web_format_label += f" quality {settings.get('web_image_quality', DEFAULTS['web_image_quality'])}"
     web_append_log(f"Mode: {web_mode_label}; image format: {web_format_label}; capture retries: {settings.get('web_capture_retries', DEFAULTS['web_capture_retries'])}\n")
+    if settings.get("web_interactive_capture_enabled"):
+        rule_summary = get_web_interactive_rule_summary()
+        scope_label = get_web_interactive_capture_scope_label(settings.get("web_interactive_capture_scope"), compact=True)
+        web_append_log(
+            f"Interactive overlays: enabled ({scope_label}; max {settings.get('web_interactive_max_items')}; template {settings.get('web_interactive_filename_template', DEFAULTS['web_interactive_filename_template'])}; "
+            f"{rule_summary['whitelist_count']} whitelist / {rule_summary['blacklist_count']} blacklist rules)\n"
+        )
+    else:
+        web_append_log("Interactive overlays: disabled\n")
     web_append_log(f"Create PDF: {'Yes' if settings.get('web_create_pdf') else 'No'}\n")
     if settings.get('web_create_pdf'):
         web_append_log(
@@ -23946,6 +24437,15 @@ web_disable_animations_var = tk.BooleanVar(value=DEFAULTS["web_disable_animation
 web_disable_transitions_var = tk.BooleanVar(value=DEFAULTS["web_disable_transitions"])
 web_hide_scrollbars_var = tk.BooleanVar(value=DEFAULTS["web_hide_scrollbars"])
 web_fixed_sticky_behavior_var = tk.StringVar(value=DEFAULTS["web_fixed_sticky_behavior"])
+web_interactive_capture_enabled_var = tk.BooleanVar(value=DEFAULTS["web_interactive_capture_enabled"])
+web_interactive_capture_scope_var = tk.StringVar(value=display_web_interactive_capture_scope(DEFAULTS["web_interactive_capture_scope"]))
+web_interactive_max_items_var = tk.StringVar(value=DEFAULTS["web_interactive_max_items"])
+web_interactive_open_timeout_var = tk.StringVar(value=DEFAULTS["web_interactive_open_timeout"])
+web_interactive_content_wait_ms_var = tk.StringVar(value=DEFAULTS["web_interactive_content_wait_ms"])
+web_interactive_close_timeout_var = tk.StringVar(value=DEFAULTS["web_interactive_close_timeout"])
+web_interactive_scan_step_percent_var = tk.StringVar(value=DEFAULTS["web_interactive_scan_step_percent"])
+web_interactive_filename_template_var = tk.StringVar(value=DEFAULTS["web_interactive_filename_template"])
+web_interactive_filename_template_preview_var = tk.StringVar(value="")
 web_save_mhtml_var = tk.BooleanVar(value=DEFAULTS["web_save_mhtml"])
 web_save_response_html_var = tk.BooleanVar(value=DEFAULTS["web_save_response_html"])
 web_save_rendered_dom_var = tk.BooleanVar(value=DEFAULTS["web_save_rendered_dom"])
@@ -25636,6 +26136,7 @@ def start_image_capture():
             image_stop_button.config(state="disabled")
             image_set_status("Complete" if exit_code == 0 else "Failed")
             image_append_log(f"\nImage Capture finished with exit code {exit_code}.\n")
+            schedule_case_browser_autoload(delay_ms=250)
         safe_after(0, finish)
 
     start_daemon_thread("worker", worker)
@@ -26334,7 +26835,7 @@ def build_web_capture_tab():
 
 build_web_capture_tab()
 
-# Webpage Capture inline option panels use a compact five-tab notebook so the
+# Webpage Capture inline option panels use a compact six-tab notebook so the
 # current controls remain easy to reach while later passes can expand each
 # category without making the overlay excessively tall. Only one raised Webpage
 # options panel remains visible at a time.
@@ -26816,6 +27317,131 @@ Tooltip(web_cookie_scope_site_radio, "Loads only cookies applicable to the submi
 Tooltip(web_cookie_scope_all_radio, "Loads every valid cookie from the selected file into the isolated temporary browser. This improves redirect and SSO compatibility but may make authenticated cookies available to additional matching domains contacted during capture.")
 Tooltip(web_clear_cookies_check, "Cookie clearing applies even when no cookies file is selected. Imported cookies are loaded afterward.")
 
+# Interactive Overlays tab: conservative rule-based discovery without requiring CSS selectors.
+web_interactive_tab = ttk.Frame(web_capture_options_notebook, padding=8)
+web_interactive_tab.columnconfigure(0, weight=1)
+web_capture_options_notebook.add(web_interactive_tab, text="Interactive Overlays")
+
+web_interactive_enable_frame = ttk.LabelFrame(web_interactive_tab, text="Automatic Overlay Capture", padding=8)
+web_interactive_enable_frame.grid(row=0, column=0, sticky="ew", pady=(0, 7))
+web_interactive_enable_frame.columnconfigure(0, weight=1)
+web_interactive_enable_toggle = ttk.Checkbutton(
+    web_interactive_enable_frame,
+    text="Open likely gallery/post items, capture the resulting overlay, then dismiss it",
+    variable=web_interactive_capture_enabled_var,
+    command=update_web_interactive_options_state,
+)
+web_interactive_enable_toggle.grid(row=0, column=0, sticky="w")
+ttk.Label(
+    web_interactive_enable_frame,
+    text=(
+        "WAVI uses the packaged whitelist and blacklist terms against accessible names, visible text, roles, tags, IDs, classes, links, images, and common data attributes. "
+        "It does not require browser developer tools or user-entered CSS selectors. Matching is deliberately conservative and may skip incompatible sites."
+    ),
+    wraplength=900,
+    justify="left",
+).grid(row=1, column=0, sticky="w", pady=(5, 0))
+
+web_interactive_settings_frame = ttk.LabelFrame(web_interactive_tab, text="Capture Limits", padding=8)
+web_interactive_settings_frame.grid(row=1, column=0, sticky="ew", pady=(0, 7))
+for column in (1, 3, 5):
+    web_interactive_settings_frame.columnconfigure(column, weight=1)
+
+ttk.Label(web_interactive_settings_frame, text="Output").grid(row=0, column=0, sticky="w", pady=3)
+web_interactive_scope_combo = ttk.Combobox(
+    web_interactive_settings_frame,
+    textvariable=web_interactive_capture_scope_var,
+    values=tuple(WEB_INTERACTIVE_CAPTURE_SCOPE_LABELS.keys()),
+    state="readonly",
+    width=22,
+)
+web_interactive_scope_combo.grid(row=0, column=1, sticky="ew", padx=(6, 14), pady=3)
+
+ttk.Label(web_interactive_settings_frame, text="Maximum items").grid(row=0, column=2, sticky="w", pady=3)
+web_interactive_max_items_entry = ttk.Entry(web_interactive_settings_frame, textvariable=web_interactive_max_items_var, width=8)
+web_interactive_max_items_entry.grid(row=0, column=3, sticky="ew", padx=(6, 14), pady=3)
+
+ttk.Label(web_interactive_settings_frame, text="Scan step (%)").grid(row=0, column=4, sticky="w", pady=3)
+web_interactive_scan_step_entry = ttk.Entry(web_interactive_settings_frame, textvariable=web_interactive_scan_step_percent_var, width=8)
+web_interactive_scan_step_entry.grid(row=0, column=5, sticky="ew", padx=(6, 0), pady=3)
+
+ttk.Label(web_interactive_settings_frame, text="Open timeout (s)").grid(row=1, column=0, sticky="w", pady=3)
+web_interactive_open_timeout_entry = ttk.Entry(web_interactive_settings_frame, textvariable=web_interactive_open_timeout_var, width=8)
+web_interactive_open_timeout_entry.grid(row=1, column=1, sticky="ew", padx=(6, 14), pady=3)
+
+ttk.Label(web_interactive_settings_frame, text="Content wait (ms)").grid(row=1, column=2, sticky="w", pady=3)
+web_interactive_content_wait_entry = ttk.Entry(web_interactive_settings_frame, textvariable=web_interactive_content_wait_ms_var, width=8)
+web_interactive_content_wait_entry.grid(row=1, column=3, sticky="ew", padx=(6, 14), pady=3)
+
+ttk.Label(web_interactive_settings_frame, text="Close timeout (s)").grid(row=1, column=4, sticky="w", pady=3)
+web_interactive_close_timeout_entry = ttk.Entry(web_interactive_settings_frame, textvariable=web_interactive_close_timeout_var, width=8)
+web_interactive_close_timeout_entry.grid(row=1, column=5, sticky="ew", padx=(6, 0), pady=3)
+
+web_interactive_filename_frame = ttk.LabelFrame(web_interactive_tab, text="Interactive Output Naming", padding=8)
+web_interactive_filename_frame.grid(row=2, column=0, sticky="ew", pady=(0, 7))
+web_interactive_filename_frame.columnconfigure(0, weight=1)
+global web_interactive_filename_template_entry
+web_interactive_filename_template_entry = ttk.Entry(web_interactive_filename_frame, textvariable=web_interactive_filename_template_var)
+web_interactive_filename_template_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+interactive_filename_menu_button = ttk.Menubutton(web_interactive_filename_frame, text="Insert Tag")
+interactive_filename_menu = tk.Menu(interactive_filename_menu_button, tearoff=0)
+interactive_filename_menu_button["menu"] = interactive_filename_menu
+for tag, _sample in WEB_INTERACTIVE_FILENAME_TAGS:
+    interactive_filename_menu.add_command(label=tag, command=lambda value=tag: insert_web_interactive_filename_template_tag(value))
+interactive_filename_menu.add_separator()
+interactive_filename_menu.add_command(label="%case%", command=lambda: insert_web_interactive_filename_template_tag("%case%"))
+interactive_filename_menu_button.grid(row=0, column=1, sticky="e")
+ttk.Label(
+    web_interactive_filename_frame,
+    textvariable=web_interactive_filename_template_preview_var,
+    wraplength=760,
+    justify="left",
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
+
+web_interactive_option_widgets = [
+    web_interactive_scope_combo,
+    web_interactive_max_items_entry,
+    web_interactive_scan_step_entry,
+    web_interactive_open_timeout_entry,
+    web_interactive_content_wait_entry,
+    web_interactive_close_timeout_entry,
+    web_interactive_filename_template_entry,
+    interactive_filename_menu_button,
+]
+
+web_interactive_rules_frame = ttk.LabelFrame(web_interactive_tab, text="Editable Matching Rules", padding=8)
+web_interactive_rules_frame.grid(row=3, column=0, sticky="ew")
+web_interactive_rules_frame.columnconfigure(2, weight=1)
+ttk.Button(
+    web_interactive_rules_frame,
+    text="Open Whitelist",
+    command=lambda: open_web_interactive_rule_file(WEB_INTERACTIVE_WHITELIST_FILE, "interactive whitelist"),
+).grid(row=0, column=0, sticky="w", padx=(0, 8))
+ttk.Button(
+    web_interactive_rules_frame,
+    text="Open Blacklist",
+    command=lambda: open_web_interactive_rule_file(WEB_INTERACTIVE_BLACKLIST_FILE, "interactive blacklist"),
+).grid(row=0, column=1, sticky="w", padx=(0, 12))
+ttk.Label(
+    web_interactive_rules_frame,
+    text=(
+        "Advanced users can add site-specific terms to interactive-whitelist.txt or interactive-blacklist.txt. "
+        "Keep the category|term format shown in each file. Changes apply to the next preflight or capture."
+    ),
+    wraplength=690,
+    justify="left",
+).grid(row=0, column=2, sticky="w")
+
+ttk.Label(
+    web_interactive_tab,
+    text=(
+        "Safety: automatic clicking excludes form submissions, cross-origin links, disabled controls, and built-in high-risk actions such as follow, like, message, purchase, upload, delete, and account changes. "
+        "A skipped item is recorded rather than clicked when WAVI cannot classify it conservatively."
+    ),
+    wraplength=920,
+    justify="left",
+).grid(row=4, column=0, sticky="w", pady=(7, 0))
+
 # Evidence Outputs adds supplemental browser-generated and diagnostic artifacts.
 # Primary image capture remains under Capture and PDF remains in its separate panel.
 web_evidence_tab = ttk.Frame(web_capture_options_notebook, padding=8)
@@ -27236,6 +27862,14 @@ for web_option_var in (
     web_disable_transitions_var,
     web_hide_scrollbars_var,
     web_fixed_sticky_behavior_var,
+    web_interactive_capture_enabled_var,
+    web_interactive_capture_scope_var,
+    web_interactive_max_items_var,
+    web_interactive_open_timeout_var,
+    web_interactive_content_wait_ms_var,
+    web_interactive_close_timeout_var,
+    web_interactive_scan_step_percent_var,
+    web_interactive_filename_template_var,
     web_save_mhtml_var,
     web_save_response_html_var,
     web_save_rendered_dom_var,
@@ -27274,6 +27908,9 @@ web_lazy_scroll_var.trace_add("write", update_web_capture_options_state)
 web_detect_page_growth_var.trace_add("write", update_web_capture_options_state)
 web_capture_mode_var.trace_add("write", update_web_capture_options_state)
 web_image_format_var.trace_add("write", update_web_capture_options_state)
+web_interactive_capture_enabled_var.trace_add("write", update_web_interactive_options_state)
+web_interactive_capture_scope_var.trace_add("write", update_web_interactive_filename_template_preview)
+web_interactive_filename_template_var.trace_add("write", update_web_interactive_filename_template_preview)
 web_save_network_report_var.trace_add("write", update_web_evidence_options_state)
 web_save_failed_request_report_var.trace_add("write", update_web_evidence_options_state)
 web_wait_selector_enabled_var.trace_add("write", update_web_readiness_options_state)
@@ -27283,6 +27920,7 @@ web_pdf_display_header_footer_var.trace_add("write", update_web_pdf_options_stat
 web_pdf_capture_mode_var.trace_add("write", update_web_pdf_options_state)
 update_web_capture_options_state()
 update_web_readiness_options_state()
+update_web_interactive_options_state()
 update_web_evidence_options_state()
 update_web_cookies_file_control_state()
 update_web_pdf_options_state()
@@ -28183,8 +28821,10 @@ image_output_root_var.trace_add("write", update_image_case_folder_preview)
 image_filename_template_var.trace_add("write", update_image_filename_template_preview)
 web_case_name_var.trace_add("write", update_web_case_folder_preview)
 web_case_name_var.trace_add("write", update_web_filename_template_preview)
+web_case_name_var.trace_add("write", update_web_interactive_filename_template_preview)
 web_filename_template_var.trace_add("write", update_web_filename_template_preview)
 web_capture_mode_var.trace_add("write", update_web_filename_template_preview)
+web_capture_mode_var.trace_add("write", update_web_interactive_filename_template_preview)
 web_image_format_var.trace_add("write", update_web_filename_template_preview)
 web_create_pdf_var.trace_add("write", update_web_filename_template_preview)
 web_output_root_var.trace_add("write", update_web_case_folder_preview)
@@ -28217,6 +28857,7 @@ initialize_url_box_from_persistence_and_input_files()
 initialize_image_url_box_from_persistence_and_input_files()
 initialize_web_url_box_from_persistence_and_input_files()
 start_case_browser_result_poller()
+start_case_browser_output_root_watcher()
 schedule_case_browser_autoload(delay_ms=400)
 schedule_playlist_preview_autoload(delay_ms=500)
 apply_app_theme()

@@ -1,0 +1,151 @@
+# WAVI interactive overlay-capture whitelist
+#
+# One rule per line. Blank lines and lines beginning with # are ignored.
+# Format: category|term
+# Categories: trigger, overlay, close, next, previous, any
+# Terms are matched case-insensitively against visible text, accessible labels,
+# title/alt text, role, tag, id, class, href, source, and common data attributes.
+# Advanced users may add site-specific words or class/id fragments.
+# Prefix a trusted trigger term with safe: only when a non-link control has been
+# reviewed for that site and is known to open evidence media without changing
+# account or content state. Example: trigger|safe:site-media-tile
+
+# Safe-looking gallery, post, media, and preview triggers
+trigger|thumbnail
+trigger|gallery thumbnail
+trigger|media thumbnail
+trigger|image thumbnail
+trigger|photo thumbnail
+trigger|video thumbnail
+trigger|thumb
+trigger|gallery
+trigger|gallery item
+trigger|gallery-item
+trigger|grid item
+trigger|grid-item
+trigger|media item
+trigger|media-item
+trigger|photo
+trigger|picture
+trigger|image
+trigger|img
+trigger|image tile
+trigger|photo tile
+trigger|video tile
+trigger|video
+trigger|media
+trigger|preview
+trigger|media preview
+trigger|image preview
+trigger|photo preview
+trigger|video preview
+trigger|viewer
+trigger|lightbox
+trigger|carousel
+trigger|slideshow
+trigger|slide
+trigger|album
+trigger|attachment
+trigger|figure
+trigger|zoom
+trigger|expand
+trigger|full size
+trigger|full-size
+trigger|open image
+trigger|open photo
+trigger|open video
+trigger|open media
+trigger|view image
+trigger|view post
+trigger|open post
+trigger|view video
+trigger|view photo
+trigger|view media
+trigger|open gallery
+trigger|view gallery
+trigger|post
+trigger|post card
+trigger|post link
+trigger|post thumbnail
+trigger|post-card
+trigger|feed item
+trigger|feed-item
+trigger|story
+trigger|reel
+trigger|tile
+trigger|card
+trigger|media-card
+trigger|content-card
+trigger|result-card
+trigger|result item
+trigger|result-item
+trigger|detail
+trigger|details
+trigger|view details
+trigger|open details
+trigger|permalink
+trigger|media link
+trigger|image link
+trigger|photo link
+
+# Overlay, dialog, viewer, and lightbox containers
+overlay|dialog
+overlay|modal
+overlay|lightbox
+overlay|overlay
+overlay|viewer
+overlay|media viewer
+overlay|image viewer
+overlay|photo viewer
+overlay|gallery viewer
+overlay|preview
+overlay|popup
+overlay|popover
+overlay|drawer
+overlay|sheet
+overlay|carousel
+overlay|slideshow
+overlay|story viewer
+overlay|post viewer
+overlay|detail view
+overlay|full screen
+overlay|fullscreen
+overlay|aria-modal
+overlay|role dialog
+
+# Safe close/dismiss controls
+close|close
+close|dismiss
+close|exit
+close|close dialog
+close|close modal
+close|close viewer
+close|close lightbox
+close|close preview
+close|close gallery
+close|close image
+close|close photo
+close|close media
+close|x button
+close|times
+close|×
+
+# Carousel navigation terms retained for future and site-specific matching
+next|next
+next|next item
+next|next image
+next|next photo
+next|next media
+next|next slide
+next|forward
+next|chevron right
+next|arrow right
+previous|previous
+previous|previous item
+previous|previous image
+previous|previous photo
+previous|previous media
+previous|previous slide
+previous|back
+previous|chevron left
+previous|arrow left

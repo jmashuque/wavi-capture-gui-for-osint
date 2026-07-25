@@ -5,6 +5,8 @@
 !script-webcapture.ps1
 !script-webcapture.ts
 !script-ytdlp.ps1
+!interactive-blacklist.txt
+!interactive-whitelist.txt
 !README.md
 !CHANGELOG.md
 !LICENSE

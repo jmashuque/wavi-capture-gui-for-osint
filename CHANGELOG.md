@@ -2,6 +2,16 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0725](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0725) - Interactive Webpage Capture, Safety, and PDF Browsing
+
+- Added optional Interactive Overlays capture with packaged whitelist and blacklist rules, bounded page scanning, media-readiness checks, per-item evidence reporting, automatic dismissal, and same-origin route capture for post, reel, photo, story, and highlight pages.
+- Added Overlay only, Viewport only, and Overlay and viewport output modes, plus a separate interactive filename template with `%urlindex%`, `%overlayindex%`, `%profile%`, and `%contentid%` tags.
+- Added `%profile%` support to standard Webpage Capture filename templates.
+- Hardened automated webpage interaction with stricter candidate qualification, immutable blocking of social and account actions, same-origin media-route preference, pre-click descriptor revalidation, movement checks, topmost-element hit testing, and detailed safety records.
+- Changed interactive capture to run before PDF generation so Captured PNG PDF staging cannot replace the live webpage before interactive scanning.
+- Added PDF filtering and default-viewer opening to Case Browser, and improved Case Browser refresh behavior when the Output Root changes.
+- Added clearer inactive-tab shading to the main GUI tabs in light and dark modes.
+
 ## [v2.2026.0722](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v2.2026.0722) - Output Log and Capture Layout Improvements
 
 - Added a dedicated Output Log tab for live Audio/Video, Image, Webpage, and combined capture output, with follow, copy, save, and clear controls.

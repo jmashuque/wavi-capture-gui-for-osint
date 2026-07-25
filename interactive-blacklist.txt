@@ -1,0 +1,163 @@
+# WAVI interactive overlay-capture blacklist
+#
+# One rule per line. Blank lines and lines beginning with # are ignored.
+# Format: category|term
+# Categories: trigger, overlay, close, next, previous, any
+# Terms are matched case-insensitively against visible text, accessible labels,
+# title/alt text, role, tag, id, class, href, source, and common data attributes.
+# Add site-specific terms here when a page exposes unsafe or incompatible controls.
+
+# Account, authentication, consent, and settings actions
+any|sign in
+any|signin
+any|log in
+any|login
+any|log out
+any|logout
+any|sign up
+any|signup
+any|register
+any|account
+any|profile settings
+trigger|profile
+trigger|profile picture
+trigger|profile photo
+trigger|avatar
+trigger|user avatar
+trigger|username
+trigger|logo
+trigger|home navigation
+trigger|search button
+trigger|navigation menu
+any|settings
+any|password
+any|authentication
+any|authorize
+any|allow
+any|deny
+any|consent
+any|cookie preferences
+any|cookie settings
+any|accept cookies
+any|reject cookies
+any|notifications
+any|enable notifications
+any|permissions
+any|more actions
+any|more options
+any|overflow menu
+any|context menu
+any|navigation menu
+any|account menu
+
+# Social, messaging, and moderation actions
+any|follow
+any|unfollow
+any|like
+any|unlike
+any|react
+any|reaction
+any|share
+any|repost
+any|retweet
+any|send
+any|message
+any|direct message
+any|dm
+any|comment
+any|reply
+any|mention
+any|tag user
+any|subscribe
+any|unsubscribe
+any|join
+any|leave
+any|invite
+any|connect
+any|friend
+any|block
+any|unblock
+any|mute
+any|unmute
+any|report
+any|flag
+any|hide post
+any|not interested
+
+# Destructive, modifying, or form-submission actions
+any|submit
+any|confirm
+any|approve
+any|decline
+any|accept
+any|save changes
+any|save settings
+any|edit
+any|delete
+any|remove
+any|archive
+any|restore
+any|create
+any|new post
+any|upload
+any|publish
+any|schedule
+any|promote
+any|boost
+any|manage
+any|admin
+any|moderate
+any|form-submit
+any|submit-button
+
+# Commerce, payment, and external transaction actions
+any|buy
+any|purchase
+any|checkout
+any|cart
+any|add to cart
+any|order
+any|payment
+any|pay now
+any|donate
+any|tip
+any|book
+any|reserve
+any|bid
+any|offer
+any|subscribe now
+any|start trial
+
+# Download, launch, call, and other active controls
+any|download
+any|install
+any|open app
+any|launch app
+any|play live
+any|go live
+any|start live
+any|play
+any|pause
+any|mute video
+any|unmute video
+any|volume
+any|fullscreen video
+any|call
+any|video call
+any|voice call
+any|email
+any|mailto
+any|tel:
+any|javascript:
+
+# Common non-content overlays that should not be treated as evidence targets
+overlay|cookie banner
+overlay|consent banner
+overlay|login dialog
+overlay|sign in dialog
+overlay|newsletter
+overlay|subscribe popup
+overlay|notification prompt
+overlay|permission prompt
+overlay|advertisement
+overlay|sponsored
