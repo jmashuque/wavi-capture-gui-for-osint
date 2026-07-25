@@ -9,6 +9,7 @@ A portable Windows GUI for approved audio/video/image and rendered webpage captu
 - [Intended Users](#intended-users)
 - [What the App Does](#what-the-app-does)
 - [What the App Does Not Do](#what-the-app-does-not-do)
+- [Warnings](#warnings)
 - [Required Components](#required-components)
 - [Basic Usage](#basic-usage)
   - [Setup and Staging](#setup-and-staging)
@@ -43,7 +44,7 @@ The app has seven main tabs:
 
 - **Audio/Video Capture** for `yt-dlp` captures.
 - **Image Capture** for `gallery-dl` captures.
-- **Webpage Capture** for extension-free full-page, initial-viewport, or combined PNG/JPEG/WebP captures, optional PDF output, and optional rule-based capture of gallery or post overlays, using Deno and an isolated Chromium-browser profile.
+- **Webpage Capture** for rendered webpage images, optional PDFs, and bounded interactive-item capture.
 - **Job Queue** for staged, concurrent, and recoverable jobs.
 - **Output Log** for live Audio/Video, Image, Webpage, or combined capture output.
 - **Audio/Video Preview** for metadata, thumbnails, playlist/context review, and queueing from preview results.
@@ -104,6 +105,20 @@ The app does not:
 - guarantee that any source platform is supported
 - analyze evidence, identify people, assess authenticity, or determine evidentiary value
 - upload, sync, or retain cases outside the selected local output paths
+
+## Warnings
+
+### Interactive Overlays
+
+Interactive capture sends real clicks to third-party pages. WAVI blocks forms, cross-origin links, disabled controls, known social/account actions, and ambiguous candidates, and it revalidates each target immediately before clicking. These safeguards reduce risk but cannot guarantee that every authenticated or highly dynamic site is free from unintended state-changing interaction.
+
+Use a minimally privileged, organization-approved investigative account, begin with a low item limit, review platform-specific blacklist rules, and inspect the interactive report before larger authenticated captures.
+
+### Investigative Accounts and Cookies
+
+For authenticated OSINT captures, use only organization-approved investigative or "sock puppet" accounts and cookies created for those accounts. Never use personal accounts, personal browser profiles, or cookies from personal sessions.
+
+Treat cookies files as sensitive operational data and handle them according to organizational policy.
 
 ## Required Components
 
@@ -570,92 +585,17 @@ Cookies, proxy settings, domain presets, and gallery-dl stable/dev update checks
 
 ### Webpage Capture
 
-Webpage Capture uses `script-webcapture.ps1`, `script-webcapture.ts`, `deno.exe`, and a selected installed Chromium-family browser. The editable **Browser Path** dropdown detects common stable and preview-channel installations of Edge, Chrome, Brave, Vivaldi, Chromium, Opera, and Arc from standard folders, Windows App Paths and registered-browser entries, and `PATH`. Manual browsing remains available for portable or uncommon installations, and preflight verifies that the selected executable actually supports the required headless DevTools workflow. It communicates with the newly launched browser over the loopback Chrome DevTools Protocol connection and does not require a browser extension, Selenium, WebDriver, Playwright, Puppeteer, or downloaded packages.
+Webpage Capture uses Deno-driven Chromium browser automation to load and capture approved webpages through the Chrome DevTools Protocol. Select an installed Chromium-family browser and confirm the **Deno Path** and **Browser Path** before capture; preflight checks that the selected browser can start in WAVI's isolated capture environment.
 
-Webpage Capture controls include:
+Use **Capture Options** to choose full-page, initial-viewport, or combined output; PNG, JPEG, or WebP encoding; readiness and retry limits; lazy-load scrolling; page-stability handling; browser environment settings; optional interactive-item capture; and supplemental evidence outputs. **PDF Options** can create either a searchable Live Page PDF or an image-based Captured PNG PDF intended to match the saved visual capture.
 
-- The URL box uses the same twelve-button toolbar as Audio/Video and Image Capture: **Load**, **Append**, **Save**, **Clear**, **Strip**, **Copy**, **Failed/All**, **Group**, **Statistics**, **Normalize**, **Duplicates**, and **Validate**. Webpage capture classifications update the shared `gui-captured-urls.txt` and `gui-failed-urls.txt` history files under the selected Output Root, allowing **Failed** to filter the current webpage URL set without reading the output log.
-- **Capture Options** opens a six-tab overlay. The **Capture** tab selects full-page, initial-viewport, or combined output; PNG, JPEG, or WebP encoding; JPEG/WebP quality; capture-stage retries; and concurrency. The **Readiness** tab controls the navigation milestone, maximum navigation duration, network-quiet duration and settling limit, optional CSS-selector and literal-text conditions, a shared condition timeout, an additional final wait, and the action taken when a readiness check times out. The **Scrolling & Stability** tab controls bounded lazy-load scrolling, continued-growth detection and its outcome, safe single-image and segmented-capture limits, segment overlap, final page remeasurement, animation/transition and scrollbar stabilization, and fixed/sticky-element handling. The **Environment & State** tab provides desktop, tablet, mobile, and custom browser-environment presets; viewport, device scale, mobile-layout, touch, and orientation controls; locale, timezone, colour-scheme, and reduced-motion preferences; cache, service-worker, reload, site-storage, and between-URL cookie controls. The **Interactive Overlays** tab optionally opens likely gallery, media, or post items, captures the resulting overlay only, the browser viewport only, or both, dismisses it, and continues through a bounded number of matching items without requiring browser developer tools or user-entered selectors. It also includes an interactive-output filename template field with a tag menu and a sample resolved preview, including `%urlindex%` for the submitted source URL number, `%overlayindex%` for numbering captured overlay items under that URL, `%profile%` for the detected account/profile handle, and `%contentid%` for the detected post, reel, photo, or highlight identifier when WAVI can derive one from the interactive item URL. The **Evidence Outputs** tab adds optional MHTML, final-response HTML, serialized rendered DOM, sanitized network, failed-request, console, and TLS/browser-security reports, plus failure screenshot/metadata collection after a final capture failure. Network evidence omits request bodies, redacts sensitive headers, and can redact query-string values. **Requested site only** imports cookies applicable to the submitted hostname; **Entire cookies file** imports every valid row for redirect and SSO compatibility.
-- **PDF Options** opens a compact tabbed overlay with **Source & Output**, **Page Layout**, **Large PDFs**, and **Header & Footer** sections. It supports two PDF sources: **Live Page (searchable)** for Chromium `Page.printToPDF` output and **Captured PNG (visual match)** for image-based PDF output built from the captured PNG. Live Page also includes layout choices for handling repeated fixed or sticky webpage overlays and bounded large-PDF handling.
-- **Case Name** and **Filename Template** provide **Insert Tag** menus, including `%engine%`, which resolves to `webpage`, and `%profile%`, which resolves to the detected account/profile path segment from the final or submitted webpage URL. The filename preview reflects full-page, initial-viewport, or combined output, uses the selected image extension, and shows the optional PDF filename when PDF output is enabled. When a profile cannot be derived safely, `%profile%` resolves to `unknown-profile`.
+The optional **Interactive Overlays** feature is disabled by default. When enabled, WAVI can conservatively open likely gallery, media, post, reel, photo, story, or highlight items; capture the overlay, viewport, or both; dismiss the item; and continue through a bounded number of matches. Interactive filenames support `%urlindex%`, `%overlayindex%`, `%profile%`, and `%contentid%`. The packaged `interactive-whitelist.txt` and `interactive-blacklist.txt` files can be adjusted for supported sites.
 
-Webpage Capture security boundaries:
+Webpage Capture uses a temporary app-owned browser profile and does not read normal browser profiles, stored passwords, or browser databases. Cookies are optional, disabled by default, and must be supplied as an approved Netscape-format file. Normal browser security remains enabled, and the DevTools connection is limited to localhost.
 
-- approved `http://` and `https://` pages only
-- optional user-selected Netscape `cookies.txt` input, disabled by default and imported according to the selected **Requested site only** or **Entire cookies file** scope
-- a unique app-owned `--user-data-dir` beneath `gui-temp` for every run
-- no access to normal browser profiles or AppData browser databases
-- no browser-cookie extraction by Webpage Capture, DPAPI decryption, password access, or automatic sign-in
-- interactive overlay capture is disabled by default and excludes forms, cross-origin links, disabled controls, and known high-risk actions such as following, reacting, messaging, purchasing, uploading, deleting, or changing account state
-- remote debugging bound only to `127.0.0.1`/localhost
-- no `--no-sandbox`, certificate-error bypass, security disabling, or LAN-exposed debugging port
-- Deno receives only the subprocess, loopback-network, selected app/case paths, and explicitly selected cookies-file read permission needed for the run
+Readiness, scrolling, and page-growth limits keep captures bounded. Depending on the selected outcome, a page that does not fully settle or continues growing may be saved as **Complete with warnings**, **Partial**, or **Failed**. Optional evidence outputs include MHTML, response HTML, rendered DOM, sanitized network and failed-request reports, console errors, browser-security details, and failure screenshots. Sensitive headers and request bodies are not recorded.
 
-Before visual capture, Webpage Capture waits for either the DOM-content-loaded event or the full browser load event, according to the selected **Readiness event**. It then performs an optional bounded network-quiet check, waits for any enabled CSS-selector and/or literal-text conditions within one shared timeout, applies the selected timeout action, and finally applies the configured additional wait. A maximum network-settling value of `0` disables that stage. Selector waits can require that the element merely exists or is visibly rendered; text waits can search visible rendered text or complete DOM text. Matching is literal and case-sensitive. Invalid selectors and navigation command failures always fail the URL.
-
-The **Environment & State** tab defaults to **Desktop 1440 × 900**, device scale `1.0`, desktop layout, no touch emulation, landscape orientation, browser-default locale/timezone/colour scheme, and no reduced-motion override. Presets are convenience bundles for viewport, scale, mobile layout, touch, and orientation; changing any of those values makes the selection **Custom**. Tablet and mobile presets do not claim to reproduce a named physical device and do not replace Chromium's normal user agent. The effective preset and every underlying environment value are recorded in the sidecar. Locale accepts BCP 47-style values such as `en-CA`; timezone accepts IANA-style values such as `America/Toronto`.
-
-Before each URL, WAVI applies the selected cache and service-worker policy, optionally clears isolated site storage, optionally clears the isolated browser cookie store, imports the selected Netscape cookies, and then navigates. **Disable browser cache** is enabled by default; service-worker bypass and reload-without-cache are disabled by default. Site-storage handling can keep storage, clear only the requested origin, or clear all origins visited earlier in the same run. Storage clearing excludes cookies and runs before cookie import. **Clear browser cookies before each URL** is enabled by default and applies even when no cookies file is selected; disabling it explicitly allows cookies created by one URL to remain available to later URLs in the same isolated run. Normal browser profiles are never used.
-
-When **Reload once without cache** is enabled, WAVI completes the configured readiness cycle for the initial navigation, reloads the page with Chromium's cache bypass, and performs the readiness cycle again before capture. The sidecar records both cycles, cache and service-worker state, storage origins cleared, whether cookies were cleared before import, and the final effective browser environment.
-
-Full-page mode can scroll in bounded steps to trigger lazy content and stop after stable-height checks, the configured time limit, or a continued-growth cycle limit. If a page keeps growing, WAVI can capture the loaded portion as **Partial**, capture it as **Complete with warnings**, or fail the URL. Enable final page remeasurement when page dimensions should be refreshed immediately before capture. User-configurable single-image height and pixel limits remain bounded by WAVI's hard safety ceilings; pages beyond those limits are captured as numbered vertical segments using the selected segment height, overlap, and maximum count. Reaching the scroll-time or segment-count limit marks the result partial rather than silently treating an incomplete page as a complete capture.
-
-Optional stabilization can disable CSS animations, disable CSS transitions, hide scrollbars, and preserve, neutralize, or hide likely fixed/sticky navigation elements. These changes apply only during visual image capture, are removed afterward, and are recorded as presentation-altering actions. Initial-viewport mode captures the configured viewport before lazy-load scrolling. Combined mode saves both views in the same run. PNG remains the lossless default; JPEG and WebP use the selected quality value and are recorded as lossy in the sidecar. Capture-stage failures can be retried up to two times; each retry re-navigates the URL and rebuilds the temporary page state before another visual-capture attempt.
-
-**Interactive Overlays** is disabled by default. When enabled, WAVI scans visible and loaded page controls for likely gallery, image, video, media, preview, post, story, reel, card, or detail items. Matching uses accessible labels, visible text, roles, element names, IDs, classes, links, image attributes, and common data attributes. Raw images and videos without a clickable parent or explicit interactive behavior are excluded from automatic clicking. Same-origin links are preferred when their route resembles a media or detail URL. Non-link controls must advertise an overlay through supported ARIA or data attributes, or match an explicitly trusted site-specific whitelist rule written as `trigger|safe:term`. Broad terms such as `image`, `img`, `media`, `card`, or `post` cannot qualify an ambiguous non-link control by themselves.
-
-Immediately before every click, WAVI re-finds the selected element, re-reads its descriptor, reruns the immutable and editable blocklists, confirms the same-origin or overlay qualification, checks that the element has not moved materially, and uses `elementFromPoint()` to confirm that the selected element or one of its descendants is still topmost at the click coordinates. Candidates that fail any check are skipped with `click_skipped_safety`; the final hit-tested element, click point, movement measurements, and validation result are recorded in `_interactive-report.json`.
-
-**Warning:** Interactive capture sends real mouse clicks to a third-party webpage. These safeguards materially reduce the chance of clicking a social, account, form, commerce, or destructive action, but no automated interaction with a dynamic or authenticated site can be guaranteed side-effect-free. Sites may use unlabelled controls, opaque JavaScript handlers, changing layouts, or unfamiliar action names. Use a dedicated OSINT account with minimal privileges, keep the editable blacklist current for the target platform, test with a low maximum-item count, and review the interactive report. Avoid using an account where an unintended like, follow, save, message, purchase, deletion, or other state-changing action would create unacceptable risk.
-
-WAVI opens one validated match at a time, waits for a new dialog, modal, lightbox, viewer, or similar overlay, or for a same-origin route-based detail view such as a `/photo/...` or `/reel/...` page opened from a thumbnail, then applies the configured **Content wait** as a minimum settle delay and performs an additional bounded media-readiness check before capturing the selected overlay-only, viewport-only, or combined PNG output. Interactive capture runs while Chromium is still on the live source page and before Captured PNG PDF generation can navigate to WAVI's temporary loopback document. Interactive output names are controlled by the tab's filename template field, which supports the same common filename tags as the main capture tab, including `%urlindex%` for the submitted source URL number, `%overlayindex%` for the captured overlay number, `%profile%` for the detected account/profile handle, and `%contentid%` for the detected content identifier. Metadata extraction prioritizes the interactive item or opened route, merges partial profile and content-ID results with the source profile URL, and records the resolved filename metadata in the interactive report. WAVI then returns to the original page through an approved close control, Escape, or browser-history recovery as appropriate. The run is bounded by the maximum-item, open-timeout, content-wait, close-timeout, scan-step, candidate-attempt, and consecutive-non-capture limits. Each successful image is hashed, and an `_interactive-report.json` file is updated during the run so progress and partial results remain available if the capture is stopped early.
-
-The packaged `interactive-whitelist.txt` and `interactive-blacklist.txt` files contain the default matching terms. Each active line uses `category|term`; supported categories are `trigger`, `overlay`, `close`, `next`, `previous`, and `any`. Blank lines and lines beginning with `#` are ignored. Advanced users can add site-specific words, accessible labels, or ID/class fragments when a supported site uses different naming. Changes apply to the next preflight or capture. The blacklist is checked before the whitelist, and WAVI also retains built-in exclusions for high-risk actions even when the editable blacklist is changed. The rules are matching aids rather than a guarantee that a site is safe or compatible; review a small test capture before increasing the item limit.
-
-Optional PDF output has two modes. **Live Page (searchable)** uses Chromium's `Page.printToPDF` capability and exposes its main print options, including custom header and footer templates, page ranges, print backgrounds, and Live Page Layout controls for keeping the site print layout, removing fixed/sticky positioning, or hiding likely top navigation. **Captured PNG (visual match)** takes the saved PNG capture (including segmented full-page captures when needed) and lays it out across PDF pages, producing an image-based PDF that avoids repeated sticky or fixed overlays. This PDF source requires PNG image output; JPEG and WebP remain available with Live Page PDF or without PDF. Captured PNG PDF uses only local loopback resources and does not upload the images externally. If segmentation is intentionally bounded, Captured PNG PDF uses only the successfully captured image height rather than generating blank pages for the uncaptured remainder.
-
-Both PDF modes write to a temporary `.pdf.partial` file and rename it only after a valid PDF is received. Failed transfers remove the partial file. Per-read and overall timeouts prevent stalled PDF creation from remaining open indefinitely. PDF artifacts and sidecars record transfer details and available browser diagnostics. Exceptionally large pages may still exceed Chromium's layout limits.
-
-The **Large PDFs** tab applies to **Live Page** PDF output only. **Automatic** uses a lightweight estimate based on the current document height, paper size, margins, orientation, and scale; when the estimate reaches the configured threshold, WAVI writes numbered streamed files such as `_print_part001.pdf`. **Single PDF** always requests one streamed PDF. **Split into parts** always uses sequential Chromium page ranges. **Fail above safety limit** refuses Live Page PDF creation when the estimated page count exceeds the configured maximum. A manually entered **Pages** range takes precedence and is generated as one streamed PDF. Split sets are bounded by **Pages per part**, **Maximum total pages**, and **Maximum parts**. WAVI preserves completed parts after a later-part failure or safety limit, marks the PDF result and overall capture **Partial**, and writes a `_print.pdfset.json` descriptor containing the requested ranges, hashes, sizes, transport details, completion state, and termination reason. The page estimate is only a policy aid; Chromium print CSS can change the actual page count, so split completion is determined from the sequential print ranges rather than from the estimate alone.
-
-The **Evidence Outputs** tab creates supplemental artifacts only when selected. MHTML is generated through Chromium's page-snapshot capability. **Final response HTML** stores the final main-document response body when Chromium still exposes it and the response is HTML; **serialized rendered DOM** records the browser-mutated DOM after readiness and page preparation. The sanitized network report is capped at 5,000 records and the failed-request report at 1,000 records. `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` headers are redacted, request bodies are never recorded, URL fragments and embedded credentials are removed, and query values are redacted by default. Choosing complete query strings is explicit because URLs may contain sensitive tokens or identifiers. Console output is limited to warnings, errors, and uncaught exceptions, capped at 500 entries. Console and exception URLs follow the selected query handling, but page-supplied console message text may itself contain sensitive content and should be reviewed before sharing. TLS/browser-security output records available certificate, protocol, secure-context, mixed-content, and Chromium security-state details without bypassing certificate errors.
-
-**Save failure screenshot and failure metadata** is enabled by default. After the final configured attempt fails, WAVI tries to save the browser's current viewport plus a `.webcapture-failure.json` record containing the URL reached, page title, error, browser details, screenshot result, and available security metadata. Failure evidence does not mark the URL complete. A selected supplemental output that fails is recorded as a requested-artifact failure and leaves the URL incomplete for queue/recovery instead of being silently omitted.
-
-Typical output is:
-
-```text
-<case>\
-  media\
-    web\
-      <name>_full.png | .jpg | .webp
-      <name>_viewport.png | .jpg | .webp
-      <name>_print.pdf
-      <name>.mhtml
-      <name>.response.html
-      <name>.rendered.html
-      <name>.network.json
-      <name>.failed-requests.json
-      <name>.console.json
-      <name>.security.json
-      <name>_interactive-001_overlay.png      (Overlay only or Overlay and viewport)
-      <name>_interactive-001_viewport.png     (Viewport only or Overlay and viewport)
-      <name>_interactive-report.json
-      <name>.failure.png
-      <name>.webcapture-failure.json
-      <name>.webcapture.json
-  logs\
-    web-capture_<timestamp>.log
-  manifests\
-    sha256-manifest-web_<timestamp>.csv
-```
-
-After a successful direct or queued Webpage capture, **Copy Case Summary** provides a plain-text summary of submitted URLs, case paths, file counts, capture-completeness totals, Deno and browser versions, visual output settings, environment, readiness, scrolling, PDF and evidence-output choices, archive state, concurrency, cookies, proxy, and VPN state. Its **▼** menu copies or exports Webpage-only captured and failed URLs for the case; failed-URL actions remain available after an unsuccessful run. Completed queue-job summaries can also be copied from the Job Queue.
-
-The JSON sidecar records the requested and final URLs, redirect chain, main-document status and headers, page title, browser/version, effective environment preset, viewport, device scale, mobile/touch/orientation state, locale, timezone, colour scheme, reduced-motion preference, cache and service-worker policy, storage-clearing actions, between-URL cookie clearing, no-cache reload cycles, viewport and content dimensions, detailed readiness timing and outcomes, readiness timeout actions, selector/text condition results, page measurements before and after scrolling, scrolling termination and growth-limit results, configured and effective segmentation limits, segment overlap and truncation, visual-stabilization actions and affected-element counts, selected image format and quality, capture attempt and prior retry errors, non-sensitive cookie-import counts when enabled, PDF settings, the selected PDF capture mode, large-PDF policy/estimate/split-set results, any live-webpage behavior results, paginated-PNG PDF layout details when used, requested Evidence Outputs and their completion/errors, available browser security metadata, console/failed-request/network counts, output files, SHA256 hashes, and the final **Complete**, **Complete with warnings**, **Partial**, or **Failed** capture-completeness classification. When PDF output is requested but the browser cannot create it, the URL is left incomplete for queue/recovery purposes rather than being marked fully successful. A partial but successfully bounded visual capture is marked complete for queue/recovery while remaining explicitly classified as partial in the log and sidecar. The screenshot is a rendered visual capture of what the selected browser presented at the recorded time; it is not a server-side archive or an authenticity determination.
-
-Browser automation can still be blocked by enterprise browser policy, Defender for Endpoint, WDAC/AppLocker, ASR, or Controlled Folder Access. Preflight tests the isolated browser profile and loopback DevTools connection before capture.
+Each successful artifact is hashed. The webpage sidecar records the requested and final URLs, browser and capture settings, readiness and scrolling outcomes, generated files, hashes, warnings, and the final completeness classification. Captures may still be limited by site design, authentication challenges, anti-automation controls, browser policy, endpoint security, or Chromium's own page and PDF limits.
 
 ### Job Queue, Persistence, and Recovery
 
@@ -719,8 +659,6 @@ The **Default** profile is used initially. Changes are saved to the active profi
 
 Cookies File use is disabled by default.
 
-For authenticated OSINT captures, use only organization-approved investigative or "sock puppet" accounts and cookies created for those accounts. Never use personal accounts, personal browser profiles, or cookies from personal sessions.
-
 Cookies can help with approved authenticated captures or previews, but they are sensitive operational data. Cookie use does not guarantee access to restricted, private, expired, challenge-protected, or unsupported content.
 
 The app can:
@@ -743,7 +681,7 @@ The app does not collect credentials or automate website logins. Webpage Capture
 - Browser impersonation depends on the installed `yt-dlp` build and may be blocked by endpoint policy.
 - Webpage Capture may be blocked when browser remote debugging, developer tools, Deno child-process launches, loopback automation, or writes to the selected Output Root are restricted by enterprise policy.
 - Infinite feeds, virtualized lists, canvas/WebGL content, animations, autoplaying video, bot challenges, login/MFA flows, and pages that detect headless automation may be incomplete or unavailable. Environment presets are controlled browser emulation settings, not proof of an exact physical device or network location.
-- Webpage Capture does not automatically dismiss consent banners, sign in, submit forms, or perform unrestricted interaction. When **Interactive Overlays** is enabled, it only attempts conservative, pre-click-validated whitelist matches and may skip unsupported, ambiguous, virtualized, shadow-DOM, iframe, obscured, moving, or automation-resistant interfaces. Because it still sends real clicks to third-party pages, unintended state-changing interactions cannot be ruled out completely; use a minimally privileged OSINT account and review platform-specific blacklist rules before authenticated capture.
+- Webpage Capture does not automatically dismiss consent banners, sign in, submit forms, or perform unrestricted interaction. When **Interactive Overlays** is enabled, it only attempts conservative, pre-click-validated whitelist matches and may skip unsupported, ambiguous, virtualized, shadow-DOM, iframe, obscured, moving, or automation-resistant interfaces.
 - Proxy/VPN behavior depends on local routing, policy, and source-platform handling.
 - Case Browser thumbnails and media details generally require FFmpeg/FFprobe.
 - Manifest verification checks file hashes only; it does not assess authenticity, context, or legal sufficiency.
