@@ -37,6 +37,20 @@ function joinPath(...parts) {
   return filtered.join(separator);
 }
 
+function caseRelativeManifestPath(caseFolder, filePath) {
+  const separator = Deno.build.os === "windows" ? "\\" : "/";
+  const root = String(caseFolder || "").replace(/[\\/]+$/, "");
+  const candidate = String(filePath || "");
+  if (!root || !candidate) return "";
+
+  const compareRoot = Deno.build.os === "windows" ? root.toLowerCase() : root;
+  const compareCandidate = Deno.build.os === "windows" ? candidate.toLowerCase() : candidate;
+  const prefix = `${compareRoot}${separator}`;
+  if (!compareCandidate.startsWith(prefix)) return "";
+
+  return candidate.slice(root.length + 1).replace(/\\/g, "/");
+}
+
 function basename(path) {
   return String(path || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
 }
@@ -5895,7 +5909,10 @@ async function main() {
         );
         if (result.complete) {
           completed += 1;
-          if (config.universal_archive?.enabled) {
+          const archiveEligible = ["complete", "complete_with_warnings"].includes(
+            String(result.completenessClassification || "complete"),
+          );
+          if (config.universal_archive?.enabled && archiveEligible) {
             const capturedAtUtc = nowIso();
             const eventSeed = [
               String(config.job_id || ""),
@@ -5907,6 +5924,7 @@ async function main() {
             ].join("\n");
             const archivePayload = {
               event_id: await sha256Bytes(new TextEncoder().encode(eventSeed)),
+              classification: String(result.completenessClassification || "complete"),
               requested_url: url,
               final_url: result.finalUrl || url,
               captured_at_utc: capturedAtUtc,
@@ -5985,13 +6003,6 @@ async function main() {
         ].map(csvQuote).join(","));
       }
       await Deno.writeTextFile(skipCsvPath, skipCsvRows.join("\n") + "\n");
-      for (const [kind, path] of [
-        ["universal_archive_skip_json", skipJsonPath],
-        ["universal_archive_skip_csv", skipCsvPath],
-      ]) {
-        const info = await Deno.stat(path);
-        manifestRecords.push({ kind, path, sha256: await sha256File(path), size_bytes: info.size });
-      }
       console.log(
         `GUI_UNIVERSAL_ARCHIVE_SKIP_SUMMARY\t${universalArchiveSkipRecords.length}\t${skipJsonPath}\t${skipCsvPath}`,
       );
@@ -6005,8 +6016,10 @@ async function main() {
     for (const record of manifestRecords) {
       if (!record?.path || seen.has(record.path)) continue;
       seen.add(record.path);
+      const relativePath = caseRelativeManifestPath(caseFolder, record.path);
+      if (!relativePath || relativePath.toLowerCase().startsWith("manifests/")) continue;
       const hash = record.sha256 || await sha256File(record.path);
-      rows.push([csvQuote("SHA256"), csvQuote(hash), csvQuote(record.path)].join(","));
+      rows.push([csvQuote("SHA256"), csvQuote(hash), csvQuote(relativePath)].join(","));
     }
     await Deno.writeTextFile(manifestPath, rows.join("\n") + "\n");
     console.log(`WEB_CAPTURE_MANIFEST\t${manifestPath}`);

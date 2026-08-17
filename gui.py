@@ -13,10 +13,12 @@ import random
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import tempfile
 import time
 import traceback
 import urllib.request
@@ -31,7 +33,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 
 APP_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0725"
+APP_VERSION = "v3.2026.0816"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -66,8 +68,9 @@ WEB_UNIVERSAL_ARCHIVE_FILE = os.path.join(ROOT, "universal-webcapture-archive.sq
 WEB_INTERACTIVE_WHITELIST_FILE = os.path.join(ROOT, "interactive-whitelist.txt")
 WEB_INTERACTIVE_BLACKLIST_FILE = os.path.join(ROOT, "interactive-blacklist.txt")
 GUI_TEMP_DIR = os.path.join(ROOT, "gui-temp")
+WEB_CAPTURE_STALE_TEMP_AGE_SECONDS = 24 * 60 * 60
 DEBUG_LOG_FILE = os.path.join(ROOT, "gui-debug.log")
-JOBS_FILE_VERSION = 2
+JOBS_FILE_VERSION = 3
 DEFAULT_PROFILE_NAME = "Default"
 APP_TAB_LABELS = [
     "Audio/Video Capture",
@@ -408,7 +411,10 @@ APP_SETTINGS_DEFAULTS = {
     "output_log_follow_output": True,
 }
 
-DEFAULT_IMPERSONATE_TARGETS = ["None", "chrome", "edge", "firefox"]
+IMPERSONATE_NONE_LABEL = "None"
+IMPERSONATE_ANY_LABEL = "Any available"
+IMPERSONATE_ANY_SENTINEL = "__any__"
+DEFAULT_IMPERSONATE_TARGETS = [IMPERSONATE_NONE_LABEL]
 
 COOKIE_ENCRYPTION_MAGIC = "YTDLP_COOKIE_ENC"
 COOKIE_ENCRYPTION_VERSION = 1
@@ -418,6 +424,7 @@ COOKIE_NONCE_BYTES = 32
 COOKIE_MIN_PASSWORD_LENGTH = 8
 
 running_process = None
+av_direct_stop_requested = False
 created_temp_files = set()
 last_vpn_status = "unknown"
 adapter_display_map = {}
@@ -467,6 +474,11 @@ domain_preset_window = None
 case_browser_reload_after_id = None
 case_browser_root_watch_after_id = None
 case_browser_loaded_root_state = None
+# Transient root used by Case Browser after a capture finishes. It is not a
+# persistent setting: manual changes to the Audio/Video Output Root reclaim
+# the browser root, while Image/Webpage/queued captures can direct review to
+# the Output Root that actually produced the case.
+case_browser_runtime_output_root = ""
 case_browser_active_token = None
 case_browser_result_queue = queue.Queue()
 case_browser_result_poller_running = False
@@ -880,6 +892,76 @@ def log_debug_exception(context, exc=None):
     except Exception:
         # Debug logging must never become a new crash source.
         pass
+
+
+def web_capture_temp_profile_appears_active(profile_root):
+    """Return True when an app-owned Chromium profile still has a live DevTools port."""
+    port_file = os.path.join(str(profile_root or ""), "DevToolsActivePort")
+    if not os.path.isfile(port_file):
+        return False
+    try:
+        first_line = Path(port_file).read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+        port = int(first_line)
+        if not 1 <= port <= 65535:
+            return False
+        with socket.create_connection(("127.0.0.1", port), timeout=0.15):
+            return True
+    except Exception:
+        return False
+
+
+def cleanup_stale_web_capture_temp_dirs(max_age_seconds=WEB_CAPTURE_STALE_TEMP_AGE_SECONDS):
+    """Remove abandoned app-owned Webpage browser-profile run folders.
+
+    Cleanup is intentionally narrow: only immediate run folders created under
+    gui-temp/web-capture are considered, each must contain WAVI's
+    browser-profile directory, recently created folders are preserved, and a
+    profile with a live DevTools loopback port is never removed.
+    """
+    web_temp_root = os.path.abspath(os.path.join(GUI_TEMP_DIR, "web-capture"))
+    if not os.path.isdir(web_temp_root):
+        return 0
+
+    try:
+        entries = list(os.scandir(web_temp_root))
+    except Exception as e:
+        log_debug_exception("Could not enumerate stale Webpage temp profiles", e)
+        return 0
+
+    removed = 0
+    cutoff = time.time() - max(60, int(max_age_seconds or WEB_CAPTURE_STALE_TEMP_AGE_SECONDS))
+    for entry in entries:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            run_root = os.path.abspath(entry.path)
+            try:
+                if os.path.commonpath([web_temp_root, run_root]) != web_temp_root:
+                    continue
+            except Exception:
+                continue
+            profile_root = os.path.join(run_root, "browser-profile")
+            if not os.path.isdir(profile_root) or os.path.islink(run_root) or os.path.islink(profile_root):
+                continue
+            if os.path.getmtime(run_root) > cutoff:
+                continue
+            if web_capture_temp_profile_appears_active(profile_root):
+                continue
+            shutil.rmtree(run_root)
+            removed += 1
+        except Exception as e:
+            log_debug_exception(f"Could not remove stale Webpage temp profile: {getattr(entry, 'path', '')}", e)
+
+    try:
+        if os.path.isdir(web_temp_root) and not os.listdir(web_temp_root):
+            os.rmdir(web_temp_root)
+    except Exception as e:
+        log_debug_exception("Could not remove empty Webpage temp root", e)
+
+    return removed
+
+
+STALE_WEB_CAPTURE_TEMP_DIRS_REMOVED = cleanup_stale_web_capture_temp_dirs()
 
 
 def run_safe_ui_callback(callback, callback_args=()):
@@ -2089,16 +2171,39 @@ def update_window_title():
 
 
 def normalize_impersonate_target(value):
-    value = value.strip()
-    if not value or value.lower() == "none":
+    value = str(value or "").strip()
+    if not value or value.lower() == IMPERSONATE_NONE_LABEL.lower():
         return ""
 
-    # The "Show all targets" list displays the OS beside each target, e.g.
-    # "chrome-124 (windows-10)", but yt-dlp only wants the target token.
-    if " (" in value:
-        value = value.split(" (", 1)[0].strip()
+    lowered = value.lower()
+    if lowered in {IMPERSONATE_ANY_LABEL.lower(), IMPERSONATE_ANY_SENTINEL}:
+        return IMPERSONATE_ANY_SENTINEL
+
+    # Display labels use "Client (automatic)" for a family selector and
+    # "Client-version (OS-version)" for an exact fingerprint. yt-dlp expects
+    # those as "client" and "client-version:os-version" respectively.
+    match = re.fullmatch(r"(.+?)\s*\(([^()]*)\)\s*", value)
+    if match:
+        client_value = match.group(1).strip()
+        qualifier = match.group(2).strip()
+        if qualifier.lower() == "automatic" or qualifier == "-":
+            value = client_value
+        elif qualifier:
+            value = f"{client_value}:{qualifier}"
+        else:
+            value = client_value
 
     return value.split()[0].lower()
+
+
+def append_ytdlp_impersonate_args(cmd, value):
+    target = normalize_impersonate_target(value)
+    if target == IMPERSONATE_ANY_SENTINEL:
+        cmd.append("--impersonate=")
+    elif target:
+        cmd += ["--impersonate", target]
+
+    return target
 
 
 def get_capture_date_max():
@@ -2306,7 +2411,88 @@ def on_date_filter_combo_changed(prefix):
 
 def safe_case_name(name):
     invalid_chars = '\\/:*?"<>|'
-    return "".join("_" if ch in invalid_chars else ch for ch in name).strip()
+    return "".join("_" if ch in invalid_chars else ch for ch in str(name or "")).strip()
+
+
+WINDOWS_RESERVED_CASE_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+
+
+def validate_windows_resolved_case_name(name, label="Case Name"):
+    value = str(name or "")
+    if not value.strip():
+        raise ValueError(f"{label} is blank after resolving the template.")
+    if value != value.rstrip(" ."):
+        raise ValueError(f"{label} cannot end with a space or period on Windows.")
+    if any(ord(ch) < 32 for ch in value):
+        raise ValueError(f"{label} contains a Windows-invalid control character.")
+
+    sanitized = safe_case_name(value)
+    if not sanitized:
+        raise ValueError(f"{label} is blank after resolving the template.")
+
+    base_name = sanitized.split(".", 1)[0].upper()
+    if base_name in WINDOWS_RESERVED_CASE_BASENAMES:
+        raise ValueError(f"{label} resolves to the Windows-reserved name '{sanitized}'. Choose a different case name.")
+    if sanitized.endswith("."):
+        raise ValueError(f"{label} cannot end with a period on Windows.")
+    return sanitized
+
+
+def resolve_windows_case_name(template_value, label="Case Name"):
+    return validate_windows_resolved_case_name(template_value, label=label)
+
+
+def normalize_and_validate_output_root(value, label="Capture"):
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        raise ValueError(f"{label} Output Root cannot be blank.")
+
+    expanded = os.path.abspath(os.path.expandvars(os.path.expanduser(raw_value)))
+    try:
+        os.makedirs(expanded, exist_ok=True)
+    except Exception as exc:
+        raise ValueError(f"{label} Output Root could not be created or opened: {exc}") from exc
+
+    if not os.path.isdir(expanded):
+        raise ValueError(f"{label} Output Root is not a folder: {expanded}")
+
+    probe_path = ""
+    try:
+        fd, probe_path = tempfile.mkstemp(prefix=".wavi-write-test-", dir=expanded)
+        os.close(fd)
+    except Exception as exc:
+        raise ValueError(f"{label} Output Root is not writable: {expanded} ({exc})") from exc
+    finally:
+        if probe_path:
+            try:
+                os.remove(probe_path)
+            except Exception:
+                pass
+
+    return expanded
+
+
+def validate_enabled_cookies_file(enabled, path, label="Capture"):
+    if not bool(enabled):
+        return ""
+    cookies_path = str(path or "").strip()
+    if not cookies_path:
+        raise ValueError(f"{label} Cookies File is enabled, but no file was selected.")
+    if not os.path.isfile(cookies_path):
+        raise ValueError(f"{label} Cookies File is missing or invalid.")
+    return cookies_path
+
+
+def get_runtime_summary_settings(settings):
+    runtime_settings = dict(settings) if isinstance(settings, dict) else {}
+    runtime_settings["_runtime_proxy_summary"] = get_proxy_status_summary()
+    runtime_settings["_runtime_vpn_check_enabled"] = bool(check_vpn_var.get())
+    runtime_settings["_runtime_universal_archive_enabled"] = app_universal_archive_enabled()
+    return runtime_settings
 
 
 def format_case_tag_list(values, fallback="none"):
@@ -2395,7 +2581,7 @@ def get_resolved_case_name(now=None, domains=None, presets=None, playlist=None):
         playlist=playlist,
         engine="yt-dlp",
     )
-    return safe_case_name(rendered)
+    return resolve_windows_case_name(rendered, label="Audio/Video Capture Case Name")
 
 
 YTDLP_FILENAME_TAGS = [
@@ -3050,6 +3236,67 @@ def is_case_verification_ignored_path(path):
         return ".gui-cache" in lowered or "manifests" in lowered
 
 
+def is_wavi_case_manifest_filename(file_name):
+    lowered = str(file_name or "").strip().lower()
+    if not lowered.endswith(".csv"):
+        return False
+    return lowered.startswith("sha256-manifest") or lowered.startswith("gallery-dl-sha256-manifest")
+
+
+def normalize_case_manifest_row(row):
+    if not isinstance(row, dict):
+        return "", ""
+
+    raw_path = str(row.get("Path") or row.get("RelativePath") or "").strip()
+    raw_hash = str(row.get("Hash") or row.get("SHA256") or "").strip().upper()
+    if not raw_path or not re.fullmatch(r"[0-9A-F]{64}", raw_hash):
+        return "", ""
+    return raw_path, raw_hash
+
+
+def is_path_within_case_root(case_root, path):
+    try:
+        case_abs = os.path.abspath(case_root)
+        path_abs = os.path.abspath(path)
+        return os.path.normcase(os.path.commonpath([case_abs, path_abs])) == os.path.normcase(case_abs)
+    except Exception:
+        return False
+
+
+def resolve_case_manifest_record_path(case_root, raw_path):
+    case_abs = os.path.abspath(case_root)
+    text = str(raw_path or "").strip().strip('"')
+    if not text:
+        return ""
+
+    # New WAVI manifests use case-relative paths with forward slashes. Accept
+    # either slash style so older Image manifests remain portable as well.
+    local_text = text.replace("/", os.sep).replace("\\", os.sep)
+    if not os.path.isabs(local_text):
+        candidate = os.path.abspath(os.path.join(case_abs, local_text))
+        return candidate if is_path_within_case_root(case_abs, candidate) else ""
+
+    absolute_candidate = os.path.abspath(local_text)
+    if is_path_within_case_root(case_abs, absolute_candidate):
+        return absolute_candidate
+
+    # Legacy A/V and Webpage manifests stored absolute paths. If the case was
+    # moved as a folder, remap the suffix following the case-folder name into
+    # the currently selected case root rather than reading an arbitrary path
+    # outside the case.
+    case_name = os.path.basename(os.path.normpath(case_abs))
+    if case_name:
+        parts = [part for part in re.split(r"[\\/]+", text) if part]
+        matching_indexes = [index for index, part in enumerate(parts) if part.lower() == case_name.lower()]
+        if matching_indexes:
+            suffix_parts = parts[matching_indexes[-1] + 1:]
+            relocated = os.path.abspath(os.path.join(case_abs, *suffix_parts))
+            if is_path_within_case_root(case_abs, relocated):
+                return relocated
+
+    return ""
+
+
 def count_case_files(case_folder):
     counts = {
         "files": 0,
@@ -3134,21 +3381,21 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Format strategy: {setting_value('format_strategy', format_strategy_var.get())}",
         f"  Source scope: {setting_value('source_scope', source_scope_var.get())}",
         f"  Archive mode: {setting_value('archive_mode', archive_mode_var.get())}",
-        f"  Universal archive: {'enabled; used with Archive Mode = Use and synced to the case archive' if universal_archive_enabled_var.get() else 'disabled'}",
+        f"  Universal archive: {get_universal_archive_status('yt-dlp', settings).get('state', 'disabled')}",
         f"  Max resolution: {setting_value('max_resolution', max_resolution_var.get())}",
         f"  Display cache: {setting_value('gui_cache_mode', gui_cache_mode_var.get())}",
         f"  File manifest: {setting_value('manifest_mode', manifest_mode_var.get())}",
         f"  Failure handling: {setting_value('failure_handling', failure_handling_var.get())}",
         f"  Rate limit: {setting_value('rate_limit', rate_limit_var.get())}",
-        f"  Download speed limit: {'enabled' if download_speed_limit_enabled_var.get() else 'disabled'}; {setting_value('download_speed_limit', download_speed_limit_var.get())}",
+        f"  Download speed limit: {'enabled' if bool(setting_value('download_speed_limit_enabled', download_speed_limit_enabled_var.get())) else 'disabled'}; {setting_value('download_speed_limit', download_speed_limit_var.get())}",
         f"  Retry behavior: {setting_value('retry_behavior', retry_behavior_var.get())}",
-        f"  Throttle detection: {'enabled' if throttle_detection_enabled_var.get() else 'disabled'}; {setting_value('throttled_rate', throttled_rate_var.get())}",
-        f"  HTTP chunk size: {'enabled' if http_chunk_size_enabled_var.get() else 'disabled'}; {setting_value('http_chunk_size', http_chunk_size_var.get())}",
+        f"  Throttle detection: {'enabled' if bool(setting_value('throttle_detection_enabled', throttle_detection_enabled_var.get())) else 'disabled'}; {setting_value('throttled_rate', throttled_rate_var.get())}",
+        f"  HTTP chunk size: {'enabled' if bool(setting_value('http_chunk_size_enabled', http_chunk_size_enabled_var.get())) else 'disabled'}; {setting_value('http_chunk_size', http_chunk_size_var.get())}",
         f"  Concurrent captures: {setting_value('concurrent_captures', concurrent_captures_var.get())}",
         f"  Concurrent fragments: {setting_value('concurrent_fragments', concurrent_fragments_var.get())}",
         f"  Impersonate target: {setting_value('impersonate_target', impersonate_var.get())}",
-        f"  Proxy: {get_proxy_status_summary()}",
-        f"  VPN check: {'enabled' if check_vpn_var.get() else 'disabled'}",
+        f"  Proxy: {setting_value('_runtime_proxy_summary', get_proxy_status_summary())}",
+        f"  VPN check: {'enabled' if bool(setting_value('_runtime_vpn_check_enabled', check_vpn_var.get())) else 'disabled'}",
     ]
 
     return "\n".join(lines)
@@ -3200,7 +3447,6 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
     metadata_text = ", ".join(metadata_outputs) if metadata_outputs else "none"
     max_items = settings.get("image_max_items") if settings.get("image_max_items_enabled") else "disabled"
     item_range = settings.get("image_item_range") if settings.get("image_item_range_enabled") else "disabled"
-    universal_effective = app_universal_archive_enabled() and str(settings.get("image_archive_mode", DEFAULTS.get("image_archive_mode", "use"))).lower() == "use"
     lines = [
         "WAVI Capture GUI for OSINT - Image Case Summary",
         "",
@@ -3237,7 +3483,7 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
         f"  Capture mode: {_image_capture_mode_label(_summary_setting(settings, 'image_capture_mode', image_capture_mode_var.get()))}",
         f"  Metadata outputs: {metadata_text}",
         f"  Archive mode: {_image_archive_mode_label(_summary_setting(settings, 'image_archive_mode', image_archive_mode_var.get()))}",
-        f"  Universal archive: {'enabled' if universal_effective else 'disabled'}",
+        f"  Universal archive: {get_universal_archive_status('gallery-dl', settings).get('state', 'disabled')}",
         f"  Maximum items: {max_items}",
         f"  Item range: {item_range}",
         f"  Pacing: {get_image_pacing_summary(_summary_setting(settings, 'image_rate_limit', image_rate_limit_var.get()))}",
@@ -3245,8 +3491,8 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
         f"  Timeout: {_summary_setting(settings, 'image_timeout', image_timeout_var.get())} seconds",
         f"  Concurrent captures: {_summary_setting(settings, 'image_concurrent_captures', image_concurrent_captures_var.get())}",
         f"  Cookies file: {_summary_enabled(_summary_setting(settings, 'image_use_cookies_file', image_use_cookies_file_var.get()))}",
-        f"  Proxy: {get_proxy_status_summary()}",
-        f"  VPN check: {_summary_enabled(check_vpn_var.get())}",
+        f"  Proxy: {settings.get('_runtime_proxy_summary', get_proxy_status_summary())}",
+        f"  VPN check: {_summary_enabled(settings.get('_runtime_vpn_check_enabled', check_vpn_var.get()))}",
     ]
     return "\n".join(lines)
 
@@ -3349,11 +3595,11 @@ def build_web_case_summary_text(exit_code, submitted_url_count, paths, versions,
             else "  PDF: Disabled"
         ),
         f"  Evidence outputs: {evidence_text}",
-        f"  Universal archive: {_summary_enabled(app_universal_archive_enabled())}",
+        f"  Universal archive: {get_universal_archive_status('web-capture', settings).get('state', 'disabled')}",
         f"  Concurrent captures: {settings.get('web_concurrent_captures', DEFAULTS['web_concurrent_captures'])}",
         f"  Cookies file: {_summary_enabled(settings.get('web_use_cookies_file', False))}; scope {cookie_scope}",
-        f"  Proxy: {get_proxy_status_summary()}",
-        f"  VPN check: {_summary_enabled(check_vpn_var.get())}",
+        f"  Proxy: {settings.get('_runtime_proxy_summary', get_proxy_status_summary())}",
+        f"  VPN check: {_summary_enabled(settings.get('_runtime_vpn_check_enabled', check_vpn_var.get()))}",
     ]
     return "\n".join(lines)
 
@@ -3787,11 +4033,13 @@ def cleanup_web_capture_temp_from_config(config_path):
                     if os.path.isdir(run_root):
                         shutil.rmtree(run_root)
                     break
-                except Exception:
+                except Exception as e:
                     if attempt < 7:
                         time.sleep(0.2)
-    except Exception:
-        pass
+                    else:
+                        log_debug_exception(f"Could not clean Webpage temp run folder: {run_root}", e)
+    except Exception as e:
+        log_debug_exception(f"Could not inspect Webpage temp config for cleanup: {config_path}", e)
 
 
 def cleanup_command_input_file_if_temp(cmd):
@@ -5185,11 +5433,8 @@ def validate_inputs():
                 + "\n".join(missing_input_files)
             )
 
-    if use_cookies_file_var.get() and cookies_file and not os.path.isfile(cookies_file):
-        raise ValueError("Cookies file is invalid.")
-
-    if output_root and not os.path.isdir(output_root):
-        os.makedirs(output_root, exist_ok=True)
+    validate_enabled_cookies_file(use_cookies_file_var.get(), cookies_file, label="Audio/Video Capture")
+    normalize_and_validate_output_root(output_root, label="Audio/Video Capture")
 
     if ffmpeg_folder and not os.path.isdir(ffmpeg_folder):
         raise ValueError("FFmpeg folder is invalid.")
@@ -5264,6 +5509,8 @@ def prepare_queue_job_for_restart(job):
     job["interrupted_at"] = ""
     job.pop("completed_url_indexes", None)
     job.pop("failed_url_indexes", None)
+    job.pop("web_capture_classifications", None)
+    job.pop("web_capture_classification_summary", None)
     job["_run_mode"] = "restart"
     job["_resume_base_completed"] = 0
 
@@ -5339,17 +5586,17 @@ def validate_queue_job_inputs(job):
     if not urls:
         raise ValueError("The queue job does not contain any URLs.")
 
-    if bool(settings.get("use_cookies_file", DEFAULTS["use_cookies_file"])) and cookies_file and not os.path.isfile(cookies_file):
-        raise ValueError("Cookies file is invalid.")
-
-    if output_root and not os.path.isdir(output_root):
-        os.makedirs(output_root, exist_ok=True)
+    validate_enabled_cookies_file(
+        bool(settings.get("use_cookies_file", DEFAULTS["use_cookies_file"])),
+        cookies_file,
+        label="Audio/Video Capture",
+    )
+    settings["output_root"] = normalize_and_validate_output_root(output_root, label="Audio/Video Capture")
 
     if ffmpeg_folder and not os.path.isdir(ffmpeg_folder):
         raise ValueError("FFmpeg folder is invalid.")
 
-    if not resolved_case_name:
-        raise ValueError("Queue job resolved case name is blank.")
+    validate_windows_resolved_case_name(resolved_case_name, label="Queue Job Case Name")
 
     get_enabled_capture_dates_from_settings(settings)
 
@@ -5406,6 +5653,9 @@ def get_case_summary_paths_for_job(job):
 def build_case_summary_for_job(job, exit_code, submitted_url_count, paths, versions, counts, universal_skip_records=None, universal_skip_summary=None):
     engine = get_job_engine(job)
     settings = job.get("settings", {}) if isinstance(job.get("settings", {}), dict) else {}
+    runtime_settings = job.get("_runtime_summary_settings", {})
+    if isinstance(runtime_settings, dict) and runtime_settings:
+        settings = {**settings, **runtime_settings}
     if engine == "gallery-dl":
         return build_image_case_summary_text(exit_code, submitted_url_count, paths, versions, counts, settings=settings)
     if engine == "web-capture":
@@ -5719,7 +5969,7 @@ def preflight_check(show_success_popup=True):
         if cookies_file:
             add_check("Cookies file exists", os.path.isfile(cookies_file), cookies_file)
         else:
-            add_check("Cookies file", True, "Enabled, but not specified")
+            add_check("Cookies file", False, "Enabled, but no file was selected")
     else:
         add_check("Cookies file", True, "Disabled by app setting; skipped")
 
@@ -5736,11 +5986,10 @@ def preflight_check(show_success_popup=True):
     add_check(archive_status["label"], True, f"{archive_status['state']}; {archive_status['path']}")
 
     try:
-        if output_root:
-            os.makedirs(output_root, exist_ok=True)
-        add_check("Output root exists or can be created", os.path.isdir(output_root), output_root)
+        validated_output_root = normalize_and_validate_output_root(output_root, label="Audio/Video Capture")
+        add_check("Output root exists and is writable", True, validated_output_root)
     except Exception as e:
-        add_check("Output root exists or can be created", False, str(e))
+        add_check("Output root exists and is writable", False, str(e))
 
     if os.path.isfile(yt_dlp_path):
         version_info = get_tool_first_line(
@@ -7158,10 +7407,10 @@ def apply_app_settings_dict(settings):
 
 
 def get_universal_archive_status(engine, settings=None):
-    """Return a consistent app-level universal archive status for capture logs."""
+    """Return a consistent app-level universal archive status for capture logs and summaries."""
     normalized_engine = str(engine or "").strip().lower()
-    app_enabled = app_universal_archive_enabled()
     settings = settings if isinstance(settings, dict) else {}
+    app_enabled = bool(settings.get("_runtime_universal_archive_enabled", app_universal_archive_enabled()))
 
     if normalized_engine in {"gallery-dl", "image", "image-capture"}:
         label = "Image universal archive"
@@ -8803,6 +9052,7 @@ def clear_url_history_files():
     for root_value in [
         output_root_var.get().strip() if 'output_root_var' in globals() else '',
         image_output_root_var.get().strip() if 'image_output_root_var' in globals() else '',
+        web_output_root_var.get().strip() if 'web_output_root_var' in globals() else '',
     ]:
         if not root_value:
             continue
@@ -8818,7 +9068,7 @@ def clear_url_history_files():
     if not roots:
         messagebox.showinfo(
             "No Output Root",
-            "No Audio/Video or Image Capture Output Root is currently configured.",
+            "No Audio/Video, Image, or Webpage Capture Output Root is currently configured.",
         )
         return
 
@@ -8861,6 +9111,10 @@ def clear_url_history_files():
         append_log("\nCleared GUI URL history file(s):\n" + "\n".join(deleted) + "\n")
         try:
             image_append_log("\nCleared GUI URL history file(s):\n" + "\n".join(deleted) + "\n")
+        except Exception:
+            pass
+        try:
+            web_append_log("\nCleared GUI URL history file(s):\n" + "\n".join(deleted) + "\n")
         except Exception:
             pass
 
@@ -9123,6 +9377,13 @@ def inspect_web_universal_archive(create=True):
 def record_web_universal_archive_capture(payload):
     """Commit one successful Webpage Capture and its requested/final URL aliases to SQLite."""
     payload = payload if isinstance(payload, dict) else {}
+    classification = str(payload.get("classification") or "").strip().lower()
+    if classification not in {"complete", "complete_with_warnings"}:
+        raise ValueError(
+            "The Webpage Capture archive record was not eligible for the universal archive "
+            f"(classification: {classification or 'missing'})."
+        )
+
     requested_url = clean_extracted_url(payload.get("requested_url", ""))
     final_url = clean_extracted_url(payload.get("final_url", "")) or requested_url
     requested_normalized = normalize_web_universal_archive_url(requested_url)
@@ -9177,8 +9438,8 @@ def record_web_universal_archive_capture(payload):
                 )
         try:
             connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug_exception("Webpage universal archive WAL checkpoint failed", e)
         return f"web:{capture_id}"
     finally:
         connection.close()
@@ -9861,7 +10122,7 @@ def reset_defaults():
 
 
 def start_capture():
-    global running_process, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name
+    global running_process, av_direct_stop_requested, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name, active_av_direct_universal_archive
 
     effective_concurrency_limit = get_concurrent_capture_limit()
 
@@ -9922,21 +10183,30 @@ def start_capture():
         pending_playlist_name = consume_url_preview_pending_playlist_name()
         command_settings = get_settings_dict()
         command_settings, applied_domain_presets = apply_checked_domain_presets_to_settings(command_settings, capture_urls)
+        command_settings["output_root"] = normalize_and_validate_output_root(
+            command_settings.get("output_root", ""),
+            label="Audio/Video Capture",
+        )
+        validate_enabled_cookies_file(
+            command_settings.get("use_cookies_file", DEFAULTS["use_cookies_file"]),
+            command_settings.get("cookies_file", ""),
+            label="Audio/Video Capture",
+        )
         capture_domains = sorted({domain for domain in (get_url_domain_key(url) for url in capture_urls) if domain})
         capture_case_template = command_settings.get("case_name", case_name_var.get().strip())
         if str(pending_playlist_name or "").strip():
             capture_case_template = append_playlist_tag_to_case_template(capture_case_template)
-        resolved_case_name = safe_case_name(render_case_name_template(
-            capture_case_template,
-            now=capture_timestamp,
-            domains=capture_domains,
-            presets=applied_domain_presets,
-            playlist=pending_playlist_name,
-            engine="yt-dlp",
-        ))
-
-        if not resolved_case_name:
-            raise ValueError("Case Name is blank after resolving the template.")
+        resolved_case_name = resolve_windows_case_name(
+            render_case_name_template(
+                capture_case_template,
+                now=capture_timestamp,
+                domains=capture_domains,
+                presets=applied_domain_presets,
+                playlist=pending_playlist_name,
+                engine="yt-dlp",
+            ),
+            label="Audio/Video Capture Case Name",
+        )
 
         cmd = build_powershell_command_for_job({
             "settings": command_settings,
@@ -9990,6 +10260,7 @@ def start_capture():
         if not proceed:
             return
 
+    av_direct_stop_requested = False
     prepare_case_summary_actions_for_run("yt-dlp")
     clear_engine_log_history("yt-dlp")
     append_log("Starting capture...\n\n")
@@ -10014,7 +10285,7 @@ def start_capture():
     last_capture_context = {
         "tool_versions": tool_versions,
         "submitted_url_count": len(capture_urls),
-        "settings": command_settings,
+        "settings": get_runtime_summary_settings(command_settings),
         "paths": get_expected_run_paths_for_values(
             command_settings.get("output_root", output_root_var.get().strip()),
             resolved_case_name,
@@ -10027,8 +10298,8 @@ def start_capture():
 
     start_button.config(state="disabled")
     start_menu_button.config(state="disabled")
-    stop_button.config(state="normal")
-    set_status("Running...")
+    stop_button.config(state="disabled")
+    set_status("Starting...")
 
     submitted_url_count = len(capture_urls)
     direct_recovery_job = create_direct_recovery_job(
@@ -10045,13 +10316,18 @@ def start_capture():
     active_av_direct_recovery_job_id = direct_recovery_job_id or ""
     active_av_direct_domains = list(capture_domains)
     active_av_direct_case_name = resolved_case_name
+    active_av_direct_universal_archive = bool("-UniversalArchiveFile" in cmd)
     if direct_recovery_job_id:
         append_log(f"Recovery job saved to Job Queue: {direct_recovery_job_id}\n")
     elif not job_persistence_is_enabled():
         append_log("Job Persistence is disabled; this direct capture will not be recoverable from the Job Queue.\n")
 
     def worker():
-        global running_process, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name
+        global running_process, av_direct_stop_requested, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name, active_av_direct_universal_archive
+
+        exit_code = 1
+        universal_skip_records = []
+        universal_skip_summary = {}
 
         try:
             running_process = subprocess.Popen(
@@ -10063,9 +10339,8 @@ def start_capture():
                 bufsize=1,
                 universal_newlines=True,
             )
-
-            universal_skip_records = []
-            universal_skip_summary = {}
+            safe_after(0, lambda: stop_button.config(state="normal"))
+            safe_after(0, set_status, "Running...")
 
             if running_process.stdout:
                 for line in running_process.stdout:
@@ -10081,12 +10356,11 @@ def start_capture():
                         continue
 
                     queue_append_log(line)
-                    if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE	") or line.startswith("GUI_QUEUE_URL_INCOMPLETE	")):
+                    if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
                         safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
 
             exit_code = running_process.wait()
 
-            safe_after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
             safe_after(0, show_run_summary, exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
             if exit_code == 0:
@@ -10101,14 +10375,20 @@ def start_capture():
             queue_append_log(f"\nERROR: {e}\n")
 
         finally:
+            safe_after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
             cleanup_command_input_file_if_temp(cmd)
+            running_process = None
             active_av_direct_recovery_job_id = ""
             active_av_direct_domains = []
             active_av_direct_case_name = ""
+            active_av_direct_universal_archive = False
             safe_after(0, lambda: start_button.config(state="normal"))
             safe_after(0, lambda: start_menu_button.config(state="normal"))
             safe_after(0, lambda: stop_button.config(state="disabled"))
-            safe_after(0, schedule_case_browser_autoload, 250)
+            if av_direct_stop_requested:
+                safe_after(0, set_status, "Interrupted")
+            av_direct_stop_requested = False
+            safe_after(0, schedule_case_browser_autoload, 250, command_settings.get("output_root", ""))
 
     start_daemon_thread("worker", worker)
 
@@ -10212,6 +10492,29 @@ def get_engine_concurrent_capture_limit(engine, settings=None):
     return get_concurrent_capture_limit(settings)
 
 
+def av_settings_use_universal_archive(settings=None):
+    settings = settings if isinstance(settings, dict) else {}
+    archive_mode = str(settings.get("archive_mode", DEFAULTS.get("archive_mode", "use")) or "use").strip().lower()
+    return bool(app_universal_archive_enabled() and archive_mode == "use")
+
+
+def get_active_av_universal_archive_execution_count():
+    count = sum(
+        1
+        for running_job in get_running_queue_jobs()
+        if get_job_engine(running_job) == "yt-dlp" and bool(running_job.get("_av_universal_archive_active", False))
+    )
+
+    try:
+        direct_active = running_process is not None and running_process.poll() is None
+    except Exception:
+        direct_active = False
+
+    if direct_active and bool(active_av_direct_universal_archive):
+        count += 1
+    return count
+
+
 def jobs_can_run_concurrently(left_job, right_job):
     left_engine = get_job_engine(left_job)
     right_engine = get_job_engine(right_job)
@@ -10219,7 +10522,7 @@ def jobs_can_run_concurrently(left_job, right_job):
         return True
     left_settings = left_job.get("settings", {}) if isinstance(left_job, dict) else {}
     right_settings = right_job.get("settings", {}) if isinstance(right_job, dict) else {}
-    return max(
+    return min(
         get_engine_concurrent_capture_limit(left_engine, left_settings),
         get_engine_concurrent_capture_limit(right_engine, right_settings),
     ) >= 2
@@ -10227,15 +10530,10 @@ def jobs_can_run_concurrently(left_job, right_job):
 
 def get_running_job_count_for_engine(engine):
     engine_name = str(engine or "").strip().lower()
-    count = sum(1 for job in job_queue if job.get("status") == "running" and get_job_engine(job) == engine_name)
+    count = sum(1 for job in get_running_queue_jobs() if get_job_engine(job) == engine_name)
 
     try:
-        queue_processes = set(job_queue_running_processes.values())
-    except Exception:
-        queue_processes = set()
-
-    try:
-        av_direct_active = running_process is not None and running_process.poll() is None and running_process not in queue_processes
+        av_direct_active = running_process is not None and running_process.poll() is None
     except Exception:
         av_direct_active = False
 
@@ -10248,30 +10546,25 @@ def get_running_job_count_for_engine(engine):
     except Exception:
         web_direct_active = False
 
-    if engine_name == "yt-dlp" and av_direct_active and not active_av_direct_recovery_job_id:
+    if engine_name == "yt-dlp" and av_direct_active:
         count += 1
-    elif engine_name == "gallery-dl" and image_direct_active and not active_image_direct_recovery_job_id:
+    elif engine_name == "gallery-dl" and image_direct_active:
         count += 1
-    elif engine_name == "web-capture" and web_direct_active and not active_web_direct_recovery_job_id:
+    elif engine_name == "web-capture" and web_direct_active:
         count += 1
 
     return count
 
 
-def get_ephemeral_active_direct_jobs():
+def get_active_direct_jobs():
     jobs = []
 
     try:
-        queue_processes = set(job_queue_running_processes.values())
-    except Exception:
-        queue_processes = set()
-
-    try:
-        av_direct_active = running_process is not None and running_process.poll() is None and running_process not in queue_processes
+        av_direct_active = running_process is not None and running_process.poll() is None
     except Exception:
         av_direct_active = False
 
-    if av_direct_active and not active_av_direct_recovery_job_id and active_av_direct_domains:
+    if av_direct_active and active_av_direct_domains:
         jobs.append({
             "engine": "yt-dlp",
             "status": "running",
@@ -10285,7 +10578,7 @@ def get_ephemeral_active_direct_jobs():
     except Exception:
         image_direct_active = False
 
-    if image_direct_active and not active_image_direct_recovery_job_id and active_image_direct_domains:
+    if image_direct_active and active_image_direct_domains:
         jobs.append({
             "engine": "gallery-dl",
             "status": "running",
@@ -10298,7 +10591,7 @@ def get_ephemeral_active_direct_jobs():
         web_direct_active = web_running_process is not None and web_running_process.poll() is None
     except Exception:
         web_direct_active = False
-    if web_direct_active and not active_web_direct_recovery_job_id and active_web_direct_domains:
+    if web_direct_active and active_web_direct_domains:
         jobs.append({
             "engine": "web-capture",
             "status": "running",
@@ -10312,7 +10605,48 @@ def get_ephemeral_active_direct_jobs():
 
 def queue_job_has_available_engine_slot(job):
     engine = get_job_engine(job)
-    return get_running_job_count_for_engine(engine) < get_engine_concurrent_capture_limit(engine)
+    candidate_settings = job.get("settings", {}) if isinstance(job, dict) else {}
+
+    # Direct captures are only launched when that engine's effective concurrent
+    # capture limit is 1. Do not let a later GUI setting change retroactively
+    # open another same-engine slot while that direct run is still active.
+    try:
+        if engine == "yt-dlp" and running_process is not None and running_process.poll() is None:
+            return False
+        if engine == "gallery-dl" and image_running_process is not None and image_running_process.poll() is None:
+            return False
+        if engine == "web-capture" and web_running_process is not None and web_running_process.poll() is None:
+            return False
+    except Exception as e:
+        log_debug_exception("Could not determine direct-capture scheduler occupancy", e)
+
+    # script-ytdlp.ps1 synchronizes universal archive additions back into the
+    # case archive using a per-run before/after view. Two WAVI A/V executions
+    # using the shared universal archive at the same time could therefore
+    # attribute each other's new entries to the wrong case. Serialize only
+    # those A/V executions that actually use the universal archive; ordinary
+    # non-universal A/V jobs retain their configured concurrency.
+    if engine == "yt-dlp" and av_settings_use_universal_archive(candidate_settings):
+        if get_active_av_universal_archive_execution_count() >= 1:
+            return False
+
+    effective_limit = get_engine_concurrent_capture_limit(engine, candidate_settings)
+
+    active_same_engine = [
+        running_job
+        for running_job in get_running_queue_jobs()
+        if get_job_engine(running_job) == engine
+    ]
+
+    for running_job in active_same_engine:
+        running_settings = running_job.get("settings", {}) if isinstance(running_job, dict) else {}
+        effective_limit = min(
+            effective_limit,
+            get_engine_concurrent_capture_limit(engine, running_settings),
+        )
+
+    active_count = get_running_job_count_for_engine(engine)
+    return active_count < effective_limit
 
 def get_concurrent_fragment_limit(settings=None):
     try:
@@ -10390,7 +10724,7 @@ def find_domain_collisions_for_job(candidate_job, statuses=("pending", "running"
             })
 
     if "running" in statuses:
-        for existing in get_ephemeral_active_direct_jobs():
+        for existing in get_active_direct_jobs():
             existing_domains = set(existing.get("domains") or [])
             overlap = sorted(candidate_domains & existing_domains)
             if overlap and jobs_can_run_concurrently(candidate_job, existing):
@@ -10529,6 +10863,59 @@ def job_persistence_is_enabled():
         return bool(APP_SETTINGS_DEFAULTS.get("job_persistence", True))
 
 
+WEB_CAPTURE_CLASSIFICATION_VALUES = {"complete", "complete_with_warnings", "partial", "failed"}
+
+
+def normalize_web_capture_classification_records(records, total_urls=0):
+    if not isinstance(records, dict):
+        return {}
+
+    try:
+        total = max(0, int(total_urls or 0))
+    except Exception:
+        total = 0
+
+    normalized = {}
+    for key, raw_record in records.items():
+        if not isinstance(raw_record, dict):
+            continue
+
+        try:
+            url_index = int(raw_record.get("url_index", key) or 0)
+        except Exception:
+            continue
+
+        if url_index <= 0 or (total and url_index > total):
+            continue
+
+        classification = str(raw_record.get("classification", "") or "").strip().lower()
+        if classification not in WEB_CAPTURE_CLASSIFICATION_VALUES:
+            continue
+
+        normalized[str(url_index)] = {
+            "url_index": url_index,
+            "classification": classification,
+            "url": str(raw_record.get("url", "") or ""),
+            "recorded_at": str(raw_record.get("recorded_at", "") or ""),
+        }
+
+    return dict(sorted(normalized.items(), key=lambda item: int(item[0])))
+
+
+def summarize_web_capture_classifications(records):
+    counts = {"complete": 0, "complete_with_warnings": 0, "partial": 0, "failed": 0}
+    if not isinstance(records, dict):
+        return counts
+
+    for item in records.values():
+        if not isinstance(item, dict):
+            continue
+        classification = str(item.get("classification", "") or "").strip().lower()
+        if classification in counts:
+            counts[classification] += 1
+    return counts
+
+
 def serialize_queue_job(job):
     allowed_keys = [
         "job_id",
@@ -10560,10 +10947,16 @@ def serialize_queue_job(job):
         "resume_strategy",
         "completed_url_indexes",
         "failed_url_indexes",
+        "web_capture_classifications",
     ]
 
     serialized = {key: job.get(key) for key in allowed_keys if key in job}
     serialized["settings_schema_version"] = int(job.get("settings_schema_version", SETTINGS_SCHEMA_VERSION) or SETTINGS_SCHEMA_VERSION)
+    if get_job_engine(job) == "web-capture":
+        serialized["web_capture_classifications"] = normalize_web_capture_classification_records(
+            job.get("web_capture_classifications", {}),
+            len(job.get("urls", []) or []),
+        )
     return serialized
 
 
@@ -10610,6 +11003,13 @@ def normalize_loaded_queue_job(raw_job):
     if engine not in {"yt-dlp", "gallery-dl", "web-capture"}:
         engine = "yt-dlp"
 
+    web_capture_classifications = {}
+    if engine == "web-capture":
+        web_capture_classifications = normalize_web_capture_classification_records(
+            raw_job.get("web_capture_classifications", {}),
+            len(clean_urls),
+        )
+
     job = {
         "job_id": str(raw_job.get("job_id") or make_job_id()),
         "engine": engine,
@@ -10640,6 +11040,8 @@ def normalize_loaded_queue_job(raw_job):
         "resume_strategy": str(raw_job.get("resume_strategy", "") or ""),
         "completed_url_indexes": list(raw_job.get("completed_url_indexes", []) or []),
         "failed_url_indexes": list(raw_job.get("failed_url_indexes", []) or []),
+        "web_capture_classifications": web_capture_classifications,
+        "web_capture_classification_summary": summarize_web_capture_classifications(web_capture_classifications),
     }
 
     if raw_status == "running":
@@ -10736,6 +11138,7 @@ def write_job_queue_state_now():
         atomic_write_json(JOBS_FILE, build_job_queue_state_payload(), indent=2)
         return True
     except Exception as e:
+        log_debug_exception("Could not save Job Queue state", e)
         try:
             append_log(f"\nWARNING: Could not save job queue state: {e}\n")
         except Exception:
@@ -10809,6 +11212,12 @@ def load_job_queue_state(startup=False):
         with open(JOBS_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
+        try:
+            jobs_file_version = int(payload.get("version", 0) or 0) if isinstance(payload, dict) else 0
+        except Exception:
+            jobs_file_version = 0
+        migrate_jobs_file = 0 <= jobs_file_version < JOBS_FILE_VERSION
+
         raw_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
         loaded_jobs = []
         interrupted_count = 0
@@ -10837,20 +11246,30 @@ def load_job_queue_state(startup=False):
 
         if startup:
             append_log(f"\nLoaded {len(job_queue)} persisted queue job(s) from: {JOBS_FILE}\n")
+            if migrate_jobs_file:
+                append_log(f"Migrating Job Queue file schema {jobs_file_version} to {JOBS_FILE_VERSION}.\n")
+            elif jobs_file_version > JOBS_FILE_VERSION:
+                append_log(
+                    f"WARNING: Persisted Job Queue file schema {jobs_file_version} is newer than this app's schema {JOBS_FILE_VERSION}; "
+                    "loaded known fields without rewriting the file.\n"
+                )
             if interrupted_count:
                 append_log(f"Marked {interrupted_count} previously running job(s) as interrupted.\n")
 
         append_loaded_job_schema_warning(schema_warnings)
 
-        if interrupted_count:
+        if interrupted_count or migrate_jobs_file:
             job_queue_state_loading = False
             save_job_queue_state(immediate=True)
             job_queue_state_loading = True
-            if startup:
+            if startup and migrate_jobs_file:
+                append_log(f"Job Queue file migration to schema {JOBS_FILE_VERSION} completed.\n")
+            if startup and interrupted_count:
                 safe_after(600, show_startup_interrupted_jobs_prompt, interrupted_count)
 
         return True
     except Exception as e:
+        log_debug_exception("Could not load persisted Job Queue", e)
         try:
             append_log(f"\nWARNING: Could not load persisted job queue: {e}\n")
         except Exception:
@@ -10865,7 +11284,7 @@ def mark_running_queue_jobs_interrupted(reason="Interrupted"):
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for job in job_queue:
-        if job.get("status") == "running":
+        if job_is_active_queue_execution(job):
             job["status"] = "interrupted"
             job["finished"] = now_text
             job["exit_code"] = "interrupted"
@@ -10880,6 +11299,29 @@ def mark_running_queue_jobs_interrupted(reason="Interrupted"):
         refresh_job_queue_window()
 
     return changed
+
+
+def mark_direct_recovery_job_interrupted(job_id, reason="Interrupted"):
+    if not job_id:
+        return False
+
+    job = get_queue_job_by_id(job_id)
+    if not job or not bool(job.get("direct_capture", False)):
+        return False
+    if job.get("status") != "running":
+        return False
+
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job["status"] = "interrupted"
+    job["finished"] = now_text
+    job["exit_code"] = "interrupted"
+    job["interrupted_at"] = now_text
+    job["interrupted_reason"] = reason
+    job["_interruption_requested"] = True
+    write_job_recovery_manifest(job, "interrupted")
+    save_job_queue_state(immediate=True)
+    refresh_job_queue_window()
+    return True
 
 
 def job_queue_window_is_open():
@@ -11239,21 +11681,33 @@ def add_urls_to_queue_as_job(urls, resolved_case_name=None, settings=None, case_
 
         settings = settings.copy() if isinstance(settings, dict) else get_settings_dict()
         settings, applied_presets = apply_checked_domain_presets_to_settings(settings, clean_urls)
+        settings["output_root"] = normalize_and_validate_output_root(
+            settings.get("output_root", ""),
+            label="Audio/Video Capture",
+        )
+        validate_enabled_cookies_file(
+            settings.get("use_cookies_file", DEFAULTS["use_cookies_file"]),
+            settings.get("cookies_file", ""),
+            label="Audio/Video Capture",
+        )
         case_template = case_template if case_template is not None else settings.get("case_name", "")
         if str(playlist_name or "").strip():
             case_template = append_playlist_tag_to_case_template(case_template)
         job_domains_for_tags = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
-        resolved_case_name = resolved_case_name or safe_case_name(render_case_name_template(
-            case_template,
-            now=datetime.now(),
-            domains=job_domains_for_tags,
-            presets=applied_presets,
-            playlist=playlist_name,
-            engine=settings.get("engine", "yt-dlp"),
-        ))
-
-        if not resolved_case_name:
-            raise ValueError("Case Name is blank after resolving the template.")
+        if resolved_case_name:
+            resolved_case_name = validate_windows_resolved_case_name(resolved_case_name, label="Queue Job Case Name")
+        else:
+            resolved_case_name = resolve_windows_case_name(
+                render_case_name_template(
+                    case_template,
+                    now=datetime.now(),
+                    domains=job_domains_for_tags,
+                    presets=applied_presets,
+                    playlist=playlist_name,
+                    engine=settings.get("engine", "yt-dlp"),
+                ),
+                label="Queue Job Case Name",
+            )
 
         job = {
             "job_id": make_job_id(),
@@ -12096,11 +12550,14 @@ def duplicate_selected_queue_job():
 
     try:
         if case_template:
-            resolved_case_name = safe_case_name(render_case_name_template(
-                case_template,
-                now=datetime.now(),
-                engine=get_job_engine(job),
-            ))
+            resolved_case_name = resolve_windows_case_name(
+                render_case_name_template(
+                    case_template,
+                    now=datetime.now(),
+                    engine=get_job_engine(job),
+                ),
+                label="Queue Job Case Name",
+            )
         else:
             resolved_case_name = job.get("resolved_case_name", "")
 
@@ -12242,24 +12699,41 @@ def pause_queue_after_current():
     job_queue_pause_after_current = True
     if job_queue_status_var and job_queue_window_is_open():
         try:
-            job_queue_status_var.set("Queue will pause after the current job.")
+            job_queue_status_var.set("Queue will pause after active job(s) finish.")
         except Exception:
             pass
 
 
-def stop_current_queue_job():
+def stop_active_queue_jobs():
     global job_queue_pause_after_current
 
-    if not job_queue_running:
+    active_processes = [
+        (job_id, process)
+        for job_id, process in list(job_queue_running_processes.items())
+        if process is not None and process.poll() is None
+    ]
+    running_jobs = get_running_queue_jobs()
+
+    if not job_queue_running and not active_processes and not running_jobs:
         messagebox.showinfo("Queue not running", "The queue is not currently running.")
         return
 
     job_queue_pause_after_current = True
-    stop_capture()
+    try:
+        for job in running_jobs:
+            job["_interruption_requested"] = True
+            job["interrupted_reason"] = "Stopped by user."
+        save_job_queue_state(immediate=True)
+        for job_id, process in active_processes:
+            terminate_process_tree(process, label=f"queue job {job_id}")
+        append_log("\nStop requested. Active queue process tree(s) terminated. Queue will pause after active job(s) stop.\n")
+        set_status("Stopping active queue jobs...")
+    except Exception as e:
+        messagebox.showerror("Stop error", str(e))
 
     if job_queue_status_var and job_queue_window_is_open():
         try:
-            job_queue_status_var.set("Stop requested for current queue job.")
+            job_queue_status_var.set("Stop requested for active queue jobs.")
         except Exception:
             pass
 
@@ -12438,8 +12912,14 @@ def continue_highlighted_interrupted_jobs():
     start_job_queue(job_ids=runnable_ids, scope_label="highlighted")
 
 
+def job_is_active_queue_execution(job):
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return False
+    return not bool(job.get("direct_capture", False)) or bool(job.get("_queue_execution_active", False))
+
+
 def get_running_queue_jobs():
-    return [job for job in job_queue if job.get("status") == "running"]
+    return [job for job in job_queue if job_is_active_queue_execution(job)]
 
 
 def get_pending_queue_jobs():
@@ -12463,7 +12943,7 @@ def job_collides_with_running_jobs(job):
         if job_domains & running_domains:
             return True
 
-    for running_job in get_ephemeral_active_direct_jobs():
+    for running_job in get_active_direct_jobs():
         running_domains = set(running_job.get("domains") or [])
         if job_domains & running_domains:
             return True
@@ -12537,9 +13017,6 @@ def run_next_queue_job():
                 pass
         append_log("\nJob queue complete.\n")
         set_status("Queue complete")
-        start_button.config(state="normal")
-        start_menu_button.config(state="normal")
-        stop_button.config(state="disabled")
         return
 
     if not started_any and pending_jobs and running_jobs:
@@ -12656,9 +13133,17 @@ def write_job_recovery_manifest(job, event="state"):
             "failed_url_indexes": list(job.get("failed_url_indexes", []) or []),
             "archive_files": get_job_archive_files_for_recovery(job),
         }
+        if get_job_engine(job) == "web-capture":
+            classification_records = normalize_web_capture_classification_records(
+                job.get("web_capture_classifications", {}),
+                len(job.get("urls", []) or []),
+            )
+            payload["web_capture_classifications"] = classification_records
+            payload["web_capture_classification_summary"] = summarize_web_capture_classifications(classification_records)
         atomic_write_json(path, payload, indent=2)
         return True
     except Exception as e:
+        log_debug_exception("Could not write Job Queue recovery manifest", e)
         try:
             append_log(f"\nWARNING: Could not write recovery manifest: {e}\n")
         except Exception:
@@ -12813,13 +13298,9 @@ def mark_queue_job_web_capture_classification(job_id, record):
         "url": str(record.get("url", "") or ""),
         "recorded_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    records = normalize_web_capture_classification_records(records, len(job.get("urls", []) or []))
     job["web_capture_classifications"] = records
-    counts = {"complete": 0, "complete_with_warnings": 0, "partial": 0, "failed": 0}
-    for item in records.values():
-        value = str((item or {}).get("classification", "")).strip().lower() if isinstance(item, dict) else ""
-        if value in counts:
-            counts[value] += 1
-    job["web_capture_classification_summary"] = counts
+    job["web_capture_classification_summary"] = summarize_web_capture_classifications(records)
     write_job_recovery_manifest(job, "web_capture_classification")
     save_job_queue_state()
     update_job_queue_progress()
@@ -12850,7 +13331,7 @@ def handle_queue_output_line(job_id, line):
         mark_queue_job_url_incomplete(job_id, url_index=url_index)
 
 def run_queue_job(job):
-    global running_process, last_capture_context, job_queue_running_processes
+    global last_capture_context, job_queue_running_processes
 
     cmd = []
     job_engine = get_job_engine(job)
@@ -12880,7 +13361,11 @@ def run_queue_job(job):
 
         run_urls = get_queue_job_run_urls(job)
         resume_base_completed = int(job.get("_resume_base_completed", 0) or 0)
+        job["_runtime_summary_settings"] = get_runtime_summary_settings(job.get("settings", {}))
         cmd = build_powershell_command_for_job(job)
+        job["_av_universal_archive_active"] = bool(
+            job_engine == "yt-dlp" and "-UniversalArchiveFile" in cmd
+        )
         submitted_url_count = len(run_urls)
         tool_versions = query_capture_tool_versions_for_job(job.get("settings", {}))
 
@@ -12891,11 +13376,12 @@ def run_queue_job(job):
         last_capture_context = {
             "tool_versions": tool_versions,
             "submitted_url_count": submitted_url_count,
-            "settings": job.get("settings", {}),
+            "settings": {**job.get("settings", {}), **job.get("_runtime_summary_settings", {})},
             "paths": job_paths,
         }
 
         job["status"] = "running"
+        job["_queue_execution_active"] = True
         job["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         job["finished"] = ""
         job["exit_code"] = ""
@@ -12935,9 +13421,6 @@ def run_queue_job(job):
         job_log(format_command_for_log(cmd))
         job_log("\n\n")
 
-        start_button.config(state="normal")
-        start_menu_button.config(state="normal")
-        stop_button.config(state="normal")
         prepare_case_summary_actions_for_run(get_job_engine(job))
         set_status(f"Queue running: {job.get('resolved_case_name', '')}")
 
@@ -12945,15 +13428,20 @@ def run_queue_job(job):
         job["status"] = "failed"
         job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         job["exit_code"] = "setup error"
+        job.pop("_queue_execution_active", None)
+        job.pop("_av_universal_archive_active", None)
         job_log(f"\nQueue job setup failed: {e}\n")
         cleanup_command_input_file_if_temp(cmd)
+        try:
+            write_job_recovery_manifest(job, "queue_setup_failed")
+        except Exception as manifest_error:
+            log_debug_exception("Could not write queue setup-failure recovery manifest", manifest_error)
+        save_job_queue_state(immediate=True)
         refresh_job_queue_window()
         safe_after(0, run_next_queue_job)
         return
 
     def worker():
-        global running_process
-
         exit_code = 1
 
         try:
@@ -12968,7 +13456,8 @@ def run_queue_job(job):
             )
 
             job_queue_running_processes[job["job_id"]] = process
-            running_process = process
+            if job.get("_interruption_requested"):
+                terminate_process_tree(process, label=f"queue job {job['job_id']}")
 
             universal_skip_records = []
             universal_skip_summary = {}
@@ -13118,14 +13607,15 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     job.pop("_run_mode", None)
     job.pop("_resume_base_completed", None)
     job.pop("_interruption_requested", None)
+    job.pop("_queue_execution_active", None)
+    job.pop("_av_universal_archive_active", None)
+    job.pop("_runtime_summary_settings", None)
 
     refresh_job_queue_window()
-    schedule_case_browser_autoload(delay_ms=250)
-
-    if not get_running_queue_jobs():
-        start_button.config(state="normal")
-        start_menu_button.config(state="normal")
-        stop_button.config(state="disabled")
+    schedule_case_browser_autoload(
+        delay_ms=250,
+        output_root=get_job_output_root_for_recovery(job),
+    )
 
     if job_queue_pause_after_current and not get_running_queue_jobs():
         job_queue_running = False
@@ -13133,10 +13623,10 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
         job_queue_run_filter_ids = None
         if job_queue_status_var and job_queue_window_is_open():
             try:
-                job_queue_status_var.set("Queue paused after current job.")
+                job_queue_status_var.set("Queue paused after active job(s).")
             except Exception:
                 pass
-        job_log("\nJob queue paused after current job.\n")
+        job_log("\nJob queue paused after active job(s).\n")
         return
 
     safe_after(250, run_next_queue_job)
@@ -13183,8 +13673,8 @@ def open_job_queue(select_tab=True):
     ttk.Button(top_bar, text="Start Queue", command=start_job_queue).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Start Selected", command=start_selected_queue_jobs).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Restart Selected", command=restart_selected_queue_jobs).pack(side="left", padx=(0, 6))
-    ttk.Button(top_bar, text="Pause After Current", command=pause_queue_after_current).pack(side="left", padx=(0, 6))
-    ttk.Button(top_bar, text="Stop Current", command=stop_current_queue_job).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Pause After Active", command=pause_queue_after_current).pack(side="left", padx=(0, 6))
+    ttk.Button(top_bar, text="Stop Active Jobs", command=stop_active_queue_jobs).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Remove Selected", command=remove_selected_queue_job).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Clear Completed", command=clear_completed_queue_jobs).pack(side="left", padx=(0, 6))
     ttk.Button(top_bar, text="Clear All", command=clear_all_non_active_queue_jobs).pack(side="left", padx=(0, 6))
@@ -13432,11 +13922,11 @@ def open_job_queue(select_tab=True):
             menu.entryconfig("Restart Checked", state="disabled")
 
         menu.add_separator()
-        menu.add_command(label="Pause After Current", command=pause_queue_after_current)
-        menu.add_command(label="Stop Current", command=stop_current_queue_job)
+        menu.add_command(label="Pause After Active", command=pause_queue_after_current)
+        menu.add_command(label="Stop Active Jobs", command=stop_active_queue_jobs)
         if not job_queue_running:
-            menu.entryconfig("Pause After Current", state="disabled")
-            menu.entryconfig("Stop Current", state="disabled")
+            menu.entryconfig("Pause After Active", state="disabled")
+            menu.entryconfig("Stop Active Jobs", state="disabled")
 
         menu.add_separator()
         menu.add_command(label="Clear Completed", command=clear_completed_queue_jobs)
@@ -13589,31 +14079,21 @@ def disable_start_controls_for_shutdown():
 
 
 def stop_capture():
-    global running_process, job_queue_pause_after_current
-
-    if job_queue_running_processes:
-        job_queue_pause_after_current = True
-        try:
-            for job in get_running_queue_jobs():
-                job["_interruption_requested"] = True
-                job["interrupted_reason"] = "Stopped by user."
-            save_job_queue_state()
-            for job_id, process in list(job_queue_running_processes.items()):
-                terminate_process_tree(process, label=f"queue job {job_id}")
-            append_log("\nStop requested. Active queue process tree(s) terminated. Queue will pause after active job(s) stop.\n")
-            set_status("Stopping queue...")
-        except Exception as e:
-            messagebox.showerror("Stop error", str(e))
-        return
+    global running_process, av_direct_stop_requested
 
     if running_process is not None and running_process.poll() is None:
         try:
-            mark_running_queue_jobs_interrupted("Stopped by user.")
+            av_direct_stop_requested = True
+            mark_direct_recovery_job_interrupted(active_av_direct_recovery_job_id, "Stopped by user.")
             terminate_process_tree(running_process, label="direct Audio/Video capture")
             append_log("\nStop requested. Audio/Video process tree terminated.\n")
-            set_status("Stopped")
+            set_status("Stopping Audio/Video capture...")
         except Exception as e:
             messagebox.showerror("Stop error", str(e))
+    try:
+        stop_button.config(state="disabled")
+    except Exception:
+        pass
 
 
 def get_selected_vpn_adapter_identifiers():
@@ -15240,6 +15720,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         "desired_key": "",
         "desired_record": None,
         "worker_running": False,
+        "runtime": None,
         # Cooldowns are post-fetch timers. A new thumbnail fetch starts immediately
         # when the relevant timer has already expired; after a real fetch attempt
         # completes, the next-allowed time is moved forward.
@@ -15361,11 +15842,11 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
     def get_preview_pacing_seconds():
         return preview_pacing_options.get(pacing_var.get(), (0, 5))
 
-    def sleep_before_next_preview_url(current_index, total_count):
+    def sleep_before_next_preview_url(current_index, total_count, pacing_seconds=None):
         if stop_event.is_set() or current_index >= total_count:
             return
 
-        base_delay, jitter_max = get_preview_pacing_seconds()
+        base_delay, jitter_max = pacing_seconds if pacing_seconds is not None else get_preview_pacing_seconds()
         jitter = random.uniform(0, jitter_max) if jitter_max > 0 else 0
         delay = max(0, float(base_delay) + jitter)
 
@@ -15475,6 +15956,28 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         if case_template_needs_playlist_for_preview() and not str(playlist_name or "").strip():
             return url_preview_temp_cache_folder()
         return resolved_preview_cache_folder(playlist_name=playlist_name)
+
+    def make_preview_runtime_snapshot(include_cache=False):
+        """Capture worker inputs on the Tk thread before background work starts."""
+        yt_dlp_path = yt_dlp_path_var.get().strip()
+        runtime = {
+            "yt_dlp_path": yt_dlp_path,
+            "deno_executable": resolve_deno_executable_for_gui(yt_dlp_path),
+            "playlist_mode": playlist_mode_var.get(),
+            "max_playlist_items": get_max_playlist_items(),
+            "cookies_file": cookies_file_var.get().strip(),
+            "use_cookies_file": bool(use_cookies_file_var.get()),
+            "proxy_url": get_proxy_url_for_command(),
+            "impersonate_target": impersonate_var.get(),
+            "timeout_seconds": get_preview_timeout_seconds(),
+            "pacing_seconds": get_preview_pacing_seconds(),
+            "thumbnail_mode": normalize_url_preview_thumbnail_mode(thumbnail_mode_var.get()),
+            "rate_limit_thumbnails": bool(rate_limit_thumbnails_var.get()),
+            "ffmpeg_exe": get_ffmpeg_executable_for_gui(),
+        }
+        if include_cache:
+            runtime["cache_folder"] = preview_cache_folder()
+        return runtime
 
     def move_preview_cache_to_resolved_case_folder(playlist_name=None):
         if not str(playlist_name or "").strip() and case_template_needs_playlist_for_preview():
@@ -15599,6 +16102,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         with thumbnail_state_lock:
             thumbnail_state["desired_key"] = ""
             thumbnail_state["desired_record"] = None
+            thumbnail_state["runtime"] = None
 
         clear_thumbnail("Audio/Video Preview cache cleared")
         set_details_text(format_record_details(current_detail_record.get("record")))
@@ -15666,11 +16170,11 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             pass
         return ".img"
 
-    def convert_thumbnail_to_png(source_path, png_path):
+    def convert_thumbnail_to_png(source_path, png_path, ffmpeg_exe=None):
         if os.path.isfile(png_path):
             return png_path
 
-        ffmpeg_exe = get_ffmpeg_executable_for_gui()
+        ffmpeg_exe = str(ffmpeg_exe or "").strip() or get_ffmpeg_executable_for_gui()
         if not ffmpeg_exe or not os.path.isfile(ffmpeg_exe):
             ext = os.path.splitext(source_path)[1].lower()
             if ext == ".png":
@@ -15698,12 +16202,13 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             raise ValueError(f"ffmpeg thumbnail conversion failed: {detail}")
         return png_path
 
-    def fetch_thumbnail_fast(record):
+    def fetch_thumbnail_fast(record, runtime=None):
+        runtime = runtime or make_preview_runtime_snapshot(include_cache=True)
         thumb_url = str(record.get("thumbnail_url") or "").strip()
         if not thumb_url:
             raise ValueError("No thumbnail URL was available in metadata.")
 
-        folder = preview_cache_folder()
+        folder = str(runtime.get("cache_folder") or "").strip() or preview_cache_folder()
         base = safe_cache_name(thumb_url)
         png_path = os.path.join(folder, f"{base}.png")
         if os.path.isfile(png_path):
@@ -15731,62 +16236,61 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         with open(raw_path, "wb") as f:
             f.write(data)
 
-        return convert_thumbnail_to_png(raw_path, png_path)
+        return convert_thumbnail_to_png(raw_path, png_path, runtime.get("ffmpeg_exe"))
 
-    def build_ytdlp_common_metadata_args(url, include_playlist_mode=True):
-        yt_dlp_path = yt_dlp_path_var.get().strip()
+    def build_ytdlp_common_metadata_args(url, include_playlist_mode=True, runtime=None):
+        runtime = runtime or make_preview_runtime_snapshot(include_cache=False)
+        yt_dlp_path = str(runtime.get("yt_dlp_path") or "").strip()
         if not yt_dlp_path or not os.path.isfile(yt_dlp_path):
             raise ValueError("yt-dlp path is missing or invalid.")
 
         cmd = [
             yt_dlp_path,
+            "--ignore-config",
             "--dump-single-json",
             "--skip-download",
             "--ignore-no-formats-error",
             "--no-warnings",
             "--no-progress",
             "--js-runtimes",
-            f"deno:{resolve_deno_executable_for_gui()}",
-            "--user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "--add-header",
-            "Accept-Language: en-US,en;q=0.9",
+            f"deno:{runtime.get('deno_executable') or resolve_deno_executable_for_gui(yt_dlp_path)}",
         ]
 
         if include_playlist_mode:
-            max_items = get_max_playlist_items()
-            if playlist_mode_var.get() == "Fast playlist scan":
+            max_items = int(runtime.get("max_playlist_items") or 0)
+            if runtime.get("playlist_mode") == "Fast playlist scan":
                 cmd.append("--flat-playlist")
             elif max_items:
                 cmd += ["--playlist-items", f"1:{max_items}"]
 
-        cookies_file = cookies_file_var.get().strip()
-        if use_cookies_file_var.get() and cookies_file:
+        cookies_file = str(runtime.get("cookies_file") or "").strip()
+        if bool(runtime.get("use_cookies_file")):
+            validate_enabled_cookies_file(True, cookies_file, label="Audio/Video Preview")
             cmd += ["--cookies", cookies_file]
 
-        proxy_url = get_proxy_url_for_command()
+        proxy_url = str(runtime.get("proxy_url") or "").strip()
         if proxy_url:
             cmd += ["--proxy", proxy_url]
 
-        impersonate_target = normalize_impersonate_target(impersonate_var.get())
-        if impersonate_target:
-            cmd += ["--impersonate", impersonate_target]
+        append_ytdlp_impersonate_args(cmd, runtime.get("impersonate_target", ""))
 
         cmd.append(url)
         return cmd
 
-    def fetch_thumbnail_ytdlp(record):
+    def fetch_thumbnail_ytdlp(record, runtime=None):
+        runtime = runtime or make_preview_runtime_snapshot(include_cache=True)
         source_url = str(record.get("url") or record.get("source_url") or "").strip()
         if not source_url:
             raise ValueError("No source URL is available for yt-dlp thumbnail fallback.")
 
-        folder = os.path.join(preview_cache_folder(), safe_cache_name(source_url))
+        cache_folder = str(runtime.get("cache_folder") or "").strip() or preview_cache_folder()
+        folder = os.path.join(cache_folder, safe_cache_name(source_url))
         os.makedirs(folder, exist_ok=True)
         png_path = os.path.join(folder, "thumb.png")
         if os.path.isfile(png_path):
             return png_path
 
-        cmd = build_ytdlp_common_metadata_args(source_url, include_playlist_mode=False)
+        cmd = build_ytdlp_common_metadata_args(source_url, include_playlist_mode=False, runtime=runtime)
         # Replace JSON-only flags with thumbnail-write flags while preserving cookies/proxy/impersonation/header args.
         cleaned = []
         skip_next = False
@@ -15808,10 +16312,10 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
         result = subprocess.run(
             cmd,
-            cwd=os.path.dirname(os.path.abspath(yt_dlp_path_var.get().strip())) or ROOT,
+            cwd=os.path.dirname(os.path.abspath(str(runtime.get("yt_dlp_path") or ""))) or ROOT,
             capture_output=True,
             text=True,
-            timeout=get_preview_timeout_seconds(),
+            timeout=int(runtime.get("timeout_seconds") or 120),
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
@@ -15829,7 +16333,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             raise ValueError("yt-dlp thumbnail fallback did not create a thumbnail file.")
 
         candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-        return convert_thumbnail_to_png(candidates[0], png_path)
+        return convert_thumbnail_to_png(candidates[0], png_path, runtime.get("ffmpeg_exe"))
 
     def update_url_tree_row(iid):
         try:
@@ -16500,7 +17004,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             parent=dialog,
         )
 
-    def scan_worker(scan_records):
+    def scan_worker(scan_records, runtime):
         total_count = len(scan_records)
         for index, record in enumerate(scan_records, start=1):
             if stop_event.is_set():
@@ -16509,14 +17013,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             safe_after(0, set_record_status, record, "Scanning")
             safe_after(0, status_var.set, f"Previewing {index}/{total_count}: {url[:140]}")
             try:
-                cmd = build_ytdlp_common_metadata_args(url, include_playlist_mode=True)
+                cmd = build_ytdlp_common_metadata_args(url, include_playlist_mode=True, runtime=runtime)
                 append_log(f"\nAudio/Video Preview metadata scan {index}/{total_count}:\n{format_command_for_log(cmd)}\n")
                 result = subprocess.run(
                     cmd,
-                    cwd=os.path.dirname(os.path.abspath(yt_dlp_path_var.get().strip())) or ROOT,
+                    cwd=os.path.dirname(os.path.abspath(str(runtime.get("yt_dlp_path") or ""))) or ROOT,
                     capture_output=True,
                     text=True,
-                    timeout=get_preview_timeout_seconds(),
+                    timeout=int(runtime.get("timeout_seconds") or 120),
                 )
                 combined_output = "\n".join(part for part in [result.stdout, result.stderr] if part)
                 backoff_reason = detect_preview_backoff_reason(combined_output)
@@ -16528,7 +17032,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 if result.returncode != 0:
                     detail = (result.stderr or result.stdout or f"exit code {result.returncode}").strip()
                     safe_after(0, add_preview_error, record, "Failed", detail)
-                    sleep_before_next_preview_url(index, total_count)
+                    sleep_before_next_preview_url(index, total_count, runtime.get("pacing_seconds"))
                     continue
                 data = extract_json_object_from_stdout(result.stdout)
                 safe_after(0, normalized_info_record, record, data)
@@ -16542,7 +17046,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                     stop_event.set()
                     break
                 safe_after(0, add_preview_error, record, "Error", message_text)
-            sleep_before_next_preview_url(index, total_count)
+            sleep_before_next_preview_url(index, total_count, runtime.get("pacing_seconds"))
 
         def finish():
             if not dialog.winfo_exists():
@@ -16588,11 +17092,17 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             update_url_tree_row(record.get("iid", ""))
         stop_event.clear()
         set_buttons_scanning(True)
+        try:
+            runtime = make_preview_runtime_snapshot(include_cache=False)
+        except Exception as e:
+            set_buttons_scanning(False)
+            messagebox.showerror("Audio/Video Preview", str(e), parent=dialog)
+            return
         append_log(
             f"\nStarting Audio/Video preview for {len(scan_records)} URL(s). "
             f"Pacing: {pacing_var.get()}; thumbnail mode: {thumbnail_mode_var.get()}; playlist mode: {playlist_mode_var.get()}.\n"
         )
-        start_daemon_thread("audio_video_preview_scan", scan_worker, scan_records)
+        start_daemon_thread("audio_video_preview_scan", scan_worker, scan_records, runtime)
 
     def stop_preview():
         stop_event.set()
@@ -16770,21 +17280,23 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             return ""
         return hashlib.sha256(f"{mode}\n{thumb_url}\n{source_url}".encode("utf-8", errors="ignore")).hexdigest()
 
-    def thumbnail_rate_limit_enabled():
+    def thumbnail_rate_limit_enabled(runtime=None):
+        if runtime is not None:
+            return bool(runtime.get("rate_limit_thumbnails", True))
         try:
             return bool(rate_limit_thumbnails_var.get())
         except Exception:
             return True
 
-    def thumbnail_cooldown_delay(fetch_kind):
-        if not thumbnail_rate_limit_enabled():
+    def thumbnail_cooldown_delay(fetch_kind, runtime=None):
+        if not thumbnail_rate_limit_enabled(runtime):
             return 0.0
         if fetch_kind == "ytdlp":
             return 10.0 + random.uniform(0, 10.0)
         return 5.0 + random.uniform(0, 5.0)
 
-    def thumbnail_cooldown_remaining(fetch_kind):
-        if not thumbnail_rate_limit_enabled():
+    def thumbnail_cooldown_remaining(fetch_kind, runtime=None):
+        if not thumbnail_rate_limit_enabled(runtime):
             return 0.0
         now = time.time()
         with thumbnail_state_lock:
@@ -16792,14 +17304,14 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             allowed_at = float(next_allowed.get(fetch_kind) or 0.0)
         return max(0.0, allowed_at - now)
 
-    def mark_thumbnail_fetch_attempt_completed(fetch_kind):
-        if not thumbnail_rate_limit_enabled():
+    def mark_thumbnail_fetch_attempt_completed(fetch_kind, runtime=None):
+        if not thumbnail_rate_limit_enabled(runtime):
             with thumbnail_state_lock:
                 next_allowed = thumbnail_state.setdefault("next_allowed", {"fast": 0.0, "ytdlp": 0.0})
                 next_allowed[fetch_kind] = 0.0
             return 0.0
 
-        delay = thumbnail_cooldown_delay(fetch_kind)
+        delay = thumbnail_cooldown_delay(fetch_kind, runtime)
         with thumbnail_state_lock:
             next_allowed = thumbnail_state.setdefault("next_allowed", {"fast": 0.0, "ytdlp": 0.0})
             next_allowed[fetch_kind] = time.time() + delay
@@ -16848,27 +17360,31 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             clear_thumbnail("Thumbnail fetch failed", "Thumbnail fetch failed.")
             set_details_text(format_record_details(record) + (f"\n\nThumbnail error: {error}" if error else ""))
 
-    def cached_fast_thumbnail_path(record):
+    def cached_fast_thumbnail_path(record, runtime=None):
+        runtime = runtime or make_preview_runtime_snapshot(include_cache=True)
         thumb_url = str((record or {}).get("thumbnail_url") or "").strip()
         if not thumb_url:
             return ""
-        png_path = os.path.join(preview_cache_folder(), f"{safe_cache_name(thumb_url)}.png")
+        cache_folder = str(runtime.get("cache_folder") or "").strip() or preview_cache_folder()
+        png_path = os.path.join(cache_folder, f"{safe_cache_name(thumb_url)}.png")
         return png_path if os.path.isfile(png_path) else ""
 
-    def cached_ytdlp_thumbnail_path(record):
+    def cached_ytdlp_thumbnail_path(record, runtime=None):
+        runtime = runtime or make_preview_runtime_snapshot(include_cache=True)
         source_url = str((record or {}).get("url") or (record or {}).get("source_url") or "").strip()
         if not source_url:
             return ""
-        png_path = os.path.join(preview_cache_folder(), safe_cache_name(source_url), "thumb.png")
+        cache_folder = str(runtime.get("cache_folder") or "").strip() or preview_cache_folder()
+        png_path = os.path.join(cache_folder, safe_cache_name(source_url), "thumb.png")
         return png_path if os.path.isfile(png_path) else ""
 
-    def wait_thumbnail_cooldown(fetch_kind, key):
-        if not thumbnail_rate_limit_enabled():
+    def wait_thumbnail_cooldown(fetch_kind, key, runtime=None):
+        if not thumbnail_rate_limit_enabled(runtime):
             return thumbnail_desired_key() == key
 
         label = "yt-dlp thumbnail fallback" if fetch_kind == "ytdlp" else "thumbnail fetch"
         while True:
-            remaining = thumbnail_cooldown_remaining(fetch_kind)
+            remaining = thumbnail_cooldown_remaining(fetch_kind, runtime)
             if remaining <= 0:
                 break
             with thumbnail_state_lock:
@@ -16880,8 +17396,8 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
 
         return thumbnail_desired_key() == key
 
-    def fetch_thumbnail_for_record_with_rate_limits(record, key):
-        mode = thumbnail_mode_var.get()
+    def fetch_thumbnail_for_record_with_rate_limits(record, key, runtime):
+        mode = str(runtime.get("thumbnail_mode") or "Off")
         errors = []
         has_thumbnail_url = bool(str(record.get("thumbnail_url") or "").strip())
         has_source_url = bool(clean_extracted_url(record.get("url") or record.get("source_url") or ""))
@@ -16894,40 +17410,40 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             return "", "No thumbnail source URL was available."
 
         if has_thumbnail_url:
-            cached_path = cached_fast_thumbnail_path(record)
+            cached_path = cached_fast_thumbnail_path(record, runtime)
             if cached_path:
                 return cached_path, ""
-            if not wait_thumbnail_cooldown("fast", key):
+            if not wait_thumbnail_cooldown("fast", key, runtime):
                 return "", "superseded"
             did_attempt = False
             try:
                 safe_after(0, set_thumbnail_status, "Fetching thumbnail from metadata URL...")
                 did_attempt = True
-                path = fetch_thumbnail_fast(record)
+                path = fetch_thumbnail_fast(record, runtime)
                 return path, ""
             except Exception as e:
                 errors.append(str(e))
             finally:
                 if did_attempt:
-                    mark_thumbnail_fetch_attempt_completed("fast")
+                    mark_thumbnail_fetch_attempt_completed("fast", runtime)
 
         if mode == "Reliable":
-            cached_path = cached_ytdlp_thumbnail_path(record)
+            cached_path = cached_ytdlp_thumbnail_path(record, runtime)
             if cached_path:
                 return cached_path, ""
-            if not wait_thumbnail_cooldown("ytdlp", key):
+            if not wait_thumbnail_cooldown("ytdlp", key, runtime):
                 return "", "superseded"
             did_attempt = False
             try:
                 safe_after(0, set_thumbnail_status, "Fetching thumbnail with yt-dlp fallback...")
                 did_attempt = True
-                path = fetch_thumbnail_ytdlp(record)
+                path = fetch_thumbnail_ytdlp(record, runtime)
                 return path, ""
             except Exception as e:
                 errors.append(str(e))
             finally:
                 if did_attempt:
-                    mark_thumbnail_fetch_attempt_completed("ytdlp")
+                    mark_thumbnail_fetch_attempt_completed("ytdlp", runtime)
 
         return "", "; ".join(error for error in errors if error) or "thumbnail fetch failed"
 
@@ -16937,6 +17453,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 with thumbnail_state_lock:
                     record = thumbnail_state.get("desired_record")
                     key = thumbnail_state.get("desired_key", "")
+                    runtime = dict(thumbnail_state.get("runtime") or {})
                 if not record or not key:
                     return
 
@@ -16945,7 +17462,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                     safe_after(0, load_thumbnail_image, record, cached_path)
                     return
 
-                if thumbnail_mode_var.get() == "Off":
+                if str(runtime.get("thumbnail_mode") or "Off") == "Off":
                     if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
                         safe_after(0, clear_thumbnail, "Thumbnail fetching is off", "")
                     return
@@ -16955,7 +17472,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
                 if thumbnail_desired_key() == key and current_detail_record.get("record") is record:
                     safe_after(0, clear_thumbnail, "Preparing thumbnail fetch...", "")
 
-                path, error = fetch_thumbnail_for_record_with_rate_limits(record, key)
+                path, error = fetch_thumbnail_for_record_with_rate_limits(record, key, runtime)
 
                 if error == "superseded" or thumbnail_desired_key() != key:
                     continue
@@ -16990,20 +17507,23 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         start_daemon_thread("audio_video_preview_thumbnail", thumbnail_worker_loop)
 
     def begin_thumbnail_fetch(record):
-        mode = thumbnail_mode_var.get()
+        mode = normalize_url_preview_thumbnail_mode(thumbnail_mode_var.get())
         if mode == "Off":
             with thumbnail_state_lock:
                 thumbnail_state["desired_key"] = ""
                 thumbnail_state["desired_record"] = None
+                thumbnail_state["runtime"] = None
             clear_thumbnail("Thumbnail fetching is off")
             return
         if not record:
             with thumbnail_state_lock:
                 thumbnail_state["desired_key"] = ""
                 thumbnail_state["desired_record"] = None
+                thumbnail_state["runtime"] = None
             clear_thumbnail("No thumbnail loaded")
             return
 
+        runtime = make_preview_runtime_snapshot(include_cache=True)
         key = thumbnail_record_key(record)
         has_thumbnail_url = bool(str(record.get("thumbnail_url") or "").strip())
         has_source_url = bool(clean_extracted_url(record.get("url") or record.get("source_url") or ""))
@@ -17019,6 +17539,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             with thumbnail_state_lock:
                 thumbnail_state["desired_key"] = key
                 thumbnail_state["desired_record"] = record
+                thumbnail_state["runtime"] = runtime
             load_thumbnail_image(record, record.get("thumbnail_cache_path"))
             return
 
@@ -17027,6 +17548,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
             worker_running = bool(thumbnail_state.get("worker_running"))
             thumbnail_state["desired_key"] = key
             thumbnail_state["desired_record"] = record
+            thumbnail_state["runtime"] = runtime
         if same_target and worker_running:
             return
 
@@ -17537,6 +18059,7 @@ def check_impersonate_targets():
         return
 
     target_status_var.set("Impersonate targets: Checking...")
+    include_specific = bool(show_all_impersonate_targets_var.get())
 
     def worker():
         cmd = [
@@ -17557,23 +18080,42 @@ def check_impersonate_targets():
                 part for part in [result.stdout, result.stderr] if part
             )
 
-            if show_all_impersonate_targets_var.get():
-                targets = parse_all_impersonate_targets(combined_output)
-                target_label = "target(s)"
-                log_title = "Available impersonate targets"
+            if result.returncode != 0:
+                detail_lines = [line.strip() for line in combined_output.splitlines() if line.strip()]
+                detail = detail_lines[-1] if detail_lines else "No diagnostic output was returned."
+                raise RuntimeError(f"yt-dlp exited with code {result.returncode}: {detail}")
+
+            records = parse_available_impersonate_targets(combined_output)
+            values = build_impersonate_menu_values(
+                records,
+                include_specific=include_specific,
+            )
+
+            safe_after(0, update_impersonate_menu, values, records)
+
+            family_count = len({record["family"] for record in records})
+            target_count = len(records)
+            family_label = "client family" if family_count == 1 else "client families"
+            target_label = "usable target" if target_count == 1 else "usable targets"
+            safe_after(
+                0,
+                target_status_var.set,
+                f"Impersonate targets: Found {family_count} {family_label}, {target_count} {target_label}",
+            )
+
+            log_lines = [
+                "",
+                "Available impersonate selections:",
+                *values,
+                "",
+                f"Usable specific targets reported by yt-dlp: {target_count}",
+            ]
+            if target_count:
+                log_lines.extend(record["selector"] for record in records)
             else:
-                targets = parse_windows_impersonate_targets(combined_output)
-                target_label = "Windows target(s)"
-                log_title = "Available Windows impersonate targets"
-
-            values = DEFAULT_IMPERSONATE_TARGETS.copy()
-            for target in targets:
-                if is_valid_impersonate_target_label(target) and target not in values:
-                    values.append(target)
-
-            safe_after(0, update_impersonate_menu, values)
-            safe_after(0, target_status_var.set, f"Impersonate targets: Found {len(values) - 1} {target_label}")
-            queue_append_log(f"\n{log_title}:\n" + "\n".join(values) + "\n")
+                log_lines.append("(none)")
+            log_lines.append("")
+            queue_append_log("\n".join(log_lines))
 
         except Exception as e:
             safe_after(0, target_status_var.set, "Impersonate targets: Check failed")
@@ -17583,190 +18125,179 @@ def check_impersonate_targets():
     start_daemon_thread("worker", worker)
 
 
-def is_valid_impersonate_target_label(value):
-    value = (value or "").strip()
+def impersonate_target_family(client_token):
+    token = str(client_token or "").strip().lower()
+    if not token:
+        return ""
 
+    match = re.fullmatch(r"([a-z][a-z0-9_.]*?)(?:-[0-9].*)?", token)
+    if match:
+        return match.group(1)
+
+    return token
+
+
+def format_impersonate_family_label(family):
+    return str(family or "").replace("_", " ").replace(".", " ").title()
+
+
+def is_valid_impersonate_target_label(value):
+    value = str(value or "").strip()
     if not value:
         return False
 
-    lowered = value.lower()
+    if value == IMPERSONATE_NONE_LABEL:
+        return True
 
-    # Filter yt-dlp status/log lines such as [info], [debug], [warning], etc.
-    if lowered.startswith("["):
+    target = normalize_impersonate_target(value)
+    if target == IMPERSONATE_ANY_SENTINEL:
+        return True
+
+    if not target or target.startswith("["):
         return False
 
-    target_token = normalize_impersonate_target(value)
-
-    if not target_token:
+    if target in {"target", "client", "source", "os", "none"}:
         return False
 
-    if target_token.startswith("["):
-        return False
-
-    if target_token in {"target", "client", "source", "os", "none"}:
-        return False
-
-    browser_prefixes = (
-        "chrome",
-        "edge",
-        "firefox",
-        "brave",
-        "opera",
-        "vivaldi",
-        "safari",
-    )
-
-    return target_token.startswith(browser_prefixes)
+    return bool(re.fullmatch(r"[a-z][a-z0-9_.-]*(?::[a-z0-9_.-]+)?", target))
 
 
-def parse_windows_impersonate_targets(output):
-    targets = []
+def parse_available_impersonate_targets(output):
+    records = []
     seen = set()
 
-    browser_prefixes = (
-        "chrome",
-        "edge",
-        "firefox",
-        "brave",
-        "opera",
-        "vivaldi",
-    )
-
-    for raw_line in output.splitlines():
+    for raw_line in str(output or "").splitlines():
         line = raw_line.strip()
-
         if not line:
             continue
 
         lowered = line.lower()
 
+        # yt-dlp deliberately lists known client families whose dependency is
+        # unavailable. Those rows are informational, not selectable targets.
+        if "unavailable" in lowered or "not available" in lowered:
+            continue
+
         if lowered.startswith("["):
             continue
 
-        if "client" in lowered and "os" in lowered:
-            continue
-
-        if "target" in lowered and "source" in lowered:
+        if "client" in lowered and "os" in lowered and "source" in lowered:
             continue
 
         if set(line) <= {"-", " ", "\t"}:
             continue
 
         parts = line.split()
-        if not parts:
+        if len(parts) < 2:
             continue
 
-        candidate = parts[0].strip().lower()
+        client = parts[0].strip().strip("|").strip(",").lower()
+        os_value = parts[1].strip().strip("|").strip(",").lower()
 
-        if not candidate.startswith(browser_prefixes):
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]*", client):
             continue
 
-        if "windows" not in lowered and "win" not in lowered:
+        if os_value in {"-", "n/a", "none"}:
+            os_value = ""
+        elif not re.fullmatch(r"[a-z0-9_.-]+", os_value):
             continue
 
-        if candidate not in seen:
-            seen.add(candidate)
-            targets.append(candidate)
-
-    return targets
-
-
-def parse_all_impersonate_targets(output):
-    targets = []
-    seen = set()
-
-    browser_prefixes = (
-        "chrome",
-        "edge",
-        "firefox",
-        "brave",
-        "opera",
-        "vivaldi",
-        "safari",
-    )
-
-    os_tokens = (
-        "windows",
-        "win",
-        "macos",
-        "mac",
-        "linux",
-        "ubuntu",
-        "android",
-        "ios",
-        "iphone",
-        "ipad",
-    )
-
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-
-        if not line:
+        family = impersonate_target_family(client)
+        if not family:
             continue
 
-        lowered = line.lower()
-
-        # Skip yt-dlp log/info/debug lines. These are not impersonation targets.
-        if lowered.startswith("["):
+        selector = f"{client}:{os_value}" if os_value else client
+        if selector in seen:
             continue
 
-        if "client" in lowered and "os" in lowered:
+        seen.add(selector)
+        records.append({
+            "client": client,
+            "os": os_value,
+            "family": family,
+            "selector": selector,
+            "display": f"{client} ({os_value})" if os_value else client,
+        })
+
+    return records
+
+
+def build_impersonate_menu_values(records, include_specific=False):
+    values = [IMPERSONATE_NONE_LABEL]
+    records = list(records or [])
+
+    if not records:
+        return values
+
+    values.append(IMPERSONATE_ANY_LABEL)
+
+    families = []
+    seen_families = set()
+    for record in records:
+        family = str(record.get("family") or "").strip().lower()
+        if not family or family in seen_families:
             continue
+        seen_families.add(family)
+        families.append(family)
 
-        if "target" in lowered and "source" in lowered:
-            continue
+    for family in families:
+        values.append(f"{format_impersonate_family_label(family)} (automatic)")
 
-        if set(line) <= {"-", " ", "\t"}:
-            continue
+    if include_specific:
+        for record in records:
+            # A target without a version or OS is identical to its automatic
+            # family selector, so do not show a duplicate entry.
+            if record["selector"] == record["family"]:
+                continue
+            values.append(record["display"])
 
-        parts = line.split()
-        if not parts:
-            continue
-
-        candidate = parts[0].strip().lower()
-
-        if candidate.startswith("["):
-            continue
-
-        if not candidate.startswith(browser_prefixes):
-            continue
-
-        os_value = ""
-
-        for part in parts[1:]:
-            clean_part = part.strip().strip("|").strip(",").strip().lower()
-            if any(token in clean_part for token in os_tokens):
-                os_value = clean_part
-                break
-
-        display = f"{candidate} ({os_value})" if os_value else candidate
-
-        # De-duplicate by the display label so the same target can be shown
-        # separately for different OS values if yt-dlp reports it that way.
-        if display not in seen:
-            seen.add(display)
-            targets.append(display)
-
-    return targets
+    return values
 
 
-def update_impersonate_menu(values):
+def update_impersonate_menu(values, available_records=None):
     clean_values = []
+    selector_to_label = {}
 
     for value in values:
-        if value == "None" or is_valid_impersonate_target_label(value):
-            if value not in clean_values:
-                clean_values.append(value)
+        if not is_valid_impersonate_target_label(value):
+            continue
+        if value not in clean_values:
+            clean_values.append(value)
+        selector = normalize_impersonate_target(value)
+        selector_to_label.setdefault(selector, value)
 
-    if "None" not in clean_values:
-        clean_values.insert(0, "None")
+    if IMPERSONATE_NONE_LABEL not in clean_values:
+        clean_values.insert(0, IMPERSONATE_NONE_LABEL)
+
+    current = impersonate_var.get()
+    current_selector = normalize_impersonate_target(current)
+
+    available_records = list(available_records or [])
+    available_specific = {record["selector"]: record["display"] for record in available_records}
+    available_families = {record["family"] for record in available_records}
+
+    if current_selector == IMPERSONATE_ANY_SENTINEL and available_records:
+        selector_to_label.setdefault(IMPERSONATE_ANY_SENTINEL, IMPERSONATE_ANY_LABEL)
+    elif current_selector in available_specific and current_selector not in selector_to_label:
+        # Keep a still-valid exact selection visible even when "Show specific
+        # targets" is off, instead of silently changing its fingerprint.
+        current_label = available_specific[current_selector]
+        clean_values.append(current_label)
+        selector_to_label[current_selector] = current_label
+    elif current_selector in available_families and current_selector not in selector_to_label:
+        current_label = f"{format_impersonate_family_label(current_selector)} (automatic)"
+        if current_label not in clean_values:
+            clean_values.append(current_label)
+        selector_to_label[current_selector] = current_label
 
     impersonate_menu["values"] = clean_values
 
-    current = impersonate_var.get()
-    if current not in clean_values:
-        impersonate_var.set("None")
-
+    if not current_selector:
+        impersonate_var.set(IMPERSONATE_NONE_LABEL)
+    elif current_selector in selector_to_label:
+        impersonate_var.set(selector_to_label[current_selector])
+    else:
+        impersonate_var.set(IMPERSONATE_NONE_LABEL)
 
 def export_firefox_cookies_dialog():
     yt_dlp_path = yt_dlp_path_var.get().strip()
@@ -19788,8 +20319,18 @@ def show_case_browser_placeholder(message):
         pass
 
 
+def get_case_browser_effective_output_root():
+    preferred = str(case_browser_runtime_output_root or "").strip()
+    return preferred or output_root_var.get().strip()
+
+
+def set_case_browser_runtime_output_root(value):
+    global case_browser_runtime_output_root
+    case_browser_runtime_output_root = str(value or "").strip()
+
+
 def get_case_browser_output_root_state(value=None):
-    raw_path = output_root_var.get().strip() if value is None else str(value or "").strip()
+    raw_path = get_case_browser_effective_output_root() if value is None else str(value or "").strip()
     if not raw_path:
         return ("", False)
 
@@ -19851,8 +20392,11 @@ def start_case_browser_output_root_watcher():
         case_browser_root_watch_after_id = None
 
 
-def schedule_case_browser_autoload(delay_ms=500):
+def schedule_case_browser_autoload(delay_ms=500, output_root=None):
     global case_browser_reload_after_id
+
+    if output_root is not None:
+        set_case_browser_runtime_output_root(output_root)
 
     try:
         if case_browser_reload_after_id:
@@ -19876,13 +20420,16 @@ def schedule_case_browser_autoload(delay_ms=500):
 
 def on_output_root_changed(*args):
     update_case_folder_preview(*args)
+    # A deliberate Audio/Video Output Root change becomes the user's current
+    # Case Browser root until another capture finishes in a different root.
+    set_case_browser_runtime_output_root(output_root_var.get().strip())
     schedule_case_browser_autoload()
 
 
 def open_case_browser(select_tab=True, silent=False):
     global case_browser_active_token, case_browser_loaded_root_state
 
-    output_root = output_root_var.get().strip()
+    output_root = get_case_browser_effective_output_root()
     case_browser_loaded_root_state = get_case_browser_output_root_state(output_root)
     load_token = object()
     case_browser_active_token = load_token
@@ -21219,29 +21766,31 @@ def open_case_browser(select_tab=True, silent=False):
 
         return ""
 
-    def find_latest_manifest(case_root):
+    def find_case_manifests(case_root):
         candidates = []
-        search_roots = [
-            os.path.join(case_root, "manifests"),
-            case_root,
-        ]
 
-        for search_root in search_roots:
-            if not os.path.isdir(search_root):
-                continue
+        for root_dir, dir_names, file_names in os.walk(case_root):
+            dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache"}]
+            for file_name in file_names:
+                if is_wavi_case_manifest_filename(file_name):
+                    candidates.append(os.path.join(root_dir, file_name))
 
-            for root_dir, _dir_names, file_names in os.walk(search_root):
-                for file_name in file_names:
-                    lowered = file_name.lower()
-                    if lowered.startswith("sha256-manifest") and lowered.endswith(".csv"):
-                        path = os.path.join(root_dir, file_name)
-                        candidates.append(path)
+        def manifest_sort_key(path):
+            file_name = os.path.basename(path)
+            match = re.search(r"(\d{8})[-_](\d{6})", file_name)
+            try:
+                modified_ns = os.stat(path).st_mtime_ns
+            except Exception:
+                modified_ns = 0
+            if match:
+                return (match.group(1) + match.group(2), modified_ns, os.path.normcase(path))
+            try:
+                return (datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y%m%d%H%M%S"), modified_ns, os.path.normcase(path))
+            except Exception:
+                return ("", modified_ns, os.path.normcase(path))
 
-        if not candidates:
-            return ""
-
-        candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return candidates[0]
+        candidates.sort(key=manifest_sort_key)
+        return candidates
 
     def verify_case_files():
         folder_path = get_selected_browser_folder()
@@ -21270,38 +21819,87 @@ def open_case_browser(select_tab=True, silent=False):
             warning_message = ""
 
             try:
-                manifest_path = find_latest_manifest(case_root)
+                manifest_paths = find_case_manifests(case_root)
 
-                if not manifest_path:
+                if not manifest_paths:
                     warning_title = "No manifest found"
-                    warning_message = f"No SHA256 manifest was found for:\n\n{case_root}"
+                    warning_message = f"No SHA-256 manifest was found for:\n\n{case_root}"
                 else:
-                    ok_count = 0
-                    missing = []
-                    changed = []
-                    manifest_paths = set()
+                    expected_records = {}
+                    malformed_rows = 0
+                    unusable_manifests = []
+                    usable_manifest_count = 0
 
-                    with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
-                        reader = csv.DictReader(f)
-                        for row in reader:
+                    # Read oldest to newest. If more than one manifest records
+                    # the same file, the newest manifest becomes the expected
+                    # current hash for that path. This lets run-scoped A/V and
+                    # Webpage manifests combine into a case-level verification
+                    # view without re-hashing unchanged files in every run.
+                    for manifest_path in manifest_paths:
+                        if case_browser_active_token is not load_token or APP_CLOSING:
+                            return
+
+                        usable_rows = 0
+                        try:
+                            with open(manifest_path, "r", encoding="utf-8-sig", newline="") as f:
+                                reader = csv.DictReader(f)
+                                for row in reader:
+                                    if case_browser_active_token is not load_token or APP_CLOSING:
+                                        return
+
+                                    raw_path, expected_hash = normalize_case_manifest_row(row)
+                                    if not raw_path or not expected_hash:
+                                        malformed_rows += 1
+                                        continue
+
+                                    abs_path = resolve_case_manifest_record_path(case_root, raw_path)
+                                    if not abs_path:
+                                        malformed_rows += 1
+                                        continue
+
+                                    if is_case_verification_ignored_path(abs_path):
+                                        continue
+
+                                    key = os.path.normcase(os.path.abspath(abs_path))
+                                    expected_records[key] = {
+                                        "path": os.path.abspath(abs_path),
+                                        "raw_path": raw_path,
+                                        "expected_hash": expected_hash,
+                                        "manifest": manifest_path,
+                                    }
+                                    usable_rows += 1
+                        except Exception:
+                            unusable_manifests.append(manifest_path)
+                            continue
+
+                        if usable_rows > 0:
+                            usable_manifest_count += 1
+                        else:
+                            unusable_manifests.append(manifest_path)
+
+                    if not expected_records:
+                        warning_title = "No verifiable manifest records"
+                        warning_message = (
+                            "WAVI found manifest files, but none contained usable SHA-256 records "
+                            f"for files inside this case:\n\n{case_root}"
+                        )
+                    else:
+                        ok_count = 0
+                        missing = []
+                        changed = []
+
+                        for record in expected_records.values():
                             if case_browser_active_token is not load_token or APP_CLOSING:
                                 return
 
-                            path = row.get("Path", "")
-                            expected_hash = (row.get("Hash", "") or "").upper()
-
-                            if not path:
-                                continue
-
-                            abs_path = os.path.abspath(path)
-
-                            if is_case_verification_ignored_path(abs_path):
-                                continue
-
-                            manifest_paths.add(abs_path)
+                            abs_path = record["path"]
+                            try:
+                                display_path = os.path.relpath(abs_path, case_root)
+                            except Exception:
+                                display_path = record["raw_path"]
 
                             if not os.path.isfile(abs_path):
-                                missing.append(path)
+                                missing.append(display_path)
                                 continue
 
                             try:
@@ -21313,37 +21911,45 @@ def open_case_browser(select_tab=True, silent=False):
                                         h.update(chunk)
                                 actual_hash = h.hexdigest().upper()
                             except Exception:
-                                changed.append(path)
+                                changed.append(display_path)
                                 continue
 
-                            if actual_hash == expected_hash:
+                            if actual_hash == record["expected_hash"]:
                                 ok_count += 1
                             else:
-                                changed.append(path)
+                                changed.append(display_path)
 
-                    untracked_count = 0
-                    for root_dir, dir_names, file_names in os.walk(case_root):
-                        if case_browser_active_token is not load_token or APP_CLOSING:
-                            return
+                        tracked_paths = set(expected_records.keys())
+                        untracked_count = 0
+                        for root_dir, dir_names, file_names in os.walk(case_root):
+                            if case_browser_active_token is not load_token or APP_CLOSING:
+                                return
 
-                        dir_names[:] = [name for name in dir_names if name.lower() not in {"__pycache__", ".gui-cache", "manifests"}]
-                        for file_name in file_names:
-                            path = os.path.abspath(os.path.join(root_dir, file_name))
-                            if is_case_verification_ignored_path(path):
-                                continue
-                            if path == os.path.abspath(manifest_path):
-                                continue
-                            if path not in manifest_paths:
-                                untracked_count += 1
+                            dir_names[:] = [
+                                name for name in dir_names
+                                if name.lower() not in {"__pycache__", ".gui-cache", "manifests"}
+                            ]
+                            for file_name in file_names:
+                                path = os.path.abspath(os.path.join(root_dir, file_name))
+                                if is_case_verification_ignored_path(path):
+                                    continue
+                                if os.path.normcase(path) not in tracked_paths:
+                                    untracked_count += 1
 
-                    summary = (
-                        f"Manifest:\n{manifest_path}\n\n"
-                        f"Verified unchanged: {ok_count}\n"
-                        f"Missing: {len(missing)}\n"
-                        f"Changed/unreadable: {len(changed)}\n"
-                        f"New/untracked since manifest: {untracked_count}\n"
-                        f"Ignored folders: .gui-cache, manifests\n"
-                    )
+                        newest_manifest = manifest_paths[-1]
+                        summary = (
+                            f"Manifests found: {len(manifest_paths)}\n"
+                            f"Manifests with usable records: {usable_manifest_count}\n"
+                            f"Newest manifest:\n{newest_manifest}\n\n"
+                            f"Tracked files: {len(expected_records)}\n"
+                            f"Verified unchanged: {ok_count}\n"
+                            f"Missing: {len(missing)}\n"
+                            f"Changed/unreadable: {len(changed)}\n"
+                            f"New/untracked outside manifest-control folders: {untracked_count}\n"
+                            f"Malformed/unsafe manifest rows ignored: {malformed_rows}\n"
+                            f"Unreadable/empty manifests: {len(set(unusable_manifests))}\n"
+                            f"Ignored folders: .gui-cache, manifests\n"
+                        )
 
             except Exception as e:
                 error = str(e)
@@ -21371,9 +21977,9 @@ def open_case_browser(select_tab=True, silent=False):
                 queue_append_log("\nCase file verification:\n" + summary + "\n")
                 messagebox.showinfo("Case file verification", summary)
 
-            enqueue_case_browser_ui(apply_result)
+            safe_after(0, apply_result)
 
-        start_daemon_thread("worker", worker)
+        threading.Thread(target=worker, daemon=True).start()
 
     def find_tree_item_by_path(target_path):
         try:
@@ -21538,18 +22144,25 @@ def on_close():
             log_debug_exception("Queue shutdown handling failed", e)
 
     if direct_av_active or direct_image_active or direct_web_active:
-        try:
-            mark_running_queue_jobs_interrupted("App closed while direct capture was running.")
-        except Exception as e:
-            log_debug_exception("Could not mark direct capture jobs interrupted during shutdown", e)
-
         if direct_av_active:
+            try:
+                mark_direct_recovery_job_interrupted(active_av_direct_recovery_job_id, "App closed while direct capture was running.")
+            except Exception as e:
+                log_debug_exception("Could not mark Audio/Video direct recovery job interrupted during shutdown", e)
             terminate_process_tree(running_process, label="direct Audio/Video capture")
 
         if direct_image_active:
+            try:
+                mark_direct_recovery_job_interrupted(active_image_direct_recovery_job_id, "App closed while direct capture was running.")
+            except Exception as e:
+                log_debug_exception("Could not mark Image direct recovery job interrupted during shutdown", e)
             terminate_process_tree(image_running_process, label="direct Image Capture")
 
         if direct_web_active:
+            try:
+                mark_direct_recovery_job_interrupted(active_web_direct_recovery_job_id, "App closed while direct capture was running.")
+            except Exception as e:
+                log_debug_exception("Could not mark Webpage direct recovery job interrupted during shutdown", e)
             terminate_process_tree(web_running_process, label="direct Webpage Capture")
 
     try:
@@ -22485,7 +23098,7 @@ def get_web_proxy_server_for_browser():
     parsed = urlsplit(proxy_url)
     if parsed.username or parsed.password:
         raise ValueError(
-            "Webpage Capture does not support authenticated proxy credentials in this first version. "
+            "Webpage Capture does not support authenticated proxy credentials. "
             "Disable the app proxy or use an approved unauthenticated proxy for this capture."
         )
     return proxy_url
@@ -22495,14 +23108,17 @@ def get_resolved_web_case_name(now=None, domains=None):
     now = now or datetime.now()
     if domains is None:
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in get_web_url_list()) if domain})
-    return safe_case_name(render_case_name_template(
-        web_case_name_var.get().strip(),
-        now=now,
-        domains=domains,
-        presets=[],
-        playlist="",
-        engine="web-capture",
-    ))
+    return resolve_windows_case_name(
+        render_case_name_template(
+            web_case_name_var.get().strip(),
+            now=now,
+            domains=domains,
+            presets=[],
+            playlist="",
+            engine="web-capture",
+        ),
+        label="Webpage Capture Case Name",
+    )
 
 
 def render_web_filename_template_example(template, now=None, resolved_case_name=None, capture_mode=None):
@@ -23235,11 +23851,10 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     if invalid_urls:
         raise ValueError("Webpage Capture supports only HTTP/HTTPS URLs in this version.")
     if not preflight_only:
-        if not output_root:
-            raise ValueError("Webpage Capture Output Root cannot be blank.")
-        os.makedirs(output_root, exist_ok=True)
-        if not resolved_case_name:
-            raise ValueError("Webpage Capture Case Name is blank after resolving the template.")
+        normalized_output_root = normalize_and_validate_output_root(output_root, label="Webpage Capture")
+        settings["web_output_root"] = normalized_output_root
+        settings["output_root"] = normalized_output_root
+        validate_windows_resolved_case_name(resolved_case_name, label="Webpage Capture Case Name")
     template = str(settings.get("web_filename_template", "")).strip()
     if not template:
         raise ValueError("Webpage Capture Filename Template cannot be blank.")
@@ -23737,16 +24352,25 @@ def add_web_urls_to_queue_as_job(urls=None):
         settings = get_web_settings_dict()
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
         case_template = settings.get("web_case_name", "")
-        resolved_case_name = safe_case_name(render_case_name_template(
-            case_template,
-            now=datetime.now(),
-            domains=domains,
-            presets=[],
-            playlist="",
-            engine="web-capture",
-        ))
-        if not resolved_case_name:
-            raise ValueError("Webpage Capture Case Name is blank after resolving the template.")
+        resolved_case_name = resolve_windows_case_name(
+            render_case_name_template(
+                case_template,
+                now=datetime.now(),
+                domains=domains,
+                presets=[],
+                playlist="",
+                engine="web-capture",
+            ),
+            label="Webpage Capture Case Name",
+        )
+        normalized_output_root = normalize_and_validate_output_root(
+            settings.get("web_output_root", settings.get("output_root", "")),
+            label="Webpage Capture",
+        )
+        settings["web_output_root"] = normalized_output_root
+        settings["output_root"] = normalized_output_root
+        if settings.get("web_use_cookies_file", DEFAULTS["web_use_cookies_file"]):
+            inspect_netscape_cookie_file(settings.get("web_cookies_file", ""))
         job = {
             "job_id": make_job_id(),
             "engine": "web-capture",
@@ -23870,7 +24494,7 @@ def finish_web_direct_capture_summary(recovery_job_id, exit_code, submitted_url_
 
 
 def start_web_capture():
-    global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name, last_web_capture_context
+    global web_running_process, web_direct_stop_requested, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name, last_web_capture_context
 
     queue_has_work = bool(job_queue_running or get_pending_queue_jobs() or get_running_queue_jobs())
     if queue_has_work or get_web_concurrent_capture_limit() >= 2:
@@ -23889,14 +24513,17 @@ def start_web_capture():
         urls = get_web_url_list()
         settings = get_web_settings_dict()
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in urls) if domain})
-        resolved_case_name = safe_case_name(render_case_name_template(
-            settings.get("web_case_name", ""),
-            now=datetime.now(),
-            domains=domains,
-            presets=[],
-            playlist="",
-            engine="web-capture",
-        ))
+        resolved_case_name = resolve_windows_case_name(
+            render_case_name_template(
+                settings.get("web_case_name", ""),
+                now=datetime.now(),
+                domains=domains,
+                presets=[],
+                playlist="",
+                engine="web-capture",
+            ),
+            label="Webpage Capture Case Name",
+        )
         validate_web_settings_and_urls(settings, urls, resolved_case_name, preflight_only=False)
         case_folder = os.path.join(settings.get("web_output_root", ""), resolved_case_name)
         if not confirm_case_folder_collision(case_folder):
@@ -23938,6 +24565,7 @@ def start_web_capture():
             cleanup_command_input_file_if_temp(cmd)
             return
 
+    web_direct_stop_requested = False
     direct_recovery_job = create_direct_recovery_job(
         "web-capture", settings, urls, resolved_case_name, settings.get("web_case_name", ""),
         domains=domains, applied_domain_presets=[], playlist_name="",
@@ -23951,7 +24579,7 @@ def start_web_capture():
     last_web_capture_context = {
         "tool_versions": versions,
         "submitted_url_count": len(urls),
-        "settings": settings,
+        "settings": get_runtime_summary_settings(settings),
         "paths": get_expected_web_run_paths_for_values(settings.get("web_output_root", settings.get("output_root", "")), resolved_case_name),
     }
     prepare_case_summary_actions_for_run("web-capture")
@@ -24008,11 +24636,11 @@ def start_web_capture():
 
     web_start_button.config(state="disabled")
     web_start_menu_button.config(state="disabled")
-    web_stop_button.config(state="normal")
-    web_set_status("Running...")
+    web_stop_button.config(state="disabled")
+    web_set_status("Starting...")
 
     def worker():
-        global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
+        global web_running_process, web_direct_stop_requested, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
         exit_code = 1
         universal_skip_records = []
         universal_skip_summary = {}
@@ -24020,6 +24648,8 @@ def start_web_capture():
         try:
             process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             web_running_process = process
+            safe_after(0, lambda: web_stop_button.config(state="normal"))
+            safe_after(0, web_set_status, "Running...")
             if process.stdout:
                 for line in process.stdout:
                     archive_payload = parse_web_universal_archive_record_output_line(line)
@@ -24067,6 +24697,11 @@ def start_web_capture():
                     if recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
                         safe_after(0, handle_queue_output_line, recovery_job_id, line)
             exit_code = process.wait()
+        except Exception as e:
+            safe_after(0, web_append_log, f"\nERROR: {e}\n")
+            exit_code = 1
+        finally:
+            cleanup_command_input_file_if_temp(cmd)
             safe_after(
                 0,
                 finish_web_direct_capture_summary,
@@ -24077,13 +24712,9 @@ def start_web_capture():
                 dict(universal_skip_summary),
                 dict(classification_summary),
             )
-        except Exception as e:
-            safe_after(0, web_append_log, f"\nERROR: {e}\n")
-        finally:
-            cleanup_command_input_file_if_temp(cmd)
 
         def finish():
-            global web_running_process, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
+            global web_running_process, web_direct_stop_requested, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
             web_running_process = None
             active_web_direct_recovery_job_id = ""
             active_web_direct_domains = []
@@ -24091,9 +24722,13 @@ def start_web_capture():
             web_start_button.config(state="normal")
             web_start_menu_button.config(state="normal")
             web_stop_button.config(state="disabled")
-            web_set_status("Complete" if exit_code == 0 else "Failed")
+            web_set_status("Interrupted" if web_direct_stop_requested else ("Complete" if exit_code == 0 else "Failed"))
+            web_direct_stop_requested = False
             web_append_log(f"\nWebpage Capture finished with exit code {exit_code}.\n")
-            schedule_case_browser_autoload(delay_ms=250)
+            schedule_case_browser_autoload(
+                delay_ms=250,
+                output_root=settings.get("web_output_root", settings.get("output_root", "")),
+            )
 
         safe_after(0, finish)
 
@@ -24101,10 +24736,11 @@ def start_web_capture():
 
 
 def stop_web_capture():
-    global web_running_process
+    global web_running_process, web_direct_stop_requested
     if web_running_process is not None and web_running_process.poll() is None:
         try:
-            mark_running_queue_jobs_interrupted("Stopped by user.")
+            web_direct_stop_requested = True
+            mark_direct_recovery_job_interrupted(active_web_direct_recovery_job_id, "Stopped by user.")
             terminate_process_tree(web_running_process, label="direct Webpage Capture")
             web_append_log("\nStop requested for Webpage Capture process tree.\n")
         except Exception as e:
@@ -24374,6 +25010,7 @@ image_preflight_done_var = tk.BooleanVar(value=False)
 gallery_dl_version_status_var = tk.StringVar(value="gallery-dl: not checked")
 image_options_summary_var = tk.StringVar(value="")
 image_running_process = None
+image_direct_stop_requested = False
 
 web_script_path_var = tk.StringVar(value=DEFAULTS["web_script_path"])
 web_deno_path_var = tk.StringVar(value=DEFAULTS["web_deno_path"])
@@ -24482,6 +25119,7 @@ web_status_var = tk.StringVar(value="Ready")
 web_preflight_done_var = tk.BooleanVar(value=False)
 web_options_summary_var = tk.StringVar(value="")
 web_running_process = None
+web_direct_stop_requested = False
 active_av_direct_recovery_job_id = ""
 active_image_direct_recovery_job_id = ""
 active_web_direct_recovery_job_id = ""
@@ -24491,6 +25129,7 @@ active_web_direct_domains = []
 active_av_direct_case_name = ""
 active_image_direct_case_name = ""
 active_web_direct_case_name = ""
+active_av_direct_universal_archive = False
 
 
 for option_var in [
@@ -25489,7 +26128,7 @@ def get_resolved_image_case_name(now=None, domains=None, presets=None, playlist=
         playlist=playlist,
         engine="gallery-dl",
     )
-    return safe_case_name(rendered)
+    return resolve_windows_case_name(rendered, label="Image Capture Case Name")
 
 
 def update_image_case_folder_preview(*_args):
@@ -25624,10 +26263,8 @@ def validate_image_inputs():
             if missing:
                 raise ValueError("One or more Image Capture Input File entries are missing or invalid.\n\n" + "\n".join(missing))
         raise ValueError("No Image Capture URLs are available. Add URLs to the URL box or select Input File(s).")
-    if image_use_cookies_file_var.get() and cookies_file and not os.path.isfile(cookies_file):
-        raise ValueError("Image Capture cookies file is invalid.")
-    if output_root:
-        os.makedirs(output_root, exist_ok=True)
+    validate_enabled_cookies_file(image_use_cookies_file_var.get(), cookies_file, label="Image Capture")
+    normalize_and_validate_output_root(output_root, label="Image Capture")
     if not image_case_name_var.get().strip():
         raise ValueError("Image Capture Case Name cannot be blank.")
     validate_gallery_filename_template(image_filename_template_var.get())
@@ -25647,12 +26284,18 @@ def validate_gallery_queue_job_inputs(job):
         raise ValueError("gallery-dl path is missing or invalid.")
     if not urls:
         raise ValueError("The Image Capture queue job does not contain any URLs.")
-    if bool(settings.get("image_use_cookies_file", False)) and cookies_file and not os.path.isfile(cookies_file):
-        raise ValueError("Image Capture cookies file is invalid.")
-    if output_root:
-        os.makedirs(output_root, exist_ok=True)
-    if not job.get("resolved_case_name", "").strip():
-        raise ValueError("Image Capture queue job resolved case name is blank.")
+    validate_enabled_cookies_file(
+        bool(settings.get("image_use_cookies_file", False)),
+        cookies_file,
+        label="Image Capture",
+    )
+    normalized_output_root = normalize_and_validate_output_root(output_root, label="Image Capture")
+    settings["image_output_root"] = normalized_output_root
+    settings["output_root"] = normalized_output_root
+    validate_windows_resolved_case_name(
+        job.get("resolved_case_name", "").strip(),
+        label="Image Capture Queue Job Case Name",
+    )
 
 
 def build_gallery_powershell_command_for_job(job):
@@ -25735,7 +26378,7 @@ def image_preflight_check(show_success_popup=True):
         if cookies_file:
             add_check("Cookies file exists", os.path.isfile(cookies_file), cookies_file)
         else:
-            add_check("Cookies file", True, "Enabled, but not specified")
+            add_check("Cookies file", False, "Enabled, but no file was selected")
     else:
         add_check("Cookies file", True, "Disabled by app setting; skipped")
 
@@ -25752,11 +26395,10 @@ def image_preflight_check(show_success_popup=True):
     add_check(archive_status["label"], True, f"{archive_status['state']}; {archive_status['path']}")
 
     try:
-        if output_root:
-            os.makedirs(output_root, exist_ok=True)
-        add_check("Output root exists or can be created", os.path.isdir(output_root), output_root or "not set")
+        validated_output_root = normalize_and_validate_output_root(output_root, label="Image Capture")
+        add_check("Output root exists and is writable", True, validated_output_root)
     except Exception as e:
-        add_check("Output root exists or can be created", False, str(e))
+        add_check("Output root exists and is writable", False, str(e))
 
     if os.path.isfile(gallery_path):
         version_info = get_tool_first_line(
@@ -25825,19 +26467,31 @@ def add_image_urls_to_queue_as_job(urls=None):
             raise ValueError(describe_image_url_source_problem("adding the current Image Capture to the queue"))
         settings = get_image_settings_dict()
         settings, applied_presets = apply_checked_domain_presets_to_settings(settings, clean_urls)
+        normalized_output_root = normalize_and_validate_output_root(
+            settings.get("image_output_root", settings.get("output_root", "")),
+            label="Image Capture",
+        )
+        settings["image_output_root"] = normalized_output_root
+        settings["output_root"] = normalized_output_root
+        validate_enabled_cookies_file(
+            settings.get("image_use_cookies_file", False),
+            settings.get("image_cookies_file", ""),
+            label="Image Capture",
+        )
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
         now = datetime.now()
         case_template = settings["image_case_name"]
-        resolved_case_name = safe_case_name(render_case_name_template(
-            case_template,
-            now=now,
-            domains=domains,
-            presets=applied_presets,
-            playlist="",
-            engine="gallery-dl",
-        ))
-        if not resolved_case_name:
-            raise ValueError("Image Capture Case Name is blank after resolving the template.")
+        resolved_case_name = resolve_windows_case_name(
+            render_case_name_template(
+                case_template,
+                now=now,
+                domains=domains,
+                presets=applied_presets,
+                playlist="",
+                engine="gallery-dl",
+            ),
+            label="Image Capture Case Name",
+        )
         job = {
             "job_id": make_job_id(),
             "engine": "gallery-dl",
@@ -25947,7 +26601,7 @@ def finish_image_direct_capture_summary(recovery_job_id, exit_code, submitted_ur
 
 
 def start_image_capture():
-    global image_running_process, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name, last_image_capture_context
+    global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name, last_image_capture_context
 
     effective_concurrency_limit = get_image_concurrent_capture_limit()
 
@@ -26002,18 +26656,30 @@ def start_image_capture():
         urls = get_image_url_list()
         settings = get_image_settings_dict()
         settings, applied_domain_presets = apply_checked_domain_presets_to_settings(settings, urls)
+        normalized_output_root = normalize_and_validate_output_root(
+            settings.get("image_output_root", settings.get("output_root", "")),
+            label="Image Capture",
+        )
+        settings["image_output_root"] = normalized_output_root
+        settings["output_root"] = normalized_output_root
+        validate_enabled_cookies_file(
+            settings.get("image_use_cookies_file", False),
+            settings.get("image_cookies_file", ""),
+            label="Image Capture",
+        )
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in urls) if domain})
         now = datetime.now()
-        resolved_case_name = safe_case_name(render_case_name_template(
-            settings["image_case_name"],
-            now=now,
-            domains=domains,
-            presets=applied_domain_presets,
-            playlist="",
-            engine="gallery-dl",
-        ))
-        if not resolved_case_name:
-            raise ValueError("Image Capture Case Name is blank after resolving the template.")
+        resolved_case_name = resolve_windows_case_name(
+            render_case_name_template(
+                settings["image_case_name"],
+                now=now,
+                domains=domains,
+                presets=applied_domain_presets,
+                playlist="",
+                engine="gallery-dl",
+            ),
+            label="Image Capture Case Name",
+        )
         case_folder = os.path.join(settings["image_output_root"], resolved_case_name)
         job = {"engine": "gallery-dl", "settings": settings, "urls": urls, "resolved_case_name": resolved_case_name, "domains": domains, "case_template": settings["image_case_name"], "applied_domain_presets": applied_domain_presets}
         cmd = build_gallery_powershell_command_for_job(job)
@@ -26056,6 +26722,7 @@ def start_image_capture():
             cleanup_command_input_file_if_temp(cmd)
             return
 
+    image_direct_stop_requested = False
     direct_recovery_job = create_direct_recovery_job(
         "gallery-dl",
         settings,
@@ -26075,7 +26742,7 @@ def start_image_capture():
     last_image_capture_context = {
         "tool_versions": versions,
         "submitted_url_count": len(urls),
-        "settings": settings,
+        "settings": get_runtime_summary_settings(settings),
         "paths": get_expected_image_run_paths_for_values(settings.get("image_output_root", settings.get("output_root", "")), resolved_case_name),
     }
     prepare_case_summary_actions_for_run("gallery-dl")
@@ -26104,29 +26771,31 @@ def start_image_capture():
     image_append_log(format_command_for_log(cmd) + "\n\n")
     image_start_button.config(state="disabled")
     image_start_menu_button.config(state="disabled")
-    image_stop_button.config(state="normal")
-    image_set_status("Running...")
+    image_stop_button.config(state="disabled")
+    image_set_status("Starting...")
 
     def worker():
-        global image_running_process, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
+        global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
         exit_code = 1
         try:
             process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
             image_running_process = process
+            safe_after(0, lambda: image_stop_button.config(state="normal"))
+            safe_after(0, image_set_status, "Running...")
             if process.stdout:
                 for line in process.stdout:
                     queue_image_append_log(line)
                     if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE	") or line.startswith("GUI_QUEUE_URL_INCOMPLETE	")):
                         safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
             exit_code = process.wait()
-            safe_after(0, finish_image_direct_capture_summary, direct_recovery_job_id, exit_code, len(urls))
         except Exception as e:
             queue_image_append_log(f"\nERROR: {e}\n")
             exit_code = 1
         finally:
             cleanup_command_input_file_if_temp(cmd)
+            safe_after(0, finish_image_direct_capture_summary, direct_recovery_job_id, exit_code, len(urls))
         def finish():
-            global image_running_process, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
+            global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
             image_running_process = None
             active_image_direct_recovery_job_id = ""
             active_image_direct_domains = []
@@ -26134,18 +26803,23 @@ def start_image_capture():
             image_start_button.config(state="normal")
             image_start_menu_button.config(state="normal")
             image_stop_button.config(state="disabled")
-            image_set_status("Complete" if exit_code == 0 else "Failed")
+            image_set_status("Interrupted" if image_direct_stop_requested else ("Complete" if exit_code == 0 else "Failed"))
+            image_direct_stop_requested = False
             image_append_log(f"\nImage Capture finished with exit code {exit_code}.\n")
-            schedule_case_browser_autoload(delay_ms=250)
+            schedule_case_browser_autoload(
+                delay_ms=250,
+                output_root=settings.get("image_output_root", settings.get("output_root", "")),
+            )
         safe_after(0, finish)
 
     start_daemon_thread("worker", worker)
 
 def stop_image_capture():
-    global image_running_process
+    global image_running_process, image_direct_stop_requested
     if image_running_process is not None and image_running_process.poll() is None:
         try:
-            mark_running_queue_jobs_interrupted("Stopped by user.")
+            image_direct_stop_requested = True
+            mark_direct_recovery_job_interrupted(active_image_direct_recovery_job_id, "Stopped by user.")
             terminate_process_tree(image_running_process, label="direct Image Capture")
             image_append_log("\nStop requested for Image Capture process tree.\n")
         except Exception as e:
@@ -28586,7 +29260,7 @@ ttk.Label(
 
 ttk.Checkbutton(
     impersonate_frame,
-    text="Show all targets",
+    text="Show specific targets",
     variable=show_all_impersonate_targets_var,
     command=lambda: target_status_var.set("Impersonate targets: Not checked"),
 ).grid(row=1, column=2, sticky="e", pady=(6, 0))

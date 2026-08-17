@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$InputFile,
 
@@ -361,7 +361,32 @@ function Resolve-ToolPath {
 
 function New-SafeCaseName {
     param([string]$Name)
-    return ($Name -replace '[\\/:*?"<>|]', '_').Trim()
+
+    $original = [string]$Name
+    if ([string]::IsNullOrWhiteSpace($original)) {
+        return ""
+    }
+    if ($original -match '[\x00-\x1F]') {
+        throw "CaseName contains a Windows-invalid control character."
+    }
+    if ($original -match '[ .]$') {
+        throw "CaseName cannot end with a space or period on Windows."
+    }
+
+    $safe = ($original -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return ""
+    }
+    if ($safe.EndsWith('.')) {
+        throw "CaseName cannot end with a period on Windows."
+    }
+
+    $baseName = (($safe -split '\.', 2)[0]).ToUpperInvariant()
+    if ($baseName -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+        throw "CaseName resolves to the Windows-reserved name '$safe'. Choose a different case name."
+    }
+
+    return $safe
 }
 
 function Test-RelativeOutputTemplate {
@@ -1147,7 +1172,7 @@ $OptionLines = @(
     "Match keywords:         $MatchKeywords",
     "Reject keywords:        $RejectKeywords",
     "Failure handling:       $FailureHandling",
-    "Impersonate target:     $ImpersonateTarget",
+    "Impersonate target:     $(if ($ImpersonateTarget -eq '__any__') { 'Any available' } else { $ImpersonateTarget })",
     "GUI display cache:      $GuiCacheMode",
     "File manifest:          $ManifestMode",
     "Proxy:                  $(Get-MaskedProxyUrl -Value $ProxyUrl)"
@@ -1195,14 +1220,12 @@ switch ($RetryBehavior) {
 }
 
 $CommonArgs = @(
+    "--ignore-config",
     "--continue",
     "--restrict-filenames",
     "--trim-filenames", "180",
 
     "--js-runtimes", "deno:$DenoPath",
-
-    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "--add-header", "Accept-Language: en-US,en;q=0.9",
 
     "--retries", $RetryCount,
     "--fragment-retries", $FragmentRetryCount,
@@ -1225,10 +1248,6 @@ if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
 }
 else {
     Write-RunLog "Proxy: disabled"
-}
-
-if ($FailureHandling -eq "Continue") {
-    $CommonArgs += "--ignore-errors"
 }
 
 switch ($ArchiveMode) {
@@ -1460,7 +1479,10 @@ if ($FFmpegFolder) {
     $CommonArgs += @("--ffmpeg-location", $FFmpegFolder)
 }
 
-if ($ImpersonateTarget) {
+if ($ImpersonateTarget -eq "__any__") {
+    $CommonArgs += "--impersonate="
+}
+elseif ($ImpersonateTarget) {
     $CommonArgs += @("--impersonate", $ImpersonateTarget)
 }
 
@@ -1496,6 +1518,8 @@ function Invoke-GuiCacheGeneration {
         MediaInfoOk = $mediaInfoOk
     }
 }
+
+$HadCaptureFailure = $false
 
 for ($i = 0; $i -lt $Urls.Count; $i++) {
     $Url = $Urls[$i]
@@ -1571,6 +1595,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     }
 
     if ($YtDlpExitCode -ne 0) {
+        $HadCaptureFailure = $true
         $msg = "yt-dlp exited with code $YtDlpExitCode for URL: $Url"
         Write-Warning $msg
         Add-RunLogLine $msg
@@ -1620,8 +1645,10 @@ $manifestWriter = New-Object System.IO.StreamWriter($HashManifest, $false, $mani
 try {
     $manifestWriter.WriteLine('"Algorithm","Hash","Path"')
 
+    # Hash all eligible files except the active run log first. The run log is
+    # still open while manifest warnings and the final summary are written.
     foreach ($file in Get-ChildItem -LiteralPath $CaseDir -Recurse -File -ErrorAction SilentlyContinue) {
-        if ($file.FullName -eq $HashManifest) {
+        if ($file.FullName -eq $HashManifest -or $file.FullName -eq $RunLog) {
             continue
         }
 
@@ -1639,27 +1666,53 @@ try {
 
         try {
             $hash = Get-Sha256HashCompat -Path $file.FullName
-            $safePath = $file.FullName -replace '"', '""'
+            $relativePath = $file.FullName.Substring($CaseDir.Length).TrimStart('\', '/') -replace '\\', '/'
+            $safePath = $relativePath -replace '"', '""'
             $manifestWriter.WriteLine(('"SHA256","{0}","{1}"' -f $hash, $safePath))
         }
         catch {
             Write-RunWarning "Could not hash file for manifest: $($file.FullName) - $($_.Exception.Message)"
         }
     }
+
+    Write-Section "Done"
+
+    Write-RunLog "Case folder:      $CaseDir"
+    Write-RunLog "Run log:          $RunLog"
+    Write-RunLog "Download archive: $ArchiveFile"
+    Write-RunLog "Universal archive: $UniversalArchiveFile"
+    Write-RunLog "Failed URLs:      $GlobalFailedUrlsFile"
+    Write-RunLog "Captured URLs:    $GlobalCapturedUrlsFile"
+    Write-RunLog "SHA256 manifest:  $HashManifest"
+    Close-RunLogWriter
+
+    # The run log must be closed before it can be hashed on Windows. Hashing it
+    # last also records the digest of its final contents rather than a stale
+    # pre-summary version.
+    if ((Test-Path -LiteralPath $RunLog) -and ((Get-Item -LiteralPath $RunLog).LastWriteTime -ge $manifestSince)) {
+        try {
+            $runLogHash = Get-Sha256HashCompat -Path $RunLog
+            $relativeRunLogPath = $RunLog.Substring($CaseDir.Length).TrimStart('\', '/') -replace '\\', '/'
+            $safeRunLogPath = $relativeRunLogPath -replace '"', '""'
+            $manifestWriter.WriteLine(('"SHA256","{0}","{1}"' -f $runLogHash, $safeRunLogPath))
+        }
+        catch {
+            Write-Warning "Could not hash finalized run log for manifest: $RunLog - $($_.Exception.Message)"
+        }
+    }
 }
 finally {
+    Close-RunLogWriter
     $manifestWriter.Dispose()
 }
 
-Write-RunLog "Hash manifest written to: $HashManifest"
+Write-Host "Hash manifest written to: $HashManifest"
 
-Write-Section "Done"
+# Windows PowerShell -File otherwise reports successful script completion as exit 0.
+# Make the wrapper's process result authoritative for the GUI/queue whenever any
+# submitted URL returned a non-zero yt-dlp result.
+if ($HadCaptureFailure) {
+    exit 1
+}
 
-Write-RunLog "Case folder:      $CaseDir"
-Write-RunLog "Run log:          $RunLog"
-Write-RunLog "Download archive: $ArchiveFile"
-Write-RunLog "Universal archive: $UniversalArchiveFile"
-Write-RunLog "Failed URLs:      $GlobalFailedUrlsFile"
-Write-RunLog "Captured URLs:    $GlobalCapturedUrlsFile"
-Write-RunLog "SHA256 manifest:  $HashManifest"
-Close-RunLogWriter
+exit 0

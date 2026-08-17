@@ -2,6 +2,17 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0816](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0816) - Capture Reliability, Recovery, and Evidence Integrity
+
+- Improved Audio/Video and Image Capture failure handling so failed URLs and yt-dlp processing errors produce authoritative job results, while Image metadata-only captures now use the normal gallery-dl processing path without suppressing later media downloads.
+- Strengthened direct-capture and Job Queue process ownership, Stop and shutdown behaviour, interrupted-job recovery, setup-failure persistence, and Webpage per-URL classification recovery.
+- Improved queue concurrency and archive safety by preserving each job’s captured concurrency limits, reserving engines for active direct captures, serializing Audio/Video universal-archive use, and preventing Partial Webpage captures from suppressing later cross-case attempts.
+- Improved evidence integrity with finalized run-log hashing, case-relative manifest paths, cross-engine manifest verification, relocated-case support, and combined verification across Audio/Video, Image, and Webpage manifests.
+- Reworked yt-dlp impersonation targets around the capabilities reported by the installed tool, with dynamic browser-family and exact client/OS choices, unavailable-target filtering, and corrected exact-target forwarding.
+- Improved capture repeatability and validation by removing forced Audio/Video browser/language headers, isolating yt-dlp and gallery-dl from unrelated external configuration files, validating writable Output Roots and enabled cookie files, and rejecting Windows-invalid resolved case names.
+- Improved Case Browser root handling so it follows the most recently completed capture across all three engines while retaining manual Audio/Video Output Root control.
+- Improved runtime stability and diagnostics with live gallery-dl Output Log streaming, safer background-worker state snapshots, abandoned Webpage browser-profile cleanup, and targeted logging for persistence, recovery, archive, and temporary-file failures.
+
 ## [v3.2026.0725](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0725) - Interactive Webpage Capture, Safety, and PDF Browsing
 
 - Added optional Interactive Overlays capture with packaged whitelist and blacklist rules, bounded page scanning, media-readiness checks, per-item evidence reporting, automatic dismissal, and same-origin route capture for post, reel, photo, story, and highlight pages.

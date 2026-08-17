@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$InputFile,
 
@@ -178,24 +178,82 @@ function Invoke-GalleryDlSafely {
         [Parameter(Mandatory = $true)][string]$RunLog
     )
 
-    $StdOutFile = New-AppTempFile -Prefix "avi-gallerydl-stdout-" -Suffix ".log"
-    $StdErrFile = New-AppTempFile -Prefix "avi-gallerydl-stderr-" -Suffix ".log"
+    # Use System.Diagnostics.Process rather than Start-Process with temporary
+    # stdout/stderr files. Reading both redirected streams asynchronously keeps
+    # gallery-dl output live in WAVI while avoiding Windows PowerShell's native
+    # stderr -> NativeCommandError conversion.
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $StartInfo.FileName = $FilePath
+    $StartInfo.Arguments = Join-NativeArguments $Arguments
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = $StartInfo
 
     try {
-        $Process = Start-Process -FilePath $FilePath -ArgumentList (Join-NativeArguments $Arguments) -RedirectStandardOutput $StdOutFile -RedirectStandardError $StdErrFile -NoNewWindow -Wait -PassThru
+        if (-not $Process.Start()) {
+            throw "gallery-dl process could not be started."
+        }
 
-        foreach ($OutputFile in @($StdOutFile, $StdErrFile)) {
-            if (Test-Path -LiteralPath $OutputFile -PathType Leaf) {
-                Get-Content -LiteralPath $OutputFile -ErrorAction SilentlyContinue | ForEach-Object {
-                    $Line = $_.ToString()
+        $StdOutTask = $Process.StandardOutput.ReadLineAsync()
+        $StdErrTask = $Process.StandardError.ReadLineAsync()
+
+        while ($null -ne $StdOutTask -or $null -ne $StdErrTask) {
+            $PendingTasks = @()
+            $TaskKinds = @()
+
+            if ($null -ne $StdOutTask) {
+                $PendingTasks += $StdOutTask
+                $TaskKinds += "stdout"
+            }
+            if ($null -ne $StdErrTask) {
+                $PendingTasks += $StdErrTask
+                $TaskKinds += "stderr"
+            }
+
+            if ($PendingTasks.Count -eq 0) {
+                break
+            }
+
+            $CompletedIndex = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$PendingTasks, 250)
+
+            if ($CompletedIndex -lt 0) {
+                continue
+            }
+
+            $Kind = $TaskKinds[$CompletedIndex]
+            if ($Kind -eq "stdout") {
+                $Line = $StdOutTask.Result
+                if ($null -eq $Line) {
+                    $StdOutTask = $null
+                }
+                else {
                     if ($Line.Length -gt 0) {
                         Write-Host $Line
                         Write-RunLogLineOnly $Line
                     }
+                    $StdOutTask = $Process.StandardOutput.ReadLineAsync()
+                }
+            }
+            else {
+                $Line = $StdErrTask.Result
+                if ($null -eq $Line) {
+                    $StdErrTask = $null
+                }
+                else {
+                    if ($Line.Length -gt 0) {
+                        Write-Host $Line
+                        Write-RunLogLineOnly $Line
+                    }
+                    $StdErrTask = $Process.StandardError.ReadLineAsync()
                 }
             }
         }
 
+        $Process.WaitForExit()
         if ($null -eq $Process.ExitCode) {
             return 1
         }
@@ -203,13 +261,50 @@ function Invoke-GalleryDlSafely {
         return [int]$Process.ExitCode
     }
     finally {
-        Remove-Item -LiteralPath $StdOutFile, $StdErrFile -Force -ErrorAction SilentlyContinue
+        if ($null -ne $Process) {
+            try {
+                if (-not $Process.HasExited) {
+                    $Process.Kill()
+                    [void]$Process.WaitForExit(2000)
+                }
+            }
+            catch {
+                # Best effort only. The GUI also terminates the full process tree
+                # when the user stops or closes an active capture.
+            }
+            $Process.Dispose()
+        }
     }
 }
 
 function New-SafeCaseName {
     param([string]$Name)
-    return ($Name -replace '[\\/:*?"<>|]', '_').Trim()
+
+    $original = [string]$Name
+    if ([string]::IsNullOrWhiteSpace($original)) {
+        return ""
+    }
+    if ($original -match '[\x00-\x1F]') {
+        throw "CaseName contains a Windows-invalid control character."
+    }
+    if ($original -match '[ .]$') {
+        throw "CaseName cannot end with a space or period on Windows."
+    }
+
+    $safe = ($original -replace '[\\/:*?"<>|]', '_').Trim()
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return ""
+    }
+    if ($safe.EndsWith('.')) {
+        throw "CaseName cannot end with a period on Windows."
+    }
+
+    $baseName = (($safe -split '\.', 2)[0]).ToUpperInvariant()
+    if ($baseName -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+        throw "CaseName resolves to the Windows-reserved name '$safe'. Choose a different case name."
+    }
+
+    return $safe
 }
 
 function Test-RelativeOutputTemplate {
@@ -386,10 +481,20 @@ Write-RunLog "Media folder: $MediaFolder"
 Write-RunLog "Output template: $OutputTemplate"
 Write-RunLog "Archive mode: $ArchiveMode"
 Write-RunLog "Archive file: $ArchiveFileUsed"
+if ($MetadataOnly) {
+    Write-RunLog "Capture mode: metadata/artifacts only (media download disabled)"
+    if ($ArchiveMode -eq "Use") {
+        Write-RunLog "Archive table: wavi_metadata (isolated from full-media archive records)"
+    }
+}
+else {
+    Write-RunLog "Capture mode: download images/files and selected metadata"
+}
 Write-RunLog "Rate limit: $RateLimit"
 Write-RunLog "URL count: $($Urls.Count)"
 
 $BaseArgs = @(
+    "--config-ignore",
     "--destination", $MediaFolder,
     "--filename", $OutputTemplate,
     "--write-unsupported", $UnsupportedFile,
@@ -404,6 +509,13 @@ if ($WriteTags) { $BaseArgs += "--write-tags" }
 
 if ($ArchiveMode -eq "Use") {
     $BaseArgs += @("--download-archive", $ArchiveFileUsed)
+
+    # Metadata-only captures deliberately use a separate archive namespace.
+    # Otherwise gallery-dl's normal archive write on a successful --no-download
+    # item would make a later full-media run treat that item as already downloaded.
+    if ($MetadataOnly) {
+        $BaseArgs += @("--option", "archive-table=wavi_metadata")
+    }
 }
 elseif ($ArchiveMode -eq "Force") {
     $BaseArgs += "--no-skip"
@@ -434,7 +546,10 @@ elseif ($MaxItems -gt 0) {
 }
 
 if ($MetadataOnly) {
-    $BaseArgs += @("--simulate", "--dump-json")
+    # Stay on gallery-dl's normal DownloadJob/postprocessor path while disabling
+    # the media transfer itself. This keeps metadata sidecars and native error
+    # status authoritative instead of switching to the JSON DataJob path.
+    $BaseArgs += "--no-download"
 }
 
 function Write-GuiUrlResult {
@@ -511,7 +626,7 @@ function Add-BufferedGuiUrlRecord {
 function Write-BufferedLinesUtf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$Lines,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Lines,
         [Parameter(Mandatory = $false)][bool]$Append = $true
     )
 
@@ -646,33 +761,50 @@ Write-Section "Image Capture Manifest"
 $CaseFiles = Get-ChildItem -LiteralPath $CaseFolder -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
     $_.FullName -notlike "*\.gui-cache\*" -and $_.FullName -notlike "*\manifests\*"
 }
+$RunLogFullPath = [System.IO.Path]::GetFullPath($RunLog)
 
 $ManifestEncoding = New-Object System.Text.UTF8Encoding($false)
 $ManifestWriter = New-Object System.IO.StreamWriter($ManifestFile, $false, $ManifestEncoding)
 try {
     $ManifestWriter.WriteLine("SHA256,SizeBytes,RelativePath")
     foreach ($File in $CaseFiles) {
+        $FileFullPath = [System.IO.Path]::GetFullPath($File.FullName)
+        if ([string]::Equals($FileFullPath, $RunLogFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
         try {
             $Hash = Get-Sha256HashCompat -Path $File.FullName
-            $Relative = $File.FullName.Substring($CaseFolder.Length).TrimStart('\', '/')
+            $Relative = $File.FullName.Substring($CaseFolder.Length).TrimStart('\', '/') -replace '\\', '/'
             $ManifestWriter.WriteLine(('"{0}",{1},"{2}"' -f $Hash, $File.Length, ($Relative -replace '"', '""')))
         }
         catch {
             Write-RunLog "WARNING: Could not hash file: $($File.FullName) - $($_.Exception.Message)"
         }
     }
+
+    Write-Section "Image Capture Summary"
+    Write-RunLog "Submitted URLs: $($Urls.Count)"
+    Write-RunLog "Completed URLs: $Completed"
+    Write-RunLog "Failed URLs: $Failed"
+    Write-RunLog "Case folder: $CaseFolder"
+    Write-RunLog "Manifest: $ManifestFile"
+    Close-RunLogWriter
+
+    try {
+        $RunLogItem = Get-Item -LiteralPath $RunLog -ErrorAction Stop
+        $RunLogHash = Get-Sha256HashCompat -Path $RunLogItem.FullName
+        $RunLogRelative = $RunLogItem.FullName.Substring($CaseFolder.Length).TrimStart('\', '/') -replace '\\', '/'
+        $ManifestWriter.WriteLine(('"{0}",{1},"{2}"' -f $RunLogHash, $RunLogItem.Length, ($RunLogRelative -replace '"', '""')))
+    }
+    catch {
+        Write-Warning "Could not hash finalized run log: $RunLog - $($_.Exception.Message)"
+    }
 }
 finally {
+    Close-RunLogWriter
     $ManifestWriter.Dispose()
 }
-
-Write-Section "Image Capture Summary"
-Write-RunLog "Submitted URLs: $($Urls.Count)"
-Write-RunLog "Completed URLs: $Completed"
-Write-RunLog "Failed URLs: $Failed"
-Write-RunLog "Case folder: $CaseFolder"
-Write-RunLog "Manifest: $ManifestFile"
-Close-RunLogWriter
 
 if ($Failed -gt 0) {
     exit 1
