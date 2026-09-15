@@ -90,6 +90,9 @@ const PDF_PRINT_COMMAND_TIMEOUT_MS = 180000;
 const PDF_STREAM_READ_TIMEOUT_MS = 30000;
 const PDF_STREAM_TOTAL_TIMEOUT_MS = 600000;
 const PDF_STREAM_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+const PDF_POINTS_PER_INCH = 72;
+const PAGINATED_PNG_BASE_POINTS_PER_CSS_PIXEL = 1;
+const PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS = 12000;
 const BROWSER_STDERR_TAIL_CHARACTERS = 16384;
 
 const SHA256_CONSTANTS = new Uint32Array([
@@ -515,14 +518,84 @@ function htmlEscape(value) {
     .replaceAll("'", "&#39;");
 }
 
+function formatPdfTemplateLocal(value, mode = "datetime") {
+  const parsed = value ? new Date(value) : null;
+  if (!(parsed instanceof Date) || Number.isNaN(parsed.getTime())) return "";
+  try {
+    if (mode === "date") {
+      return new Intl.DateTimeFormat(undefined, {
+        year: "numeric",
+        month: "numeric",
+        day: "numeric",
+      }).format(parsed);
+    }
+    if (mode === "time") {
+      return new Intl.DateTimeFormat(undefined, {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        timeZoneName: "short",
+      }).format(parsed);
+    }
+    return new Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+    }).format(parsed);
+  } catch {
+    if (mode === "date") return parsed.toLocaleDateString();
+    if (mode === "time") return parsed.toLocaleTimeString();
+    return parsed.toLocaleString();
+  }
+}
+
+function buildPdfTemplateReplacements(context) {
+  const captureUtc = String(context?.capture_utc || "");
+  const requestedUrl = String(context?.requested_url || "");
+  const finalUrl = String(context?.final_url || "");
+  const bestUrl = finalUrl || requestedUrl;
+  const pageTitle = String(context?.page_title || "");
+  const pageNumber = context?.page_number == null ? "" : String(context.page_number);
+  const pageCount = context?.page_count == null ? "" : String(context.page_count);
+  const parsed = captureUtc ? new Date(captureUtc) : null;
+  const validDate = parsed instanceof Date && !Number.isNaN(parsed.getTime()) ? parsed : null;
+  const captureDateUtc = validDate
+    ? `${validDate.getUTCFullYear()}-${String(validDate.getUTCMonth() + 1).padStart(2, "0")}-${String(validDate.getUTCDate()).padStart(2, "0")}`
+    : "";
+  const captureTimeUtc = validDate
+    ? `${String(validDate.getUTCHours()).padStart(2, "0")}:${String(validDate.getUTCMinutes()).padStart(2, "0")}:${String(validDate.getUTCSeconds()).padStart(2, "0")} UTC`
+    : "";
+  const captureTimestampUtc = captureDateUtc && captureTimeUtc ? `${captureDateUtc} ${captureTimeUtc}` : captureUtc;
+  const captureDateLocal = formatPdfTemplateLocal(captureUtc, "date");
+  const captureTimeLocal = formatPdfTemplateLocal(captureUtc, "time");
+  const captureTimestampLocal = formatPdfTemplateLocal(captureUtc, "datetime");
+  return {
+    "%requested_url%": htmlEscape(requestedUrl),
+    "%final_url%": htmlEscape(finalUrl),
+    "%best_url%": htmlEscape(bestUrl),
+    "%page_title%": htmlEscape(pageTitle),
+    "%capture_utc%": htmlEscape(captureUtc),
+    "%capture_timestamp_utc%": htmlEscape(captureTimestampUtc),
+    "%capture_date_utc%": htmlEscape(captureDateUtc),
+    "%capture_time_utc%": htmlEscape(captureTimeUtc),
+    "%capture_local%": htmlEscape(captureTimestampLocal),
+    "%capture_timestamp_local%": htmlEscape(captureTimestampLocal),
+    "%capture_date_local%": htmlEscape(captureDateLocal),
+    "%capture_time_local%": htmlEscape(captureTimeLocal),
+    "%page_number%": htmlEscape(pageNumber),
+    "%page_count%": htmlEscape(pageCount),
+  };
+}
+
 function renderPdfTemplate(template, context) {
   let output = String(template || "");
-  const replacements = {
-    "%requested_url%": htmlEscape(context.requested_url || ""),
-    "%final_url%": htmlEscape(context.final_url || ""),
-    "%page_title%": htmlEscape(context.page_title || ""),
-    "%capture_utc%": htmlEscape(context.capture_utc || ""),
-  };
+  const replacements = buildPdfTemplateReplacements(context || {});
+  replacements["%page_number%"] = '<span class="pageNumber"></span>';
+  replacements["%page_count%"] = '<span class="totalPages"></span>';
   for (const [tag, value] of Object.entries(replacements)) output = output.split(tag).join(value);
   return output;
 }
@@ -2119,27 +2192,6 @@ function filePathToFileUrl(filePath) {
   return encodeURI(`file://${normalized}`);
 }
 
-function getPdfGeometry(config) {
-  let paperWidthIn = Number(config.pdf_paper_width_in) || 8.5;
-  let paperHeightIn = Number(config.pdf_paper_height_in) || 11;
-  if (config.pdf_landscape) [paperWidthIn, paperHeightIn] = [paperHeightIn, paperWidthIn];
-  const marginTopIn = Number(config.pdf_margin_top_in) || 0;
-  const marginBottomIn = Number(config.pdf_margin_bottom_in) || 0;
-  const marginLeftIn = Number(config.pdf_margin_left_in) || 0;
-  const marginRightIn = Number(config.pdf_margin_right_in) || 0;
-  return {
-    paperWidthIn,
-    paperHeightIn,
-    marginTopIn,
-    marginBottomIn,
-    marginLeftIn,
-    marginRightIn,
-    contentWidthIn: Math.max(0.1, paperWidthIn - marginLeftIn - marginRightIn),
-    contentHeightIn: Math.max(0.1, paperHeightIn - marginTopIn - marginBottomIn),
-    scale: Math.max(0.1, Number(config.pdf_scale) || 1),
-  };
-}
-
 function getPaginatedPngSourceArtifacts(capture) {
   const pngArtifacts = (capture?.artifacts || []).filter((artifact) => normalizeImageFormat(artifact.format) === "png");
   const fullPageArtifacts = pngArtifacts.filter((artifact) => String(artifact.role || "").startsWith("full_page"));
@@ -2149,33 +2201,53 @@ function getPaginatedPngSourceArtifacts(capture) {
   return selected.sort((a, b) => (Number(a.y_css_px) || 0) - (Number(b.y_css_px) || 0));
 }
 
-function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlForIndex) {
-  const geometry = getPdfGeometry(config);
+function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlForIndex, pdfContext) {
   if (!sourceArtifacts.length) throw new Error("No PNG capture artifacts were available for paginated PDF output.");
 
+  const marginTopIn = Math.max(0, Number(config.pdf_margin_top_in) || 0);
+  const marginBottomIn = Math.max(0, Number(config.pdf_margin_bottom_in) || 0);
+  const marginLeftIn = Math.max(0, Number(config.pdf_margin_left_in) || 0);
+  const marginRightIn = Math.max(0, Number(config.pdf_margin_right_in) || 0);
   const pageWidthCssPx = Math.max(1, Math.ceil(Number(capture.page_width) || Number(sourceArtifacts[0].width_css_px) || 1));
   const totalHeightCssPx = Math.max(1, Math.ceil(
     capture?.segmentation?.limit_reached
       ? Number(capture.segmentation.captured_height_css_px) || Number(capture.page_height) || 0
       : Number(capture.page_height) || 0
   ));
-  const sliceHeightCssPx = Math.max(1, Math.floor(pageWidthCssPx * geometry.contentHeightIn / geometry.contentWidthIn));
-  const pageCount = Math.max(1, Math.ceil(totalHeightCssPx / sliceHeightCssPx));
-  const cssPageWidthIn = geometry.contentWidthIn / geometry.scale;
-  const cssPageHeightIn = geometry.contentHeightIn / geometry.scale;
+
+  const horizontalMarginPoints = (marginLeftIn + marginRightIn) * PDF_POINTS_PER_INCH;
+  const maxContentWidthPoints = Math.max(1, PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS - horizontalMarginPoints);
+  const naturalPointsPerCssPx = PAGINATED_PNG_BASE_POINTS_PER_CSS_PIXEL;
+  const pointsPerCssPx = Math.min(naturalPointsPerCssPx, maxContentWidthPoints / pageWidthCssPx);
+  const totalContentHeightPoints = totalHeightCssPx * pointsPerCssPx;
+  const initialContentHeightLimitPoints = Math.max(1, PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS - ((marginTopIn + marginBottomIn) * PDF_POINTS_PER_INCH));
+  const initialPageCount = Math.max(1, Math.ceil((totalContentHeightPoints - 1e-9) / initialContentHeightLimitPoints));
+  const contentWidthIn = (pageWidthCssPx * pointsPerCssPx) / PDF_POINTS_PER_INCH;
+  const pageWidthIn = contentWidthIn + marginLeftIn + marginRightIn;
+  const templateValues = buildPdfTemplateReplacements(pdfContext || {});
 
   const metadata = {
     pageWidthCssPx,
     totalHeightCssPx,
-    sliceHeightCssPx,
-    pageCount,
-    cssPageWidthIn,
-    cssPageHeightIn,
+    pointsPerCssPx,
+    totalContentHeightPoints,
+    initialPageCount,
+    maxPageDimensionPoints: PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS,
+    pageWidthIn,
+    contentWidthIn,
+    marginTopIn,
+    marginBottomIn,
+    marginLeftIn,
+    marginRightIn,
+    displayHeaderFooter: Boolean(config.pdf_display_header_footer),
+    headerTemplate: String(config.pdf_header_template || ""),
+    footerTemplate: String(config.pdf_footer_template || ""),
+    templateValues,
     sources: sourceArtifacts.map((artifact, index) => ({
       src: sourceUrlForIndex(index),
       widthCssPx: Math.max(1, Math.ceil(Number(artifact.width_css_px) || pageWidthCssPx)),
       heightCssPx: Math.max(1, Math.ceil(Number(artifact.height_css_px) || 1)),
-      yCssPx: Math.max(0, Math.ceil(Number(artifact.y_css_px) || 0)),
+      yCssPx: Math.max(0, Number(artifact.y_css_px) || 0),
     })),
   };
   const metadataJson = JSON.stringify(metadata).replace(/</g, "\\u003c");
@@ -2185,16 +2257,12 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
 <meta charset="utf-8">
 <title>WAVI paginated PNG PDF</title>
 <style>
-  /* Do not set @page margins here. Chromium's Page.printToPDF margin values
-     define the printable area and reserve space for WAVI's header/footer. */
   html, body { margin: 0; padding: 0; background: #ffffff; }
   body { font-family: Arial, sans-serif; }
   #status { padding: 0.5rem 0.75rem; font-size: 12px; color: #444; }
-  #pages { margin: 0; padding: 0; width: ${cssPageWidthIn}in; }
+  #pages { margin: 0; padding: 0; width: ${pageWidthIn}in; }
   .page {
-    position: relative;
-    width: ${cssPageWidthIn}in;
-    height: ${cssPageHeightIn}in;
+    width: ${pageWidthIn}in;
     margin: 0;
     padding: 0;
     box-sizing: border-box;
@@ -2206,6 +2274,30 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
     page-break-after: always;
   }
   .page:last-child { break-after: auto; page-break-after: auto; }
+  .page-header,
+  .page-footer {
+    width: ${pageWidthIn}in;
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .page-content-shell {
+    width: ${pageWidthIn}in;
+    margin: 0;
+    padding: ${marginTopIn}in ${marginRightIn}in ${marginBottomIn}in ${marginLeftIn}in;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .page-content-viewport {
+    position: relative;
+    width: ${contentWidthIn}in;
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    overflow: hidden;
+    background: #ffffff;
+  }
   .page img {
     position: absolute;
     left: 0;
@@ -2227,12 +2319,25 @@ window.__waviPdfError = "";
 window.__waviPdfInfo = null;
 window.__waviPdfProgress = {
   stage: "initializing",
-  page_count: meta.pageCount,
+  page_count: meta.initialPageCount,
   pages_created: 0,
   total_images: 0,
   loaded_images: 0,
   failed_images: 0,
 };
+window.addEventListener("error", (event) => {
+  if (window.__waviPdfReady) return;
+  window.__waviPdfProgress.stage = "error";
+  window.__waviPdfError = String(event?.message || "Paginated PNG PDF document script error.");
+  window.__waviPdfReady = true;
+});
+window.addEventListener("unhandledrejection", (event) => {
+  if (window.__waviPdfReady) return;
+  const reason = event?.reason;
+  window.__waviPdfProgress.stage = "error";
+  window.__waviPdfError = String(reason?.message || reason || "Paginated PNG PDF document promise rejection.");
+  window.__waviPdfReady = true;
+});
 </script>
 </head>
 <body>
@@ -2240,58 +2345,180 @@ window.__waviPdfProgress = {
 <div id="pages"></div>
 <script>
 (async () => {
-  try {
-    const container = document.getElementById("pages");
-    const imagePromises = [];
-    window.__waviPdfProgress.stage = "building-pages";
+  const settleLayout = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
-    for (let pageIndex = 0; pageIndex < meta.pageCount; pageIndex += 1) {
-      const sliceStart = pageIndex * meta.sliceHeightCssPx;
-      const sliceEnd = Math.min(meta.totalHeightCssPx, sliceStart + meta.sliceHeightCssPx);
+  function replaceTemplateTags(template, values) {
+    let output = String(template || "");
+    for (const [tag, value] of Object.entries(values || {})) output = output.split(tag).join(String(value ?? ""));
+    return output;
+  }
+
+  function replaceLegacyChromiumPlaceholders(template, values) {
+    const container = document.createElement("div");
+    container.innerHTML = String(template || "");
+    const replacements = {
+      url: values["%best_url%"] || values["%final_url%"] || values["%requested_url%"] || "",
+      date: values["%capture_timestamp_local%"] || values["%capture_utc%"] || "",
+      title: values["%page_title%"] || "",
+      pageNumber: values["%page_number%"] || "",
+      totalPages: values["%page_count%"] || "",
+    };
+    for (const [className, replacement] of Object.entries(replacements)) {
+      for (const node of container.querySelectorAll("." + className)) node.textContent = String(replacement ?? "");
+    }
+    return container.innerHTML;
+  }
+
+  function renderHeaderFooterTemplate(template, pageNumber, pageCount) {
+    const values = {
+      ...meta.templateValues,
+      "%page_number%": String(pageNumber),
+      "%page_count%": String(pageCount),
+    };
+    return replaceLegacyChromiumPlaceholders(replaceTemplateTags(template, values), values);
+  }
+
+  function buildPages(pageCount, loadImages) {
+    const container = document.getElementById("pages");
+    container.innerHTML = "";
+    const imagePromises = [];
+    const sliceHeightCssPx = meta.totalHeightCssPx / pageCount;
+    const sliceHeightIn = (sliceHeightCssPx * meta.pointsPerCssPx) / 72;
+    let totalImages = 0;
+
+    for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
+      const sliceStart = pageIndex * sliceHeightCssPx;
+      const sliceEnd = Math.min(meta.totalHeightCssPx, sliceStart + sliceHeightCssPx);
       const page = document.createElement("div");
       page.className = "page";
       page.dataset.page = String(pageIndex + 1);
 
-      for (const source of meta.sources) {
-        const sourceStart = source.yCssPx;
-        const sourceEnd = source.yCssPx + source.heightCssPx;
-        const overlapStart = Math.max(sliceStart, sourceStart);
-        const overlapEnd = Math.min(sliceEnd, sourceEnd);
-        if (overlapEnd <= overlapStart) continue;
+      if (meta.displayHeaderFooter && meta.headerTemplate) {
+        const header = document.createElement("div");
+        header.className = "page-header";
+        header.innerHTML = renderHeaderFooterTemplate(meta.headerTemplate, pageIndex + 1, pageCount);
+        page.appendChild(header);
+      }
 
-        const image = document.createElement("img");
-        image.alt = "";
-        image.decoding = "async";
-        image.loading = "eager";
-        const offsetCssPx = sourceStart - sliceStart;
-        const offsetIn = offsetCssPx * meta.cssPageWidthIn / meta.pageWidthCssPx;
-        image.style.top = offsetIn + "in";
-        image.src = source.src;
-        window.__waviPdfProgress.total_images += 1;
+      const contentShell = document.createElement("div");
+      contentShell.className = "page-content-shell";
+      const contentViewport = document.createElement("div");
+      contentViewport.className = "page-content-viewport";
+      contentViewport.style.height = sliceHeightIn + "in";
 
-        imagePromises.push(new Promise((resolve, reject) => {
-          let settled = false;
-          const finish = (ok, error) => {
-            if (settled) return;
-            settled = true;
-            if (ok) {
-              window.__waviPdfProgress.loaded_images += 1;
-              resolve(true);
-            } else {
-              window.__waviPdfProgress.failed_images += 1;
-              reject(error || new Error("Image failed to load: " + source.src));
-            }
-          };
-          image.addEventListener("load", () => finish(true), { once: true });
-          image.addEventListener("error", () => finish(false, new Error("Image failed to load: " + source.src)), { once: true });
-          setTimeout(() => finish(false, new Error("Image load timed out: " + source.src)), 90000);
-          if (image.complete) queueMicrotask(() => finish(image.naturalWidth > 0));
-        }));
-        page.appendChild(image);
+      if (loadImages) {
+        for (const source of meta.sources) {
+          const sourceStart = source.yCssPx;
+          const sourceEnd = source.yCssPx + source.heightCssPx;
+          const overlapStart = Math.max(sliceStart, sourceStart);
+          const overlapEnd = Math.min(sliceEnd, sourceEnd);
+          if (overlapEnd <= overlapStart) continue;
+
+          const image = document.createElement("img");
+          image.alt = "";
+          image.decoding = "async";
+          image.loading = "eager";
+          const offsetCssPx = sourceStart - sliceStart;
+          const offsetIn = offsetCssPx * meta.contentWidthIn / meta.pageWidthCssPx;
+          image.style.top = offsetIn + "in";
+          image.src = source.src;
+          totalImages += 1;
+
+          imagePromises.push(new Promise((resolve, reject) => {
+            let settled = false;
+            const finish = (ok, error) => {
+              if (settled) return;
+              settled = true;
+              if (ok) {
+                window.__waviPdfProgress.loaded_images += 1;
+                resolve(true);
+              } else {
+                window.__waviPdfProgress.failed_images += 1;
+                reject(error || new Error("Image failed to load: " + source.src));
+              }
+            };
+            image.addEventListener("load", () => finish(true), { once: true });
+            image.addEventListener("error", () => finish(false, new Error("Image failed to load: " + source.src)), { once: true });
+            setTimeout(() => finish(false, new Error("Image load timed out: " + source.src)), 90000);
+            if (image.complete) queueMicrotask(() => finish(image.naturalWidth > 0));
+          }));
+          contentViewport.appendChild(image);
+        }
+      }
+
+      contentShell.appendChild(contentViewport);
+      page.appendChild(contentShell);
+
+      if (meta.displayHeaderFooter && meta.footerTemplate) {
+        const footer = document.createElement("div");
+        footer.className = "page-footer";
+        footer.innerHTML = renderHeaderFooterTemplate(meta.footerTemplate, pageIndex + 1, pageCount);
+        page.appendChild(footer);
       }
 
       container.appendChild(page);
-      window.__waviPdfProgress.pages_created = pageIndex + 1;
+    }
+
+    window.__waviPdfProgress.page_count = pageCount;
+    window.__waviPdfProgress.pages_created = pageCount;
+    window.__waviPdfProgress.total_images = totalImages;
+    window.__waviPdfProgress.loaded_images = 0;
+    window.__waviPdfProgress.failed_images = 0;
+    return { sliceHeightCssPx, sliceHeightIn, imagePromises };
+  }
+
+  function measurePages() {
+    const pages = Array.from(document.querySelectorAll(".page"));
+    if (!pages.length) {
+      return {
+        maxPageWidthPx: 0,
+        maxPageHeightPx: 0,
+        maxFixedExtraPx: 0,
+        maxHeaderHeightPx: 0,
+        maxFooterHeightPx: 0,
+      };
+    }
+    let maxPageWidthPx = 0;
+    let maxPageHeightPx = 0;
+    let maxFixedExtraPx = 0;
+    let maxHeaderHeightPx = 0;
+    let maxFooterHeightPx = 0;
+    for (const page of pages) {
+      const pageRect = page.getBoundingClientRect();
+      const viewportRect = page.querySelector(".page-content-viewport")?.getBoundingClientRect();
+      const headerRect = page.querySelector(".page-header")?.getBoundingClientRect();
+      const footerRect = page.querySelector(".page-footer")?.getBoundingClientRect();
+      maxPageWidthPx = Math.max(maxPageWidthPx, pageRect.width || 0);
+      maxPageHeightPx = Math.max(maxPageHeightPx, pageRect.height || 0);
+      maxFixedExtraPx = Math.max(maxFixedExtraPx, Math.max(0, (pageRect.height || 0) - (viewportRect?.height || 0)));
+      maxHeaderHeightPx = Math.max(maxHeaderHeightPx, headerRect?.height || 0);
+      maxFooterHeightPx = Math.max(maxFooterHeightPx, footerRect?.height || 0);
+    }
+    return { maxPageWidthPx, maxPageHeightPx, maxFixedExtraPx, maxHeaderHeightPx, maxFooterHeightPx };
+  }
+
+  try {
+    window.__waviPdfProgress.stage = "building-pages";
+    let pageCount = Math.max(1, Number(meta.initialPageCount) || 1);
+    let structure = null;
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      structure = buildPages(pageCount, false);
+      await settleLayout();
+      const measured = measurePages();
+      const fixedExtraPoints = (measured.maxFixedExtraPx / 96) * 72;
+      const maxContentHeightPoints = Math.max(1, meta.maxPageDimensionPoints - fixedExtraPoints);
+      const requiredPageCount = Math.max(1, Math.ceil((meta.totalContentHeightPoints - 1e-9) / maxContentHeightPoints));
+      if (requiredPageCount <= pageCount) break;
+      pageCount = requiredPageCount;
+    }
+
+    structure = buildPages(pageCount, true);
+    await settleLayout();
+    const measured = measurePages();
+    const paperWidthIn = Math.max(0.01, measured.maxPageWidthPx / 96);
+    const paperHeightIn = Math.max(0.01, measured.maxPageHeightPx / 96);
+    if ((paperWidthIn * 72) > meta.maxPageDimensionPoints + 0.5 || (paperHeightIn * 72) > meta.maxPageDimensionPoints + 0.5) {
+      throw new Error("The generated Captured PNG PDF page size exceeded WAVI's " + meta.maxPageDimensionPoints + "-point safety limit.");
     }
 
     if (!window.__waviPdfProgress.total_images) {
@@ -2299,21 +2526,38 @@ window.__waviPdfProgress = {
     }
 
     window.__waviPdfProgress.stage = "loading-images";
-    await Promise.all(imagePromises);
+    await Promise.all(structure.imagePromises);
     window.__waviPdfProgress.stage = "finalizing";
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await settleLayout();
 
-    document.body.classList.add("ready");
     window.__waviPdfInfo = {
-      page_count: meta.pageCount,
-      slice_height_css_px: meta.sliceHeightCssPx,
+      page_count: pageCount,
+      slice_height_css_px: structure.sliceHeightCssPx,
       page_width_css_px: meta.pageWidthCssPx,
       total_height_css_px: meta.totalHeightCssPx,
       source_image_count: meta.sources.length,
       rendered_image_count: window.__waviPdfProgress.total_images,
+      paper_width_in: paperWidthIn,
+      paper_height_in: paperHeightIn,
+      content_width_in: meta.contentWidthIn,
+      content_height_in: structure.sliceHeightIn,
+      margin_top_in: 0,
+      margin_bottom_in: 0,
+      margin_left_in: 0,
+      margin_right_in: 0,
+      configured_content_margin_top_in: meta.marginTopIn,
+      configured_content_margin_bottom_in: meta.marginBottomIn,
+      configured_content_margin_left_in: meta.marginLeftIn,
+      configured_content_margin_right_in: meta.marginRightIn,
+      page_header_height_in: measured.maxHeaderHeightPx / 96,
+      page_footer_height_in: measured.maxFooterHeightPx / 96,
+      margin_application: "custom_html_content_only",
+      header_footer_delivery: meta.displayHeaderFooter ? "inline_page_html" : "disabled",
+      display_header_footer: Boolean(meta.displayHeaderFooter),
     };
     window.__waviPdfProgress.stage = "ready";
     window.__waviPdfReady = true;
+    document.body.classList.add("ready");
   } catch (error) {
     const message = String(error && error.message ? error.message : error);
     document.body.classList.add("error");
@@ -2330,21 +2574,24 @@ window.__waviPdfProgress = {
   return {
     html,
     info: {
-      page_count: pageCount,
-      slice_height_css_px: sliceHeightCssPx,
       page_width_css_px: pageWidthCssPx,
       total_height_css_px: totalHeightCssPx,
-      paper_width_in: geometry.paperWidthIn,
-      paper_height_in: geometry.paperHeightIn,
-      margin_top_in: geometry.marginTopIn,
-      margin_bottom_in: geometry.marginBottomIn,
-      margin_left_in: geometry.marginLeftIn,
-      margin_right_in: geometry.marginRightIn,
-      content_width_in: geometry.contentWidthIn,
-      content_height_in: geometry.contentHeightIn,
-      css_page_width_in: cssPageWidthIn,
-      css_page_height_in: cssPageHeightIn,
-      margin_application: "chromium_print_to_pdf",
+      page_width_in: pageWidthIn,
+      content_width_in: contentWidthIn,
+      points_per_css_px: pointsPerCssPx,
+      estimated_initial_page_count: initialPageCount,
+      configured_content_margin_top_in: marginTopIn,
+      configured_content_margin_bottom_in: marginBottomIn,
+      configured_content_margin_left_in: marginLeftIn,
+      configured_content_margin_right_in: marginRightIn,
+      margin_application: "custom_html_content_only",
+      header_footer_delivery: Boolean(config.pdf_display_header_footer) ? "inline_page_html" : "disabled",
+      template_tags_supported: [
+        "%requested_url%", "%final_url%", "%best_url%", "%page_title%", "%capture_utc%",
+        "%capture_timestamp_utc%", "%capture_date_utc%", "%capture_time_utc%",
+        "%capture_local%", "%capture_timestamp_local%", "%capture_date_local%", "%capture_time_local%",
+        "%page_number%", "%page_count%",
+      ],
       image_delivery: "ephemeral_loopback_http",
       source_artifacts: sourceArtifacts.map((artifact) => ({
         path: artifact.path,
@@ -2356,7 +2603,7 @@ window.__waviPdfProgress = {
   };
 }
 
-async function startPaginatedPngPdfServer(config, capture) {
+async function startPaginatedPngPdfServer(config, capture, pdfContext) {
   const sourceArtifacts = getPaginatedPngSourceArtifacts(capture);
   if (!sourceArtifacts.length) throw new Error("No PNG capture artifacts were available for paginated PDF output.");
 
@@ -2416,6 +2663,7 @@ async function startPaginatedPngPdfServer(config, capture) {
     capture,
     sourceArtifacts,
     (index) => `${baseUrl}/image/${index}`,
+    pdfContext,
   );
   documentHtml = built.html;
 
@@ -2745,10 +2993,21 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
 
   if (captureMode === "paginated_png") {
     const outputPath = await uniqueOutputPath(outputFolder, `${baseName}_print`, ".pdf");
-    const pngServer = await startPaginatedPngPdfServer(config, capture);
+    const pngServer = await startPaginatedPngPdfServer(config, capture, pdfContext);
     try {
       const preparedInfo = await navigateToPaginatedPdfDocument(client, pngServer.documentUrl);
       delete params.pageRanges;
+      params.landscape = false;
+      params.scale = 1;
+      params.paperWidth = Number(preparedInfo.paper_width_in || pngServer.sourceInfo.page_width_in || config.pdf_paper_width_in || 8.5);
+      params.paperHeight = Number(preparedInfo.paper_height_in || config.pdf_paper_height_in || 11);
+      params.marginTop = 0;
+      params.marginBottom = 0;
+      params.marginLeft = 0;
+      params.marginRight = 0;
+      params.displayHeaderFooter = false;
+      params.headerTemplate = "";
+      params.footerTemplate = "";
       params.preferCSSPageSize = false;
       const memoryPreparation = await releaseMemoryBeforePdf(client);
       const record = await streamPdfToAtomicFile(client, outputPath, params);
@@ -2758,12 +3017,12 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
           path: outputPath,
           sha256: record.sha256,
           size_bytes: record.bytes,
-          landscape: Boolean(config.pdf_landscape),
+          landscape: false,
           display_header_footer: Boolean(config.pdf_display_header_footer),
           print_background: Boolean(config.pdf_print_background),
-          paper_width_in: Number(config.pdf_paper_width_in) || 8.5,
-          paper_height_in: Number(config.pdf_paper_height_in) || 11,
-          scale: Number(config.pdf_scale) || 1,
+          paper_width_in: Number(preparedInfo.paper_width_in || pngServer.sourceInfo.page_width_in || 0),
+          paper_height_in: Number(preparedInfo.paper_height_in || 0),
+          scale: 1,
           source_mode: captureMode,
           transfer_mode: record.transport.transfer_mode,
           stream_chunk_count: record.transport.chunk_count,

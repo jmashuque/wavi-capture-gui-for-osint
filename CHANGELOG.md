@@ -2,6 +2,14 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0914](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0914) - URL Workflow, App Updates, and Visual PDF Improvements
+
+- Reorganized the shared URL toolbar into a compact single-column layout across Audio/Video, Gallery/Profile, and Webpage Capture; added Undo and Redo with `Ctrl+Z`, `Ctrl+Y`, and `Ctrl+Shift+Z`, plus **Advanced ▼** URL-processing actions and a **Show ▼** menu for All, Failed, and Succeeded URLs.
+- Added on-demand WAVI update staging through **Help > Check for App Updates**, downloading the latest tagged GitHub **Source code (zip)** into a validated `gui-update` folder and providing **Open Update Folder** for manual review and replacement without automatically overwriting or running application files.
+- Improved **Captured PNG (visual match)** PDF output with automatic page dimensions derived from the captured image, preservation of the source PNG, and automatic splitting of oversized captures to keep generated PDF pages within the internal 12,000-point safety limit.
+- Separated Captured PNG PDF page-layout margins from header/footer layout so configured margins apply only to the rendered webpage image, while header and footer positioning and spacing are controlled by their own HTML/CSS.
+- Expanded custom PDF header/footer tags with capture-aware URL, title, local/UTC timestamp, and page-number values, including `%best_url%`, `%capture_timestamp_local%`, `%capture_timestamp_utc%`, `%page_number%`, and `%page_count%`; Live Page PDFs retain Chromium's native template placeholders.
+
 ## [v3.2026.0902](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0902) - Recovery Correctness and Failure-State Hardening
 
 - Corrected Webpage sparse recovery so successfully retrying unresolved URLs does not mark a job complete while any original URL remains Partial or Failed.

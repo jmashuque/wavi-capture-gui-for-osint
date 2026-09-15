@@ -22,8 +22,9 @@ import tempfile
 import time
 import traceback
 import urllib.request
+import zipfile
 from urllib.parse import quote, urlsplit, urlunsplit
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from collections import deque
 import webbrowser
 import threading
@@ -34,7 +35,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0902"
+APP_VERSION = "v3.2026.0914"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -54,10 +55,13 @@ OUTPUT_LOG_ALL_MAX_CHARS = 6 * 1024 * 1024
 OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
+APP_UPDATE_DIR_NAME = "gui-update"
+APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 SETTINGS_SCHEMA_VERSION = 45
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+GUI_UPDATE_DIR = os.path.join(ROOT, APP_UPDATE_DIR_NAME)
 SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
 JOBS_FILE = os.path.join(ROOT, "gui-jobs.json")
 URL_BOX_PERSISTENCE_FILE = os.path.join(ROOT, "gui-url-box.txt")
@@ -89,7 +93,7 @@ IMAGE_CAPTURE_TAB_LABEL = "Gallery/Profile Capture"
 DEFAULT_WEB_PDF_HEADER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
     'display:flex; justify-content:space-between; box-sizing:border-box;">'
-    '<span>%final_url%</span><span>Captured: %capture_utc%</span></div>'
+    '<span>%best_url%</span><span>Captured: %capture_timestamp_local%</span></div>'
 )
 DEFAULT_WEB_PDF_FOOTER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
@@ -4136,19 +4140,7 @@ def normalize_url_box_text_block(content):
 
 
 def append_text_to_urls_box(content):
-    content = normalize_url_box_text_block(content)
-
-    if not content:
-        return
-
-    existing = normalize_url_box_text_block(urls_text.get("1.0", "end"))
-
-    if existing:
-        urls_text.delete("1.0", "end")
-        urls_text.insert("1.0", existing + "\n" + content)
-    else:
-        urls_text.delete("1.0", "end")
-        urls_text.insert("1.0", content)
+    append_url_text_widget_content(urls_text, content)
 
 
 def read_one_input_file_for_url_box(path):
@@ -4218,8 +4210,7 @@ def load_urls_from_input_file():
     if content is None:
         return
 
-    urls_text.delete("1.0", "end")
-    urls_text.insert("1.0", normalize_url_box_text_block(content))
+    replace_url_text_widget_content(urls_text, normalize_url_box_text_block(content))
     append_log(f"\nLoaded URLs from input file(s) and replaced the URL box contents:\n{path}\n")
 
 
@@ -4247,12 +4238,7 @@ def url_text_widget_is_empty(widget):
 
 def set_url_text_widget_silent(widget, content):
     content = normalize_url_box_text_block(content)
-    replace_text_widget_content(widget, content)
-
-    try:
-        widget.edit_modified(False)
-    except Exception:
-        pass
+    replace_url_text_widget_content(widget, content, reset_history=True)
 
 
 def read_valid_input_files_for_url_box_paths(paths):
@@ -4505,7 +4491,7 @@ def save_urls_to_input_file():
 
 
 def clear_urls():
-    urls_text.delete("1.0", "end")
+    clear_url_text_widget(urls_text)
     append_log("\nCleared URL box.\n")
 
 
@@ -4517,7 +4503,7 @@ def strip_url_extra_ampersand_tags():
         return
 
     output_text, changed = strip_parameter_like_ampersand_tags_from_text(content)
-    replace_text_widget_content(urls_text, output_text)
+    replace_url_text_widget_content(urls_text, output_text)
     append_log(f"\nStripped parameter-like ampersand tags from {changed} URL(s) in the URL box.\n")
 
 
@@ -4560,8 +4546,70 @@ def replace_text_widget_content(widget, content):
         widget.insert("1.0", str(content))
 
 
-def set_text_widget_url_lines(widget, urls):
-    replace_text_widget_content(widget, "\n".join(str(url) for url in (urls or [])).strip())
+def replace_url_text_widget_content(widget, content, reset_history=False):
+    """Replace one capture URL box as a single native undo/redo edit."""
+    try:
+        autoseparators = bool(int(widget.cget("autoseparators")))
+    except Exception:
+        autoseparators = True
+
+    try:
+        widget.configure(autoseparators=False)
+    except Exception:
+        pass
+
+    try:
+        widget.edit_separator()
+    except Exception:
+        pass
+
+    try:
+        replace_text_widget_content(widget, content)
+
+        if reset_history:
+            try:
+                widget.edit_reset()
+            except Exception:
+                pass
+            try:
+                widget.edit_modified(False)
+            except Exception:
+                pass
+        else:
+            try:
+                widget.edit_separator()
+            except Exception:
+                pass
+    finally:
+        try:
+            widget.configure(autoseparators=autoseparators)
+        except Exception:
+            pass
+
+
+def append_url_text_widget_content(widget, content):
+    """Append normalized URL text to one capture URL box as one history step."""
+    content = normalize_url_box_text_block(content)
+    if not content:
+        return False
+
+    existing = normalize_url_box_text_block(get_text_widget_content(widget, "end", strip=False))
+    combined = ((existing + "\n") if existing else "") + content
+    replace_url_text_widget_content(widget, combined)
+    return True
+
+
+def clear_url_text_widget(widget, reset_history=False):
+    """Clear one capture URL box through the shared history-aware edit path."""
+    replace_url_text_widget_content(widget, "", reset_history=reset_history)
+
+
+def set_text_widget_url_lines(widget, urls, reset_history=False):
+    replace_url_text_widget_content(
+        widget,
+        "\n".join(str(url) for url in (urls or [])).strip(),
+        reset_history=reset_history,
+    )
 
 
 def read_urls_from_input_paths(paths, log_errors=True):
@@ -4672,40 +4720,167 @@ def build_url_statistics_lines(urls):
     return lines, counts
 
 
-def build_url_box_button_grid(parent, left_actions, failed_command, right_actions):
-    """Build the shared twelve-button URL-box toolbar used by all capture tabs."""
-    for index, (label, command) in enumerate(left_actions):
+def configure_url_text_widget_history(widget, history_state_sync=None):
+    """Enable and bind shared native undo/redo history for a capture URL box."""
+    try:
+        widget.configure(undo=True, autoseparators=True, maxundo=200)
+    except Exception:
+        pass
+
+    def run_undo(_event=None):
+        undo_url_text_widget(widget, history_state_sync)
+        return "break"
+
+    def run_redo(_event=None):
+        redo_url_text_widget(widget, history_state_sync)
+        return "break"
+
+    try:
+        widget.bind("<Control-z>", run_undo)
+        widget.bind("<Control-y>", run_redo)
+        widget.bind("<Control-Shift-Z>", run_redo)
+        widget.bind("<Control-Shift-z>", run_redo)
+    except Exception:
+        pass
+
+
+def run_url_history_state_sync(callback):
+    if not callable(callback):
+        return
+    try:
+        callback()
+    except Exception:
+        pass
+
+
+def undo_url_text_widget(widget, history_state_sync=None):
+    """Undo the most recent edit in a capture URL text widget, if available."""
+    try:
+        widget.edit_undo()
+    except tk.TclError:
+        return False
+    except Exception:
+        return False
+
+    run_url_history_state_sync(history_state_sync)
+    try:
+        widget.focus_set()
+    except Exception:
+        pass
+    return True
+
+
+def redo_url_text_widget(widget, history_state_sync=None):
+    """Redo the most recently undone edit in a capture URL text widget, if available."""
+    try:
+        widget.edit_redo()
+    except tk.TclError:
+        return False
+    except Exception:
+        return False
+
+    run_url_history_state_sync(history_state_sync)
+    try:
+        widget.focus_set()
+    except Exception:
+        pass
+    return True
+
+
+def build_url_box_button_grid(
+    parent,
+    text_widget,
+    core_actions,
+    show_actions,
+    advanced_actions,
+    show_mode_getter=None,
+    history_state_sync=None,
+):
+    """Build the shared single-column URL-box toolbar used by all capture tabs."""
+    configure_url_text_widget_history(text_widget, history_state_sync)
+    row = 0
+
+    for label, command in core_actions:
         ttk.Button(
             parent,
             text=label,
             command=command,
-            width=8,
+            width=14,
         ).grid(
-            row=index,
+            row=row,
             column=0,
             sticky="ew",
-            pady=(0 if index == 0 else 6, 0),
-            padx=(0, 6),
+            pady=(0 if row == 0 else 6, 0),
+        )
+        row += 1
+
+    ttk.Button(parent, text="Undo", command=lambda: undo_url_text_widget(text_widget, history_state_sync), width=14).grid(
+        row=row, column=0, sticky="ew", pady=(6, 0)
+    )
+    row += 1
+    ttk.Button(parent, text="Redo", command=lambda: redo_url_text_widget(text_widget, history_state_sync), width=14).grid(
+        row=row, column=0, sticky="ew", pady=(6, 0)
+    )
+    row += 1
+
+    def post_menu_below(button, menu):
+        """Open a popup menu directly below a standard toolbar button."""
+        button.update_idletasks()
+        x = button.winfo_rootx()
+        y = button.winfo_rooty() + button.winfo_height()
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    advanced_menu = tk.Menu(parent, tearoff=False)
+    for label, command in advanced_actions:
+        advanced_menu.add_command(label=label, command=command)
+    advanced_button = ttk.Button(parent, text="Advanced ▼", width=14)
+    advanced_button.configure(command=lambda: post_menu_below(advanced_button, advanced_menu))
+    advanced_button.grid(row=row, column=0, sticky="ew", pady=(6, 0))
+    row += 1
+
+    show_mode_var = tk.StringVar(parent, value="all")
+    if callable(show_mode_getter):
+        try:
+            show_mode_var.set(str(show_mode_getter() or "all").strip().lower())
+        except Exception:
+            show_mode_var.set("all")
+
+    show_menu = tk.Menu(parent, tearoff=False)
+
+    def run_show_action(mode_value, command):
+        command()
+        if callable(show_mode_getter):
+            try:
+                show_mode_var.set(str(show_mode_getter() or "all").strip().lower())
+                return
+            except Exception:
+                pass
+        show_mode_var.set(mode_value)
+
+    for label, command in show_actions:
+        mode_value = str(label or "").strip().lower()
+        show_menu.add_radiobutton(
+            label=label,
+            variable=show_mode_var,
+            value=mode_value,
+            command=lambda value=mode_value, action=command: run_show_action(value, action),
         )
 
-    failed_button = ttk.Button(
-        parent,
-        text="Failed",
-        command=failed_command,
-        width=10,
-    )
-    failed_button.grid(row=0, column=1, sticky="ew")
+    def post_show_menu():
+        if callable(show_mode_getter):
+            try:
+                show_mode_var.set(str(show_mode_getter() or "all").strip().lower())
+            except Exception:
+                pass
+        post_menu_below(show_button, show_menu)
 
-    for index, (label, command) in enumerate(right_actions, start=1):
-        ttk.Button(
-            parent,
-            text=label,
-            command=command,
-            width=10,
-        ).grid(row=index, column=1, sticky="ew", pady=(6, 0))
+    show_button = ttk.Button(parent, text="Show ▼", width=14, command=post_show_menu)
+    show_button.grid(row=row, column=0, sticky="ew", pady=(6, 0))
 
-    return failed_button
-
+    return show_button
 
 def normalize_url_for_compare(url):
     url = clean_extracted_url(url)
@@ -4765,7 +4940,7 @@ def get_current_url_source_text():
 
 
 def get_current_url_list_for_tools(use_all_cache=True):
-    if use_all_cache and url_view_mode == "failed" and url_all_view_cache:
+    if use_all_cache and url_view_mode != "all" and url_all_view_cache:
         return list(url_all_view_cache)
 
     return get_url_list_from_widget(urls_text, get_existing_input_file_paths(), log_errors=True)
@@ -4877,46 +5052,105 @@ def get_captured_url_records():
     return read_gui_url_records(get_gui_captured_urls_path())
 
 
-def toggle_failed_url_view():
+def filter_history_urls_for_base(base_urls, records, record_filter=None):
+    """Return unique history URLs that belong to the supplied current URL set."""
+    base_set = {normalize_url_for_compare(url) for url in (base_urls or [])}
+    output_urls = []
+    seen = set()
+
+    for record in records or []:
+        if record_filter is not None and not record_filter(record):
+            continue
+        normalized = record.get("normalized", "")
+        if base_set and normalized not in base_set:
+            continue
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output_urls.append(record.get("url", ""))
+
+    return [url for url in output_urls if url]
+
+
+def infer_url_view_mode_from_widget(
+    widget,
+    all_urls,
+    failed_records,
+    succeeded_records,
+    succeeded_record_filter=None,
+):
+    """Infer which Show view matches the URL box after an undo/redo operation."""
+    all_urls = list(all_urls or [])
+    if not all_urls:
+        return "all"
+
+    current_urls = extract_urls_from_text(get_text_widget_content(widget, "end", strip=True))
+
+    def signature(urls):
+        return [normalize_url_for_compare(url) for url in (urls or []) if normalize_url_for_compare(url)]
+
+    current_signature = signature(current_urls)
+    all_signature = signature(all_urls)
+    if current_signature == all_signature:
+        return "all"
+
+    failed_urls = filter_history_urls_for_base(all_urls, failed_records)
+    if failed_urls and current_signature == signature(failed_urls):
+        return "failed"
+
+    succeeded_urls = filter_history_urls_for_base(
+        all_urls,
+        succeeded_records,
+        succeeded_record_filter,
+    )
+    if succeeded_urls and current_signature == signature(succeeded_urls):
+        return "succeeded"
+
+    return "all"
+
+
+def sync_url_view_mode_after_history_change():
+    global url_view_mode
+    url_view_mode = infer_url_view_mode_from_widget(
+        urls_text,
+        url_all_view_cache,
+        get_failed_url_records(),
+        get_captured_url_records(),
+    )
+
+
+def show_url_view(mode):
     global url_view_mode, url_all_view_cache
+
+    mode = str(mode or "all").strip().lower()
+    if mode not in {"all", "failed", "succeeded"}:
+        return
+
+    if mode == "all":
+        if url_view_mode != "all":
+            set_url_box_urls(url_all_view_cache)
+            url_view_mode = "all"
+            append_log("\nRestored all URLs in the URL box.\n")
+        return
 
     if url_view_mode == "all":
         url_all_view_cache = get_current_url_list_for_tools(use_all_cache=False)
-        base_set = {normalize_url_for_compare(url) for url in url_all_view_cache}
-        failed_records = get_failed_url_records()
 
-        failed_urls = []
-        seen = set()
+    base_urls = list(url_all_view_cache)
+    records = get_failed_url_records() if mode == "failed" else get_captured_url_records()
+    filtered_urls = filter_history_urls_for_base(base_urls, records)
 
-        for record in failed_records:
-            normalized = record.get("normalized", "")
-            if base_set and normalized not in base_set:
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            failed_urls.append(record["url"])
-
-        if not failed_urls:
-            messagebox.showinfo("No failed URLs", "No failed URLs were found for the current Output Root/current URL set.")
-            return
-
-        set_url_box_urls(failed_urls)
-        url_view_mode = "failed"
-        try:
-            failed_url_toggle_button.config(text="All")
-        except Exception:
-            pass
-        append_log(f"\nShowing {len(failed_urls)} failed URL(s) in the URL box.\n")
+    if not filtered_urls:
+        label = "failed" if mode == "failed" else "succeeded"
+        messagebox.showinfo(
+            f"No {label} URLs",
+            f"No {label} URLs were found for the current Output Root/current URL set.",
+        )
         return
 
-    set_url_box_urls(url_all_view_cache)
-    url_view_mode = "all"
-    try:
-        failed_url_toggle_button.config(text="Failed")
-    except Exception:
-        pass
-    append_log("\nRestored all URLs in the URL box.\n")
+    set_url_box_urls(filtered_urls)
+    url_view_mode = mode
+    append_log(f"\nShowing {len(filtered_urls)} {mode} URL(s) in the URL box.\n")
 
 
 def group_urls_by_tld():
@@ -4926,7 +5160,7 @@ def group_urls_by_tld():
         return
 
     output_lines, groups = group_urls_by_domain_lines(urls)
-    replace_text_widget_content(urls_text, "\n".join(output_lines).strip())
+    replace_url_text_widget_content(urls_text, "\n".join(output_lines).strip())
     append_log(f"\nGrouped {len(urls)} URL(s) by {len(groups)} domain(s).\n")
 
 
@@ -10221,7 +10455,7 @@ def delete_settings_file():
 
         apply_settings_dict(make_default_profile_settings())
         apply_app_settings_dict(APP_SETTINGS_DEFAULTS.copy())
-        urls_text.delete("1.0", "end")
+        clear_url_text_widget(urls_text, reset_history=True)
         target_status_var.set("Impersonate targets: Not checked")
         preflight_done_var.set(False)
         active_profile_name = DEFAULT_PROFILE_NAME
@@ -10247,9 +10481,9 @@ def reset_defaults():
     # Preserve every custom profile. Only reset the GUI fields and the Default
     # profile.
     apply_settings_dict(make_default_profile_settings())
-    urls_text.delete("1.0", "end")
+    clear_url_text_widget(urls_text, reset_history=True)
     try:
-        image_urls_text.delete("1.0", "end")
+        clear_url_text_widget(image_urls_text, reset_history=True)
     except Exception:
         pass
     target_status_var.set("Impersonate targets: Not checked")
@@ -14581,13 +14815,212 @@ def fetch_latest_app_release():
     with urllib.request.urlopen(req, timeout=30) as response:
         release = json.loads(response.read().decode("utf-8"))
 
+    tag = release.get("tag_name", "") or release.get("name", "")
+    zipball_url = (release.get("zipball_url") or "").strip()
+    source_archive = None
+    if tag and zipball_url:
+        source_archive = {
+            "name": f"Source code (zip) for {tag}",
+            "download_url": zipball_url,
+        }
+
     return {
-        "tag": release.get("tag_name", "") or release.get("name", ""),
+        "tag": tag,
         "name": release.get("name", ""),
         "published": release.get("published_at", ""),
         "body": release.get("body", ""),
         "url": release.get("html_url", APP_RELEASES_LATEST_URL),
+        "source_archive": source_archive,
     }
+
+
+def validate_app_update_archive(archive_path):
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        infos = archive.infolist()
+        if not infos:
+            raise ValueError("Update archive does not contain any entries.")
+
+        seen_paths = set()
+        validated_entries = []
+        file_paths = []
+
+        for info in infos:
+            raw_name = info.filename
+            if "\\" in raw_name:
+                raise ValueError(f"Update archive contains an invalid path: {raw_name}")
+
+            path = PurePosixPath(raw_name)
+            if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+                raise ValueError(f"Update archive contains an unsafe path: {raw_name}")
+
+            normalized = path.as_posix()
+            normalized_key = normalized.casefold()
+            if normalized_key in seen_paths:
+                raise ValueError(f"Update archive contains a duplicate or case-colliding path: {raw_name}")
+            seen_paths.add(normalized_key)
+
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == 0o120000:
+                raise ValueError(f"Update archive contains an unsupported symbolic link: {raw_name}")
+
+            validated_entries.append((raw_name, path, info.is_dir()))
+            if not info.is_dir():
+                file_paths.append(path)
+
+        if not file_paths:
+            raise ValueError("Update archive does not contain any files.")
+
+        roots = {path.parts[0] for path in file_paths if path.parts}
+        if len(roots) != 1:
+            raise ValueError("GitHub source archive does not have a single repository root folder.")
+
+        repository_root = next(iter(roots))
+        staged_entries = []
+        staged_paths = set()
+
+        for raw_name, path, is_dir in validated_entries:
+            if not path.parts or path.parts[0] != repository_root:
+                raise ValueError(f"Update archive contains an entry outside the repository root: {raw_name}")
+
+            if len(path.parts) == 1:
+                if not is_dir:
+                    raise ValueError(f"Update archive contains a file in place of the repository root: {raw_name}")
+                continue
+
+            relative_path = PurePosixPath(*path.parts[1:])
+            relative_name = relative_path.as_posix()
+            relative_key = relative_name.casefold()
+            if relative_key in staged_paths:
+                raise ValueError(f"Update archive contains a duplicate or case-colliding staged path: {relative_name}")
+            staged_paths.add(relative_key)
+            staged_entries.append((raw_name, relative_path, is_dir))
+
+        if "gui.py".casefold() not in staged_paths:
+            raise ValueError("GitHub source archive is missing gui.py at the repository root.")
+
+    return repository_root, staged_entries
+
+
+def extract_app_update_archive(archive_path, staging_dir, staged_entries):
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        for member_name, relative_path, is_dir in staged_entries:
+            target_path = os.path.join(staging_dir, *relative_path.parts)
+            if is_dir:
+                os.makedirs(target_path, exist_ok=True)
+                continue
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with archive.open(member_name, "r") as source, open(target_path, "wb") as target:
+                shutil.copyfileobj(source, target)
+
+
+def validate_staged_app_version(staging_dir, tag):
+    gui_path = os.path.join(staging_dir, "gui.py")
+    try:
+        with open(gui_path, "r", encoding="utf-8") as handle:
+            gui_text = handle.read(64 * 1024)
+    except Exception as exc:
+        raise ValueError(f"Could not read staged gui.py to verify the release version: {exc}") from exc
+
+    match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', gui_text, re.MULTILINE)
+    if not match:
+        raise ValueError("Staged gui.py does not declare APP_VERSION as expected.")
+
+    staged_version = match.group(1).strip()
+    if staged_version.casefold() != (tag or "").strip().casefold():
+        raise ValueError(
+            f"Staged gui.py version ({staged_version}) does not match the GitHub release tag ({tag})."
+        )
+
+    return staged_version
+
+
+def download_and_stage_app_release(release):
+    source_archive = (release or {}).get("source_archive") or {}
+    tag = ((release or {}).get("tag") or "").strip()
+    archive_name = (source_archive.get("name") or "").strip()
+    download_url = (source_archive.get("download_url") or "").strip()
+
+    if not tag:
+        raise ValueError("The latest GitHub release does not have a usable release tag.")
+    if not download_url.lower().startswith("https://"):
+        raise ValueError("The GitHub source archive does not have a valid HTTPS download URL.")
+
+    os.makedirs(ROOT, exist_ok=True)
+    download_fd, download_path = tempfile.mkstemp(prefix=f".{APP_UPDATE_DIR_NAME}-", suffix=".zip", dir=ROOT)
+    os.close(download_fd)
+    staging_dir = tempfile.mkdtemp(prefix=f".{APP_UPDATE_DIR_NAME}-staging-", dir=ROOT)
+    digest = hashlib.sha256()
+    total = 0
+
+    try:
+        req = urllib.request.Request(
+            download_url,
+            headers={
+                "User-Agent": "wavi-capture-gui-for-osint",
+                "Accept": "application/zip, application/octet-stream;q=0.9, */*;q=0.1",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=60) as response, open(download_path, "wb") as out_file:
+            final_url = (response.geturl() or download_url).strip()
+            if not final_url.lower().startswith("https://"):
+                raise ValueError("GitHub redirected the source archive download to a non-HTTPS URL.")
+
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = None
+                if declared_size is not None and declared_size > APP_UPDATE_MAX_DOWNLOAD_BYTES:
+                    raise ValueError("The WAVI source archive is larger than the allowed staged-download limit.")
+
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > APP_UPDATE_MAX_DOWNLOAD_BYTES:
+                    raise ValueError("The WAVI source archive exceeded the allowed staged-download limit.")
+                digest.update(chunk)
+                out_file.write(chunk)
+
+        actual_digest = digest.hexdigest().lower()
+        repository_root, staged_entries = validate_app_update_archive(download_path)
+        extract_app_update_archive(download_path, staging_dir, staged_entries)
+
+        staged_version = validate_staged_app_version(staging_dir, tag)
+
+        if os.path.isdir(GUI_UPDATE_DIR):
+            shutil.rmtree(GUI_UPDATE_DIR)
+        elif os.path.exists(GUI_UPDATE_DIR):
+            raise ValueError(f"Cannot stage the update because {GUI_UPDATE_DIR} exists and is not a folder.")
+
+        os.replace(staging_dir, GUI_UPDATE_DIR)
+        staging_dir = ""
+
+        return {
+            "tag": tag,
+            "archive_name": archive_name or f"Source code (zip) for {tag}",
+            "repository_root": repository_root,
+            "bytes": total,
+            "sha256": actual_digest,
+            "staged_version": staged_version,
+            "folder": GUI_UPDATE_DIR,
+        }
+
+    finally:
+        try:
+            if os.path.exists(download_path):
+                os.remove(download_path)
+        except Exception:
+            pass
+        try:
+            if staging_dir and os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir)
+        except Exception:
+            pass
 
 
 def open_about_dialog():
@@ -14656,8 +15089,8 @@ def open_about_dialog():
 def open_app_update_dialog():
     dialog = tk.Toplevel(root)
     dialog.title("Check for App Updates")
-    dialog.geometry("700x460")
-    dialog.minsize(640, 420)
+    dialog.geometry("760x510")
+    dialog.minsize(700, 460)
     dialog.transient(root)
     dialog.grab_set()
 
@@ -14665,6 +15098,7 @@ def open_app_update_dialog():
     latest_version_var = tk.StringVar(value="Latest GitHub release: checking...")
     status_var_local = tk.StringVar(value="Querying latest release from GitHub...")
     latest_release_url_var = tk.StringVar(value=APP_RELEASES_LATEST_URL)
+    latest_release_state = {"release": None}
 
     frame = ttk.Frame(dialog, padding=12)
     frame.pack(fill="both", expand=True)
@@ -14674,24 +15108,28 @@ def open_app_update_dialog():
     ttk.Label(
         frame,
         text=(
-            "This checker only queries the latest GitHub release and opens the release page for manual download. "
-            "It does not download, extract, replace, or run files."
+            "This user-triggered checker queries the official GitHub release. Download Latest Release downloads and "
+            f"extracts the complete tagged source archive into the {APP_UPDATE_DIR_NAME} folder beside the app. WAVI does not replace or "
+            "run staged files; use Open Update Folder, close WAVI, and manually copy the staged files over the current installation."
         ),
-        wraplength=660,
+        wraplength=720,
         justify="left",
     ).grid(row=0, column=0, sticky="ew", pady=(0, 12))
 
     ttk.Label(frame, textvariable=current_version_var).grid(row=1, column=0, sticky="w", pady=3)
     ttk.Label(frame, textvariable=latest_version_var).grid(row=2, column=0, sticky="w", pady=3)
-    ttk.Label(frame, textvariable=status_var_local, wraplength=660, justify="left").grid(row=3, column=0, sticky="ew", pady=(6, 8))
+    ttk.Label(frame, textvariable=status_var_local, wraplength=720, justify="left").grid(row=3, column=0, sticky="ew", pady=(6, 8))
 
     release_notes = scrolledtext.ScrolledText(frame, height=10, wrap="word")
     release_notes.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
     release_notes.insert("1.0", "Release notes will appear here if available.")
     release_notes.config(state="disabled")
 
+    update_action_frame = ttk.Frame(frame)
+    update_action_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=5, column=0, sticky="e")
+    button_frame.grid(row=6, column=0, sticky="e")
 
     def set_release_notes(text_value):
         release_notes.config(state="normal")
@@ -14702,10 +15140,92 @@ def open_app_update_dialog():
     def open_latest_release_page():
         webbrowser.open(latest_release_url_var.get() or APP_RELEASES_LATEST_URL)
 
+    def refresh_update_folder_button():
+        if os.path.isdir(GUI_UPDATE_DIR):
+            open_update_folder_button.state(["!disabled"])
+        else:
+            open_update_folder_button.state(["disabled"])
+
+    def open_update_folder():
+        if not os.path.isdir(GUI_UPDATE_DIR):
+            refresh_update_folder_button()
+            messagebox.showinfo(
+                "Update folder not found",
+                f"No staged update folder exists yet. Use Download Latest Release first.\n\nExpected folder:\n{GUI_UPDATE_DIR}",
+            )
+            return
+
+        try:
+            os.startfile(GUI_UPDATE_DIR)
+        except Exception as exc:
+            messagebox.showerror("Could not open update folder", str(exc))
+
+    def download_latest_release():
+        release = latest_release_state.get("release")
+        if not release or not release.get("source_archive"):
+            messagebox.showinfo(
+                "Source ZIP unavailable",
+                "The GitHub source ZIP is not available for the currently loaded release. Recheck or open the release page.",
+            )
+            return
+
+        tag = release.get("tag") or "unknown"
+        status_var_local.set(f"Downloading and validating {tag}...")
+        download_button.state(["disabled"])
+        recheck_button.state(["disabled"])
+        append_log(f"\nDownloading WAVI app update {tag} from the official GitHub source archive...\n")
+
+        def worker():
+            try:
+                result = download_and_stage_app_release(release)
+
+                def update_ui():
+                    status_var_local.set(
+                        f"{result.get('tag')} source files are staged in {APP_UPDATE_DIR_NAME}."
+                    )
+                    refresh_update_folder_button()
+                    download_button.state(["!disabled"])
+                    recheck_button.state(["!disabled"])
+                    append_log(
+                        "WAVI app update staged successfully.\n"
+                        f"Release: {result.get('tag')}\n"
+                        f"Folder: {result.get('folder')}\n"
+                        f"Bytes: {result.get('bytes')}\n"
+                        f"Downloaded archive SHA-256 (local): {result.get('sha256')}\n"
+                        f"Staged APP_VERSION: {result.get('staged_version')}\n"
+                        "No current WAVI files were replaced or executed.\n"
+                    )
+                    messagebox.showinfo(
+                        "Update staged",
+                        f"WAVI {result.get('tag')} was downloaded, validated, and extracted to:\n\n"
+                        f"{result.get('folder')}\n\n"
+                        "No current application files were changed. Use Open Update Folder to review the staged source tree, close WAVI, then manually copy it over the current installation.",
+                    )
+
+                safe_after(0, update_ui)
+
+            except Exception as exc:
+                error_message = str(exc)
+
+                def show_error():
+                    status_var_local.set(f"Could not stage the WAVI update: {error_message}")
+                    download_button.state(["!disabled"] if latest_release_state.get("release", {}).get("source_archive") else ["disabled"])
+                    recheck_button.state(["!disabled"])
+                    refresh_update_folder_button()
+                    append_log(f"WAVI app update staging failed: {error_message}\n")
+                    messagebox.showerror("Update download failed", error_message)
+
+                safe_after(0, show_error)
+
+        start_daemon_thread("worker", worker)
+
     def query_latest_release():
         status_var_local.set("Querying latest release from GitHub...")
         latest_version_var.set("Latest GitHub release: checking...")
         set_release_notes("Querying GitHub...")
+        latest_release_state["release"] = None
+        download_button.state(["disabled"])
+        recheck_button.state(["disabled"])
 
         def worker():
             try:
@@ -14714,38 +15234,59 @@ def open_app_update_dialog():
                 url = release.get("url") or APP_RELEASES_LATEST_URL
                 published = release.get("published") or "unknown"
                 body = release.get("body") or "No release notes provided."
+                source_archive = release.get("source_archive")
 
                 current_tuple = normalize_version_for_compare(APP_VERSION)
                 latest_tuple = normalize_version_for_compare(tag)
 
                 if latest_tuple and current_tuple and latest_tuple > current_tuple:
-                    status_text = "A newer release appears to be available. Open the release page to manually download the latest ZIP."
+                    status_text = "A newer release is available."
                 elif latest_tuple and current_tuple and latest_tuple == current_tuple:
                     status_text = "You appear to be on the latest tagged release."
+                elif latest_tuple and current_tuple and latest_tuple < current_tuple:
+                    status_text = "This WAVI build is newer than the latest tagged GitHub release."
                 else:
-                    status_text = "Latest release was found. Review the release page to confirm whether an update is needed."
+                    status_text = "Latest release was found. Review the release information before staging files."
+
+                if source_archive:
+                    status_text += " The GitHub Source code (zip) archive is available for on-demand staging."
+                else:
+                    status_text += " The GitHub Source code (zip) archive was not returned; automatic staging is unavailable."
 
                 def update_ui():
+                    latest_release_state["release"] = release
                     latest_release_url_var.set(url)
                     latest_version_var.set(f"Latest GitHub release: {tag}    Published: {published}")
                     status_var_local.set(status_text)
                     set_release_notes(body)
+                    recheck_button.state(["!disabled"])
+                    can_stage = bool(source_archive) and not (latest_tuple and current_tuple and latest_tuple < current_tuple)
+                    if can_stage:
+                        download_button.state(["!disabled"])
+                    else:
+                        download_button.state(["disabled"])
+                    refresh_update_folder_button()
                     append_log(
                         "\nChecked app updates from GitHub.\n"
                         f"Current version: {APP_VERSION}\n"
                         f"Latest release: {tag}\n"
+                        f"Source archive: {source_archive.get('name') if source_archive else 'Source ZIP unavailable'}\n"
                         f"Release page: {url}\n"
                     )
 
                 safe_after(0, update_ui)
 
-            except Exception as e:
-                error_message = str(e)
+            except Exception as exc:
+                error_message = str(exc)
 
                 def show_error():
+                    latest_release_state["release"] = None
                     latest_version_var.set("Latest GitHub release: unavailable")
                     status_var_local.set(f"Could not query latest GitHub release: {error_message}")
                     set_release_notes("Could not retrieve release notes.")
+                    download_button.state(["disabled"])
+                    recheck_button.state(["!disabled"])
+                    refresh_update_folder_button()
                     append_log(f"\nFailed to check app updates: {error_message}\n")
                     messagebox.showerror("Update check failed", error_message)
 
@@ -14753,10 +15294,27 @@ def open_app_update_dialog():
 
         start_daemon_thread("worker", worker)
 
-    ttk.Button(button_frame, text="Recheck", command=query_latest_release).pack(side="left", padx=6)
+    download_button = ttk.Button(
+        update_action_frame,
+        text="Download Latest Release",
+        command=download_latest_release,
+        state="disabled",
+    )
+    download_button.pack(side="left", padx=(0, 8))
+
+    open_update_folder_button = ttk.Button(
+        update_action_frame,
+        text="Open Update Folder",
+        command=open_update_folder,
+    )
+    open_update_folder_button.pack(side="left")
+
+    recheck_button = ttk.Button(button_frame, text="Recheck", command=query_latest_release)
+    recheck_button.pack(side="left", padx=6)
     ttk.Button(button_frame, text="Open Latest Release Page", command=open_latest_release_page).pack(side="left", padx=6)
     ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="left", padx=6)
 
+    refresh_update_folder_button()
     query_latest_release()
 
 
@@ -22863,9 +23421,7 @@ def load_web_urls_from_input_file(replace=True):
         set_web_url_box_urls(urls)
         web_append_log(f"\nLoaded {len(urls)} webpage URL(s) from Input File(s).\n")
     else:
-        current = web_urls_text.get("1.0", "end").strip()
-        addition = "\n".join(urls).strip()
-        replace_text_widget_content(web_urls_text, ((current + "\n") if current else "") + addition)
+        append_url_text_widget_content(web_urls_text, "\n".join(urls))
         web_append_log(f"\nAppended {len(urls)} webpage URL(s) from Input File(s).\n")
 
 
@@ -22906,7 +23462,7 @@ def save_web_urls_to_input_file():
 
 
 def clear_web_urls():
-    web_urls_text.delete("1.0", "end")
+    clear_url_text_widget(web_urls_text)
     web_append_log("\nCleared Webpage Capture URL box.\n")
 
 
@@ -22916,7 +23472,7 @@ def strip_web_url_extra_ampersand_tags():
         messagebox.showwarning("No URLs", "The Webpage Capture URL box is empty.")
         return
     output_text, changed = strip_parameter_like_ampersand_tags_from_text(content)
-    replace_text_widget_content(web_urls_text, output_text)
+    replace_url_text_widget_content(web_urls_text, output_text)
     web_append_log(f"\nStripped parameter-like ampersand tags from {changed} Webpage Capture URL(s).\n")
 
 
@@ -22936,52 +23492,71 @@ def get_web_gui_failed_urls_path():
     return os.path.join(root_path, "gui-failed-urls.txt") if root_path else ""
 
 
+def get_web_gui_captured_urls_path():
+    root_path = web_output_root_var.get().strip()
+    return os.path.join(root_path, "gui-captured-urls.txt") if root_path else ""
+
+
 def get_web_failed_url_records():
     return read_gui_url_records(get_web_gui_failed_urls_path())
 
 
-def toggle_web_failed_url_view():
+def get_web_captured_url_records():
+    return read_gui_url_records(get_web_gui_captured_urls_path())
+
+
+def web_history_record_is_succeeded(record):
+    detail = str((record or {}).get("detail") or "").strip().casefold()
+    return "classification=partial" not in detail and "classification=failed" not in detail
+
+
+def sync_web_url_view_mode_after_history_change():
+    global web_url_view_mode
+    web_url_view_mode = infer_url_view_mode_from_widget(
+        web_urls_text,
+        web_url_all_view_cache,
+        get_web_failed_url_records(),
+        get_web_captured_url_records(),
+        web_history_record_is_succeeded,
+    )
+
+
+def show_web_url_view(mode):
     global web_url_view_mode, web_url_all_view_cache
+
+    mode = str(mode or "all").strip().lower()
+    if mode not in {"all", "failed", "succeeded"}:
+        return
+
+    if mode == "all":
+        if web_url_view_mode != "all":
+            set_web_url_box_urls(web_url_all_view_cache)
+            web_url_view_mode = "all"
+            web_append_log("\nRestored all Webpage Capture URLs in the URL box.\n")
+        return
 
     if web_url_view_mode == "all":
         web_url_all_view_cache = get_web_url_list()
-        base_set = {normalize_url_for_compare(url) for url in web_url_all_view_cache}
-        failed_records = get_web_failed_url_records()
-        failed_urls = []
-        seen = set()
 
-        for record in failed_records:
-            normalized = record.get("normalized", "")
-            if base_set and normalized not in base_set:
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            failed_urls.append(record["url"])
+    base_urls = list(web_url_all_view_cache)
+    if mode == "failed":
+        records = get_web_failed_url_records()
+        filtered_urls = filter_history_urls_for_base(base_urls, records)
+    else:
+        records = get_web_captured_url_records()
+        filtered_urls = filter_history_urls_for_base(base_urls, records, web_history_record_is_succeeded)
 
-        if not failed_urls:
-            messagebox.showinfo(
-                "No failed URLs",
-                "No failed Webpage Capture URLs were found for the current Output Root/current URL set.",
-            )
-            return
-
-        set_web_url_box_urls(failed_urls)
-        web_url_view_mode = "failed"
-        try:
-            web_failed_url_toggle_button.config(text="All")
-        except Exception:
-            pass
-        web_append_log(f"\nShowing {len(failed_urls)} failed Webpage Capture URL(s) in the URL box.\n")
+    if not filtered_urls:
+        label = "failed" if mode == "failed" else "succeeded"
+        messagebox.showinfo(
+            f"No {label} URLs",
+            f"No {label} Webpage Capture URLs were found for the current Output Root/current URL set.",
+        )
         return
 
-    set_web_url_box_urls(web_url_all_view_cache)
-    web_url_view_mode = "all"
-    try:
-        web_failed_url_toggle_button.config(text="Failed")
-    except Exception:
-        pass
-    web_append_log("\nRestored all Webpage Capture URLs in the URL box.\n")
+    set_web_url_box_urls(filtered_urls)
+    web_url_view_mode = mode
+    web_append_log(f"\nShowing {len(filtered_urls)} {mode} Webpage Capture URL(s) in the URL box.\n")
 
 
 def group_web_urls_by_tld():
@@ -22990,7 +23565,7 @@ def group_web_urls_by_tld():
         messagebox.showwarning("No URLs", "No Webpage Capture URLs are available to group.")
         return
     output_lines, groups = group_urls_by_domain_lines(urls)
-    replace_text_widget_content(web_urls_text, "\n".join(output_lines).strip())
+    replace_url_text_widget_content(web_urls_text, "\n".join(output_lines).strip())
     web_append_log(f"\nGrouped {len(urls)} Webpage Capture URL(s) by {len(groups)} domain(s).\n")
 
 
@@ -23653,13 +24228,20 @@ def update_web_options_summary(*_args):
             interactive_text = "Off"
 
         if web_create_pdf_var.get():
-            pdf_parts = [
-                get_web_pdf_capture_mode_label(),
-                "Landscape" if web_pdf_landscape_var.get() else "Portrait",
-                f"{normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS['web_pdf_paper_width_in'])}×"
-                f"{normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS['web_pdf_paper_height_in'])}in",
-                f"scale {normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS['web_pdf_scale'])}",
-            ]
+            if web_pdf_capture_mode_var.get() == "paginated_png":
+                pdf_parts = [
+                    get_web_pdf_capture_mode_label(),
+                    "auto-sized to capture",
+                    "auto-split for tall pages",
+                ]
+            else:
+                pdf_parts = [
+                    get_web_pdf_capture_mode_label(),
+                    "Landscape" if web_pdf_landscape_var.get() else "Portrait",
+                    f"{normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS['web_pdf_paper_width_in'])}×"
+                    f"{normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS['web_pdf_paper_height_in'])}in",
+                    f"scale {normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS['web_pdf_scale'])}",
+                ]
             if web_pdf_print_background_var.get() and web_pdf_capture_mode_var.get() == "live_webpage":
                 pdf_parts.append("backgrounds")
             if web_pdf_display_header_footer_var.get():
@@ -24234,55 +24816,58 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     if network_query_mode not in {"redact_values", "include_full"}:
         raise ValueError("Webpage Capture network-report query handling must redact values or include complete query strings.")
     if bool(settings.get("web_create_pdf", DEFAULTS["web_create_pdf"])):
-        scale = float(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"]))
-        paper_width = float(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"]))
-        paper_height = float(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"]))
+        pdf_capture_mode = str(settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"]) or DEFAULTS["web_pdf_capture_mode"]).strip()
+        if pdf_capture_mode not in {"live_webpage", "paginated_png"}:
+            raise ValueError("Webpage Capture PDF capture mode must be a supported choice.")
         margin_top = float(settings.get("web_pdf_margin_top_in", DEFAULTS["web_pdf_margin_top_in"]))
         margin_bottom = float(settings.get("web_pdf_margin_bottom_in", DEFAULTS["web_pdf_margin_bottom_in"]))
         margin_left = float(settings.get("web_pdf_margin_left_in", DEFAULTS["web_pdf_margin_left_in"]))
         margin_right = float(settings.get("web_pdf_margin_right_in", DEFAULTS["web_pdf_margin_right_in"]))
-        if not 0.1 <= scale <= 2.0:
-            raise ValueError("Webpage Capture PDF scale must be from 0.1 to 2.0.")
-        if not 1.0 <= paper_width <= 40.0:
-            raise ValueError("Webpage Capture PDF paper width must be from 1.0 to 40.0 inches.")
-        if not 1.0 <= paper_height <= 40.0:
-            raise ValueError("Webpage Capture PDF paper height must be from 1.0 to 40.0 inches.")
         if any(value < 0 or value > 5.0 for value in (margin_top, margin_bottom, margin_left, margin_right)):
             raise ValueError("Webpage Capture PDF margins must be from 0.0 to 5.0 inches.")
-        if margin_top + margin_bottom >= paper_height:
-            raise ValueError("Webpage Capture PDF top and bottom margins must total less than the paper height.")
-        if margin_left + margin_right >= paper_width:
-            raise ValueError("Webpage Capture PDF left and right margins must total less than the paper width.")
-        page_ranges = str(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]) or "").strip()
-        if page_ranges and not re.fullmatch(r"\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*", page_ranges):
-            raise ValueError("Webpage Capture PDF page ranges must use values such as 1-5 or 1,3,5-8.")
-        pdf_page_behavior = str(settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"]) or DEFAULTS["web_pdf_page_behavior"]).strip()
-        if pdf_page_behavior not in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"}:
-            raise ValueError("Webpage Capture PDF page behavior must be a supported choice.")
-        pdf_capture_mode = str(settings.get("web_pdf_capture_mode", DEFAULTS["web_pdf_capture_mode"]) or DEFAULTS["web_pdf_capture_mode"]).strip()
-        if pdf_capture_mode not in {"live_webpage", "paginated_png"}:
-            raise ValueError("Webpage Capture PDF capture mode must be a supported choice.")
-        if pdf_capture_mode == "paginated_png" and image_format != "png":
-            raise ValueError("Captured PNG PDF output requires PNG as the Webpage Capture image format.")
-        pdf_large_handling = str(settings.get("web_pdf_large_handling", DEFAULTS["web_pdf_large_handling"]) or DEFAULTS["web_pdf_large_handling"]).strip()
-        if pdf_large_handling not in {"automatic", "single", "split", "fail"}:
-            raise ValueError("Webpage Capture large Live Page PDF handling must be Automatic, Single PDF, Split into parts, or Fail above safety limit.")
-        pdf_auto_split_threshold = int(settings.get("web_pdf_auto_split_threshold_pages", DEFAULTS["web_pdf_auto_split_threshold_pages"]))
-        pdf_pages_per_part = int(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"]))
-        pdf_max_total_pages = int(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"]))
-        pdf_max_parts = int(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]))
-        if not 2 <= pdf_auto_split_threshold <= 5000:
-            raise ValueError("Webpage Capture automatic PDF split threshold must be from 2 to 5000 estimated pages.")
-        if not 1 <= pdf_pages_per_part <= 500:
-            raise ValueError("Webpage Capture pages per PDF part must be from 1 to 500.")
-        if not 1 <= pdf_max_total_pages <= 5000:
-            raise ValueError("Webpage Capture maximum Live Page PDF pages must be from 1 to 5000.")
-        if not 1 <= pdf_max_parts <= 100:
-            raise ValueError("Webpage Capture maximum PDF parts must be from 1 to 100.")
-        if pdf_pages_per_part > pdf_max_total_pages:
-            raise ValueError("Webpage Capture pages per PDF part cannot exceed the maximum total PDF pages.")
-        if pdf_auto_split_threshold > pdf_max_total_pages:
-            raise ValueError("Webpage Capture automatic PDF split threshold cannot exceed the maximum total PDF pages.")
+        if pdf_capture_mode == "live_webpage":
+            scale = float(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"]))
+            paper_width = float(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"]))
+            paper_height = float(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"]))
+            if not 0.1 <= scale <= 2.0:
+                raise ValueError("Webpage Capture PDF scale must be from 0.1 to 2.0.")
+            if not 1.0 <= paper_width <= 40.0:
+                raise ValueError("Webpage Capture PDF paper width must be from 1.0 to 40.0 inches.")
+            if not 1.0 <= paper_height <= 40.0:
+                raise ValueError("Webpage Capture PDF paper height must be from 1.0 to 40.0 inches.")
+            if margin_top + margin_bottom >= paper_height:
+                raise ValueError("Webpage Capture PDF top and bottom margins must total less than the paper height.")
+            if margin_left + margin_right >= paper_width:
+                raise ValueError("Webpage Capture PDF left and right margins must total less than the paper width.")
+        if pdf_capture_mode == "paginated_png":
+            if image_format != "png":
+                raise ValueError("Captured PNG PDF output requires PNG as the Webpage Capture image format.")
+        else:
+            page_ranges = str(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]) or "").strip()
+            if page_ranges and not re.fullmatch(r"\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*", page_ranges):
+                raise ValueError("Webpage Capture PDF page ranges must use values such as 1-5 or 1,3,5-8.")
+            pdf_page_behavior = str(settings.get("web_pdf_page_behavior", DEFAULTS["web_pdf_page_behavior"]) or DEFAULTS["web_pdf_page_behavior"]).strip()
+            if pdf_page_behavior not in {"preserve_layout", "neutralize_fixed_sticky", "hide_likely_navigation_overlays"}:
+                raise ValueError("Webpage Capture PDF page behavior must be a supported choice.")
+            pdf_large_handling = str(settings.get("web_pdf_large_handling", DEFAULTS["web_pdf_large_handling"]) or DEFAULTS["web_pdf_large_handling"]).strip()
+            if pdf_large_handling not in {"automatic", "single", "split", "fail"}:
+                raise ValueError("Webpage Capture large Live Page PDF handling must be Automatic, Single PDF, Split into parts, or Fail above safety limit.")
+            pdf_auto_split_threshold = int(settings.get("web_pdf_auto_split_threshold_pages", DEFAULTS["web_pdf_auto_split_threshold_pages"]))
+            pdf_pages_per_part = int(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"]))
+            pdf_max_total_pages = int(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"]))
+            pdf_max_parts = int(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]))
+            if not 2 <= pdf_auto_split_threshold <= 5000:
+                raise ValueError("Webpage Capture automatic PDF split threshold must be from 2 to 5000 estimated pages.")
+            if not 1 <= pdf_pages_per_part <= 500:
+                raise ValueError("Webpage Capture pages per PDF part must be from 1 to 500.")
+            if not 1 <= pdf_max_total_pages <= 5000:
+                raise ValueError("Webpage Capture maximum Live Page PDF pages must be from 1 to 5000.")
+            if not 1 <= pdf_max_parts <= 100:
+                raise ValueError("Webpage Capture maximum PDF parts must be from 1 to 100.")
+            if pdf_pages_per_part > pdf_max_total_pages:
+                raise ValueError("Webpage Capture pages per PDF part cannot exceed the maximum total PDF pages.")
+            if pdf_auto_split_threshold > pdf_max_total_pages:
+                raise ValueError("Webpage Capture automatic PDF split threshold cannot exceed the maximum total PDF pages.")
     get_web_proxy_server_for_browser()
     settings["web_script_path"] = script_path
     settings["web_deno_path"] = deno_path
@@ -26039,24 +26624,31 @@ urls_text.edit_modified(False)
 url_button_frame = ttk.Frame(main)
 url_button_frame.grid(row=11, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
 
-failed_url_toggle_button = build_url_box_button_grid(
+url_show_button = build_url_box_button_grid(
     url_button_frame,
+    urls_text,
     (
         ("Load", load_urls_from_input_file),
         ("Append", append_urls_from_input_file),
         ("Save As", save_urls_to_input_file),
         ("Clear", clear_urls),
-        ("Strip", strip_url_extra_ampersand_tags),
         ("Copy", copy_urls_from_box),
     ),
-    toggle_failed_url_view,
     (
-        ("Group", group_urls_by_tld),
-        ("Statistics", show_url_statistics),
-        ("Normalize", normalize_urls_in_box),
-        ("Duplicates", remove_duplicate_urls_from_box),
-        ("Validate", validate_urls_in_box),
+        ("All", lambda: show_url_view("all")),
+        ("Failed", lambda: show_url_view("failed")),
+        ("Succeeded", lambda: show_url_view("succeeded")),
     ),
+    (
+        ("Strip Parameter-like Tags", strip_url_extra_ampersand_tags),
+        ("Group by Domain", group_urls_by_tld),
+        ("URL Statistics", show_url_statistics),
+        ("Normalize URLs", normalize_urls_in_box),
+        ("Remove Duplicates", remove_duplicate_urls_from_box),
+        ("Validate URLs", validate_urls_in_box),
+    ),
+    lambda: url_view_mode,
+    sync_url_view_mode_after_history_change,
 )
 
 def show_start_capture_menu():
@@ -26214,10 +26806,7 @@ def load_image_urls_from_input_file(replace=True):
         set_image_url_box_urls(urls)
         image_append_log(f"\nLoaded {len(urls)} Gallery/Profile URL(s) from Input File(s).\n")
     else:
-        current = image_urls_text.get("1.0", "end").strip()
-        addition = "\n".join(urls).strip()
-        image_urls_text.delete("1.0", "end")
-        image_urls_text.insert("1.0", ((current + "\n") if current else "") + addition)
+        append_url_text_widget_content(image_urls_text, "\n".join(urls))
         image_append_log(f"\nAppended {len(urls)} Gallery/Profile URL(s) from Input File(s).\n")
 
 
@@ -26258,7 +26847,7 @@ def save_image_urls_to_input_file():
 
 
 def clear_image_urls():
-    image_urls_text.delete("1.0", "end")
+    clear_url_text_widget(image_urls_text)
     image_append_log("\nCleared Gallery/Profile Capture URL box.\n")
 
 
@@ -26268,7 +26857,7 @@ def strip_image_url_extra_ampersand_tags():
         messagebox.showwarning("No URLs", "The Gallery/Profile Capture URL box is empty.")
         return
     output_text, changed = strip_parameter_like_ampersand_tags_from_text(content)
-    replace_text_widget_content(image_urls_text, output_text)
+    replace_url_text_widget_content(image_urls_text, output_text)
     image_append_log(f"\nStripped parameter-like ampersand tags from {changed} Gallery/Profile Capture URL(s).\n")
 
 
@@ -26285,49 +26874,61 @@ def get_image_gui_failed_urls_path():
     return os.path.join(root_path, "gui-failed-urls.txt") if root_path else ""
 
 
+def get_image_gui_captured_urls_path():
+    root_path = image_output_root_var.get().strip()
+    return os.path.join(root_path, "gui-captured-urls.txt") if root_path else ""
+
+
 def get_image_failed_url_records():
     return read_gui_url_records(get_image_gui_failed_urls_path())
 
 
-def toggle_image_failed_url_view():
+def get_image_captured_url_records():
+    return read_gui_url_records(get_image_gui_captured_urls_path())
+
+
+def sync_image_url_view_mode_after_history_change():
+    global image_url_view_mode
+    image_url_view_mode = infer_url_view_mode_from_widget(
+        image_urls_text,
+        image_url_all_view_cache,
+        get_image_failed_url_records(),
+        get_image_captured_url_records(),
+    )
+
+
+def show_image_url_view(mode):
     global image_url_view_mode, image_url_all_view_cache
+
+    mode = str(mode or "all").strip().lower()
+    if mode not in {"all", "failed", "succeeded"}:
+        return
+
+    if mode == "all":
+        if image_url_view_mode != "all":
+            set_image_url_box_urls(image_url_all_view_cache)
+            image_url_view_mode = "all"
+            image_append_log("\nRestored all Gallery/Profile Capture URLs in the URL box.\n")
+        return
 
     if image_url_view_mode == "all":
         image_url_all_view_cache = get_image_url_list()
-        base_set = {normalize_url_for_compare(url) for url in image_url_all_view_cache}
-        failed_records = get_image_failed_url_records()
-        failed_urls = []
-        seen = set()
 
-        for record in failed_records:
-            normalized = record.get("normalized", "")
-            if base_set and normalized not in base_set:
-                continue
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            failed_urls.append(record["url"])
+    base_urls = list(image_url_all_view_cache)
+    records = get_image_failed_url_records() if mode == "failed" else get_image_captured_url_records()
+    filtered_urls = filter_history_urls_for_base(base_urls, records)
 
-        if not failed_urls:
-            messagebox.showinfo("No failed URLs", "No failed Gallery/Profile Capture URLs were found for the current Output Root/current URL set.")
-            return
-
-        set_image_url_box_urls(failed_urls)
-        image_url_view_mode = "failed"
-        try:
-            image_failed_url_toggle_button.config(text="All")
-        except Exception:
-            pass
-        image_append_log(f"\nShowing {len(failed_urls)} failed Gallery/Profile Capture URL(s) in the URL box.\n")
+    if not filtered_urls:
+        label = "failed" if mode == "failed" else "succeeded"
+        messagebox.showinfo(
+            f"No {label} URLs",
+            f"No {label} Gallery/Profile Capture URLs were found for the current Output Root/current URL set.",
+        )
         return
 
-    set_image_url_box_urls(image_url_all_view_cache)
-    image_url_view_mode = "all"
-    try:
-        image_failed_url_toggle_button.config(text="Failed")
-    except Exception:
-        pass
-    image_append_log("\nRestored all Gallery/Profile Capture URLs in the URL box.\n")
+    set_image_url_box_urls(filtered_urls)
+    image_url_view_mode = mode
+    image_append_log(f"\nShowing {len(filtered_urls)} {mode} Gallery/Profile Capture URL(s) in the URL box.\n")
 
 
 def group_image_urls_by_tld():
@@ -26336,7 +26937,7 @@ def group_image_urls_by_tld():
         messagebox.showwarning("No URLs", "No Gallery/Profile Capture URLs are available to group.")
         return
     output_lines, groups = group_urls_by_domain_lines(urls)
-    replace_text_widget_content(image_urls_text, "\n".join(output_lines).strip())
+    replace_url_text_widget_content(image_urls_text, "\n".join(output_lines).strip())
     image_append_log(f"\nGrouped {len(urls)} Gallery/Profile Capture URL(s) by {len(groups)} domain(s).\n")
 
 
@@ -27569,25 +28170,32 @@ def build_image_capture_tab():
     image_urls_text.grid(row=11, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
     image_button_frame = ttk.Frame(image_capture_tab)
     image_button_frame.grid(row=11, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
-    global image_failed_url_toggle_button
-    image_failed_url_toggle_button = build_url_box_button_grid(
+    global image_url_show_button
+    image_url_show_button = build_url_box_button_grid(
         image_button_frame,
+        image_urls_text,
         (
             ("Load", lambda: load_image_urls_from_input_file(True)),
             ("Append", lambda: load_image_urls_from_input_file(False)),
             ("Save As", save_image_urls_to_input_file),
             ("Clear", clear_image_urls),
-            ("Strip", strip_image_url_extra_ampersand_tags),
             ("Copy", copy_image_urls_from_box),
         ),
-        toggle_image_failed_url_view,
         (
-            ("Group", group_image_urls_by_tld),
-            ("Statistics", show_image_url_statistics),
-            ("Normalize", lambda: validate_image_urls_in_box(True)),
-            ("Duplicates", remove_duplicate_image_urls_from_box),
-            ("Validate", lambda: validate_image_urls_in_box(False)),
+            ("All", lambda: show_image_url_view("all")),
+            ("Failed", lambda: show_image_url_view("failed")),
+            ("Succeeded", lambda: show_image_url_view("succeeded")),
         ),
+        (
+            ("Strip Parameter-like Tags", strip_image_url_extra_ampersand_tags),
+            ("Group by Domain", group_image_urls_by_tld),
+            ("URL Statistics", show_image_url_statistics),
+            ("Normalize URLs", lambda: validate_image_urls_in_box(True)),
+            ("Remove Duplicates", remove_duplicate_image_urls_from_box),
+            ("Validate URLs", lambda: validate_image_urls_in_box(False)),
+        ),
+        lambda: image_url_view_mode,
+        sync_image_url_view_mode_after_history_change,
     )
 
     workflow = ttk.Frame(image_capture_tab)
@@ -27815,25 +28423,32 @@ def build_web_capture_tab():
     web_urls_text.grid(row=12, column=0, columnspan=3, sticky="nsew", pady=(0, 5))
     buttons = ttk.Frame(web_capture_tab)
     buttons.grid(row=12, column=3, sticky="n", padx=(8, 0), pady=(0, 5))
-    global web_failed_url_toggle_button
-    web_failed_url_toggle_button = build_url_box_button_grid(
+    global web_url_show_button
+    web_url_show_button = build_url_box_button_grid(
         buttons,
+        web_urls_text,
         (
             ("Load", lambda: load_web_urls_from_input_file(True)),
             ("Append", lambda: load_web_urls_from_input_file(False)),
             ("Save As", save_web_urls_to_input_file),
             ("Clear", clear_web_urls),
-            ("Strip", strip_web_url_extra_ampersand_tags),
             ("Copy", copy_web_urls_from_box),
         ),
-        toggle_web_failed_url_view,
         (
-            ("Group", group_web_urls_by_tld),
-            ("Statistics", show_web_url_statistics),
-            ("Normalize", lambda: validate_web_urls_in_box(True)),
-            ("Duplicates", remove_duplicate_web_urls_from_box),
-            ("Validate", lambda: validate_web_urls_in_box(False)),
+            ("All", lambda: show_web_url_view("all")),
+            ("Failed", lambda: show_web_url_view("failed")),
+            ("Succeeded", lambda: show_web_url_view("succeeded")),
         ),
+        (
+            ("Strip Parameter-like Tags", strip_web_url_extra_ampersand_tags),
+            ("Group by Domain", group_web_urls_by_tld),
+            ("URL Statistics", show_web_url_statistics),
+            ("Normalize URLs", lambda: validate_web_urls_in_box(True)),
+            ("Remove Duplicates", remove_duplicate_web_urls_from_box),
+            ("Validate URLs", lambda: validate_web_urls_in_box(False)),
+        ),
+        lambda: web_url_view_mode,
+        sync_web_url_view_mode_after_history_change,
     )
 
     workflow = ttk.Frame(web_capture_tab)
@@ -28648,7 +29263,7 @@ ttk.Label(
     web_pdf_mode_frame,
     text=(
         "Live Page prints the webpage directly. Captured PNG creates an image-only PDF from the screenshot, "
-        "preventing site navigation and sticky headers from repeating."
+        "automatically sizes the PDF to the capture, and splits only when a page would exceed the tall-page safety limit."
     ),
     wraplength=420,
     justify="left",
@@ -28658,7 +29273,7 @@ web_pdf_output_frame = ttk.LabelFrame(web_pdf_general_tab, text="Output", paddin
 web_pdf_output_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
 web_pdf_output_frame.columnconfigure(0, weight=1)
 web_pdf_output_frame.columnconfigure(1, weight=1)
-web_pdf_landscape_check = register_web_pdf_widget(ttk.Checkbutton(
+web_pdf_landscape_check = register_web_pdf_live_widget(ttk.Checkbutton(
     web_pdf_output_frame,
     text="Landscape",
     variable=web_pdf_landscape_var,
@@ -28688,7 +29303,7 @@ web_pdf_css_size_check = register_web_pdf_live_widget(ttk.Checkbutton(
 web_pdf_css_size_check.grid(row=1, column=1, sticky="w", pady=3)
 ttk.Label(
     web_pdf_output_frame,
-    text="Site backgrounds and CSS page sizing apply only to Live Page PDFs.",
+    text="Landscape, site backgrounds, paper/scale, page ranges, and CSS page sizing apply only to Live Page PDFs.",
     wraplength=420,
     justify="left",
 ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -28725,21 +29340,21 @@ web_pdf_page_tab.columnconfigure(0, weight=1, uniform="web_pdf_page")
 web_pdf_page_tab.columnconfigure(1, weight=1, uniform="web_pdf_page")
 web_pdf_notebook.add(web_pdf_page_tab, text="Page Layout")
 
-web_pdf_layout_frame = ttk.LabelFrame(web_pdf_page_tab, text="Paper and Scale", padding=8)
+web_pdf_layout_frame = ttk.LabelFrame(web_pdf_page_tab, text="Paper and Scale (Live Page)", padding=8)
 web_pdf_layout_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
 web_pdf_layout_frame.columnconfigure(1, weight=1)
 ttk.Label(web_pdf_layout_frame, text="Scale (0.1–2.0)").grid(row=0, column=0, sticky="w", pady=3)
-web_pdf_scale_entry = register_web_pdf_widget(ttk.Entry(
+web_pdf_scale_entry = register_web_pdf_live_widget(ttk.Entry(
     web_pdf_layout_frame, textvariable=web_pdf_scale_var, width=12
 ))
 web_pdf_scale_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
 ttk.Label(web_pdf_layout_frame, text="Paper width (in)").grid(row=1, column=0, sticky="w", pady=3)
-web_pdf_width_entry = register_web_pdf_widget(ttk.Entry(
+web_pdf_width_entry = register_web_pdf_live_widget(ttk.Entry(
     web_pdf_layout_frame, textvariable=web_pdf_paper_width_in_var, width=12
 ))
 web_pdf_width_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
 ttk.Label(web_pdf_layout_frame, text="Paper height (in)").grid(row=2, column=0, sticky="w", pady=3)
-web_pdf_height_entry = register_web_pdf_widget(ttk.Entry(
+web_pdf_height_entry = register_web_pdf_live_widget(ttk.Entry(
     web_pdf_layout_frame, textvariable=web_pdf_paper_height_in_var, width=12
 ))
 web_pdf_height_entry.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=3)
@@ -28754,6 +29369,15 @@ ttk.Label(
     wraplength=420,
     justify="left",
 ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+ttk.Label(
+    web_pdf_layout_frame,
+    text=(
+        "Captured PNG ignores these paper/scale controls. WAVI derives page dimensions from the captured image and "
+        "automatically divides very tall captures into evenly sized PDF pages without resizing the saved source PNG."
+    ),
+    wraplength=420,
+    justify="left",
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 web_pdf_margins_frame = ttk.LabelFrame(web_pdf_page_tab, text="Margins (inches)", padding=8)
 web_pdf_margins_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))

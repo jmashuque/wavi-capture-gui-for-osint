@@ -238,13 +238,12 @@ Do this once before the first capture, or whenever you prepare a fresh copy of W
 
 4. Paste the approved URL or URLs. The URL box takes priority over Input File(s); clear the URL box when you intend to use selected files.
 
-   Every capture tab has the same twelve URL-box tools:
+   Every capture tab uses the same single-column URL toolbar:
 
    - **Load**, **Append**, **Save As**, **Clear**, and **Copy** manage the URL text. **Save As** opens a file picker, and the file you save becomes the selected Input File for that capture tab.
-   - **Failed** shows failed URLs from the current Output Root that match the current URL set; the button changes to **All** so the original set can be restored.
-   - **Group** organizes URLs under domain headings, and **Statistics** shows totals by domain.
-   - **Normalize**, **Duplicates**, and **Validate** clean or inspect the URL source.
-   - **Strip** removes parameter-like `&name=value` suffixes. Use it only when those trailing parameters are unwanted, because removing them can change which webpage or media item is requested.
+   - **Undo** and **Redo** restore or reapply URL-box edits and toolbar operations. The same actions are available with **Ctrl+Z**, **Ctrl+Y**, and **Ctrl+Shift+Z**.
+   - **Advanced ▼** opens **Strip Parameter-like Tags**, **Group by Domain**, **URL Statistics**, **Normalize URLs**, **Remove Duplicates**, and **Validate URLs**. Strip Parameter-like Tags removes parameter-like `&name=value` suffixes; use it only when those trailing parameters are unwanted, because removing them can change which webpage or media item is requested.
+   - **Show ▼** switches the URL box between **All**, **Failed**, and **Succeeded** URLs from the current Output Root. The menu marks the active view.
 
 5. Run **Preflight Check**. Fix any failed item before continuing.
 
@@ -709,9 +708,11 @@ PDF creation is optional and is configured separately from the primary image cap
 | PDF source | What it does | Tradeoff |
 |---|---|---|
 | **Live Page (searchable)** | Prints the rendered webpage directly through Chromium. Text can remain searchable/selectable where the page permits it. | Site print CSS, fixed/sticky elements, and very long pages can affect pagination or output size. |
-| **Captured PNG (visual match)** | Builds an image-only PDF from the captured PNG result. | Better visual correspondence with the screenshot, but text is not searchable and PNG output is required. |
+| **Captured PNG (visual match)** | Builds an image-only PDF from the captured PNG result and automatically sizes the PDF page to the capture. Very tall captures are divided into evenly sized PDF pages when needed. | Better visual correspondence with the screenshot, but text is not searchable and PNG output is required. |
 
-Common PDF controls include landscape orientation, headers/footers, scale, paper size, margins, and—where supported by the selected source—site backgrounds and CSS page sizing. **Pages** accepts Live Page ranges such as `1-5` or `1,3,5-8`; a manual page range takes precedence over the automatic large-PDF policy.
+For **Captured PNG**, WAVI derives the PDF dimensions from the captured image instead of using the configured paper size, scale, or landscape setting. WAVI does not resize the saved source PNG before PDF generation. WAVI keeps generated page dimensions within an internal 12,000-point safety limit; when a normal-width capture would be too tall, it is divided evenly across the minimum number of PDF pages needed to stay within that limit. In this mode, configured PDF margins apply only to the rendered webpage image. Optional headers/footers are rendered by WAVI inside each generated page, so their spacing is controlled by the HTML/CSS in the header/footer template rather than by Chromium's print-margin header area.
+
+For **Live Page**, common PDF controls include landscape orientation, headers/footers, scale, paper size, margins, site backgrounds, and CSS page sizing. **Pages** accepts ranges such as `1-5` or `1,3,5-8`; a manual page range takes precedence over the automatic large-PDF policy.
 
 For **Live Page** PDFs, **Live Page Layout** can keep the site's print layout, remove qualifying fixed/sticky positioning, or hide likely top navigation. This is separate from the image-capture **Fixed/sticky** setting and does not alter the saved PNG.
 
@@ -724,7 +725,7 @@ Large Live Page PDFs can use:
 
 **Maximum total pages** and **Maximum parts** bound large-PDF work. When a split capture reaches a safety cap after producing valid parts, completed parts are retained and the result can be classified as partial. Explicit page ranges are handled separately from this automatic splitting policy.
 
-Custom PDF headers and footers accept HTML. WAVI placeholders include `%requested_url%`, `%final_url%`, `%page_title%`, and `%capture_utc%`; Chromium also exposes its standard `date`, `title`, `url`, `pageNumber`, and `totalPages` template classes. Keep header/footer content compact so it does not consume excessive page area.
+Custom PDF headers and footers accept HTML. WAVI placeholders include `%requested_url%`, `%final_url%`, `%best_url%`, `%page_title%`, `%capture_utc%`, `%capture_timestamp_utc%`, `%capture_date_utc%`, `%capture_time_utc%`, `%capture_local%`, `%capture_timestamp_local%`, `%capture_date_local%`, `%capture_time_local%`, `%page_number%`, and `%page_count%`. For **Live Page** PDFs, Chromium's standard `date`, `title`, `url`, `pageNumber`, and `totalPages` template classes remain available. For **Captured PNG** PDFs, use WAVI placeholders when you want the original capture URL or WAVI page counts rather than the temporary document URL used internally to build the PDF. Keep header/footer content compact so it does not consume excessive page area.
 
 **Filename templates and output records**
 
@@ -800,7 +801,9 @@ The Webpage Capture archive uses SQLite to store requested URLs, final redirecte
 
 ### Update Checks
 
-The app has user-triggered update helpers for staged local tools:
+**Help > Check for App Updates** queries the latest official WAVI GitHub release on demand. **Download Latest Release** downloads GitHub's **Source code (zip)** archive for the latest release tag, validates the archive structure and release version, and extracts the complete repository snapshot to the `gui-update` folder beside the app. GitHub's generated outer archive folder is removed so the repository contents are staged directly under `gui-update`. **Open Update Folder** opens the staged source tree so it can be reviewed. Close WAVI before manually copying the staged files over the current installation. WAVI does not automatically replace or run the staged application files.
+
+The app also has user-triggered update helpers for staged local tools:
 
 - **Check/Update yt-dlp** on the Audio/Video Capture tab
 - **Check/Update gallery-dl** on the Gallery/Profile Capture tab
