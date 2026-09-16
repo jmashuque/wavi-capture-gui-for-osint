@@ -2,6 +2,13 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0915](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0915) - PDF Capture Controls and Long-Page Reliability
+
+- Added **Insert Tag ▼** menus to the PDF header and footer HTML editors for inserting WAVI capture tags such as source URLs, page title, capture timestamps, and page numbers at the current cursor position.
+- Added a configurable **Height-to-width ratio** for Captured PNG PDF pages, with an optional **Always use maximum ratio** setting that automatically uses the tallest page permitted by WAVI's 12,000-point PDF height limit.
+- Added a hard **16,382 px** maximum for single Chromium screenshot dimensions to avoid unreliable oversized captures; pages exceeding the limit are automatically captured using segmentation.
+- Increased the maximum segment height to **16,382 px** and now require **Segment height** to be less than or equal to **Single-image height**, with the GUI and capture helper enforcing the same limits.
+
 ## [v3.2026.0914](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0914) - URL Workflow, App Updates, and Visual PDF Improvements
 
 - Reorganized the shared URL toolbar into a compact single-column layout across Audio/Video, Gallery/Profile, and Webpage Capture; added Undo and Redo with `Ctrl+Z`, `Ctrl+Y`, and `Ctrl+Shift+Z`, plus **Advanced ▼** URL-processing actions and a **Show ▼** menu for All, Failed, and Succeeded URLs.

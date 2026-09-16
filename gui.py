@@ -35,7 +35,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0914"
+APP_VERSION = "v3.2026.0915"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -57,7 +57,8 @@ OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_UPDATE_DIR_NAME = "gui-update"
 APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-SETTINGS_SCHEMA_VERSION = 45
+SETTINGS_SCHEMA_VERSION = 47
+WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +100,25 @@ DEFAULT_WEB_PDF_FOOTER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
     'display:flex; justify-content:flex-end; box-sizing:border-box;">'
     '<span class="pageNumber"></span>/<span class="totalPages"></span></div>'
+)
+
+WEB_PDF_TEMPLATE_TAG_MENU_ITEMS = (
+    ("Best URL", "%best_url%"),
+    ("Requested URL", "%requested_url%"),
+    ("Final URL", "%final_url%"),
+    ("Page title", "%page_title%"),
+    None,
+    ("Capture timestamp (local)", "%capture_timestamp_local%"),
+    ("Capture timestamp (local alias)", "%capture_local%"),
+    ("Capture date (local)", "%capture_date_local%"),
+    ("Capture time (local)", "%capture_time_local%"),
+    ("Capture timestamp (UTC)", "%capture_timestamp_utc%"),
+    ("Capture date (UTC)", "%capture_date_utc%"),
+    ("Capture time (UTC)", "%capture_time_utc%"),
+    ("Raw capture UTC (ISO)", "%capture_utc%"),
+    None,
+    ("Page number", "%page_number%"),
+    ("Page count", "%page_count%"),
 )
 
 DEFAULTS = {
@@ -178,7 +198,7 @@ DEFAULTS = {
     "web_max_growth_cycles": "25",
     "web_growth_limit_action": "capture_partial",
     "web_remeasure_before_capture": True,
-    "web_max_single_image_height": "30000",
+    "web_max_single_image_height": str(WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX),
     "web_max_single_image_megapixels": "150",
     "web_segment_height": "12000",
     "web_segment_overlap": "0",
@@ -227,6 +247,8 @@ DEFAULTS = {
     "web_pdf_pages_per_part": "50",
     "web_pdf_max_total_pages": "500",
     "web_pdf_max_parts": "20",
+    "web_pdf_png_page_height_ratio": "1.0",
+    "web_pdf_png_use_maximum_ratio": False,
     "input_file": os.path.join(ROOT, "urls.txt"),
     "case_name": "Case-%datetime%",
     "filename_template": "%extractor%/%uploader%/%upload_date%_%id%_%title%.%ext%",
@@ -3625,7 +3647,15 @@ def build_web_case_summary_text(exit_code, submitted_url_count, paths, versions,
         (
             f"  PDF: {_summary_enabled(settings.get('web_create_pdf', DEFAULTS['web_create_pdf']))}; "
             f"source {get_web_pdf_capture_mode_label(settings.get('web_pdf_capture_mode'))}; "
-            f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))}"
+            + (
+                (
+                    "height:width ratio maximum"
+                    if settings.get('web_pdf_png_use_maximum_ratio', DEFAULTS['web_pdf_png_use_maximum_ratio'])
+                    else f"height:width ratio {settings.get('web_pdf_png_page_height_ratio', DEFAULTS['web_pdf_png_page_height_ratio'])}"
+                )
+                if settings.get('web_pdf_capture_mode', DEFAULTS['web_pdf_capture_mode']) == 'paginated_png'
+                else f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))}"
+            )
             if settings.get('web_create_pdf', DEFAULTS['web_create_pdf'])
             else "  PDF: Disabled"
         ),
@@ -6601,9 +6631,9 @@ def get_settings_dict():
         "web_max_growth_cycles": normalize_positive_int_string(web_max_growth_cycles_var.get(), DEFAULTS["web_max_growth_cycles"]),
         "web_growth_limit_action": web_growth_limit_action_var.get() if web_growth_limit_action_var.get() in {"capture_partial", "capture_warning", "fail"} else DEFAULTS["web_growth_limit_action"],
         "web_remeasure_before_capture": bool(web_remeasure_before_capture_var.get()),
-        "web_max_single_image_height": normalize_positive_int_string(web_max_single_image_height_var.get(), DEFAULTS["web_max_single_image_height"]),
+        "web_max_single_image_height": normalize_web_max_single_image_height(web_max_single_image_height_var.get()),
         "web_max_single_image_megapixels": normalize_positive_int_string(web_max_single_image_megapixels_var.get(), DEFAULTS["web_max_single_image_megapixels"]),
-        "web_segment_height": normalize_positive_int_string(web_segment_height_var.get(), DEFAULTS["web_segment_height"]),
+        "web_segment_height": normalize_web_segment_height(web_segment_height_var.get(), normalize_web_max_single_image_height(web_max_single_image_height_var.get())),
         "web_segment_overlap": normalize_nonnegative_int_string(web_segment_overlap_var.get(), DEFAULTS["web_segment_overlap"]),
         "web_max_segments": normalize_positive_int_string(web_max_segments_var.get(), DEFAULTS["web_max_segments"]),
         "web_disable_animations": bool(web_disable_animations_var.get()),
@@ -6650,6 +6680,8 @@ def get_settings_dict():
         "web_pdf_pages_per_part": normalize_positive_int_string(web_pdf_pages_per_part_var.get(), DEFAULTS["web_pdf_pages_per_part"]),
         "web_pdf_max_total_pages": normalize_positive_int_string(web_pdf_max_total_pages_var.get(), DEFAULTS["web_pdf_max_total_pages"]),
         "web_pdf_max_parts": normalize_positive_int_string(web_pdf_max_parts_var.get(), DEFAULTS["web_pdf_max_parts"]),
+        "web_pdf_png_page_height_ratio": normalize_pdf_png_page_height_ratio_string(web_pdf_png_page_height_ratio_var.get()),
+        "web_pdf_png_use_maximum_ratio": bool(web_pdf_png_use_maximum_ratio_var.get()),
     }
 
 
@@ -6905,9 +6937,9 @@ def apply_settings_dict(settings):
     saved_web_growth_action = str(settings.get("web_growth_limit_action", DEFAULTS["web_growth_limit_action"]) or DEFAULTS["web_growth_limit_action"]).strip()
     web_growth_limit_action_var.set(saved_web_growth_action if saved_web_growth_action in {"capture_partial", "capture_warning", "fail"} else DEFAULTS["web_growth_limit_action"])
     web_remeasure_before_capture_var.set(bool(settings.get("web_remeasure_before_capture", DEFAULTS["web_remeasure_before_capture"])))
-    web_max_single_image_height_var.set(normalize_positive_int_string(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"]), DEFAULTS["web_max_single_image_height"]))
+    web_max_single_image_height_var.set(normalize_web_max_single_image_height(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"])))
     web_max_single_image_megapixels_var.set(normalize_positive_int_string(settings.get("web_max_single_image_megapixels", DEFAULTS["web_max_single_image_megapixels"]), DEFAULTS["web_max_single_image_megapixels"]))
-    web_segment_height_var.set(normalize_positive_int_string(settings.get("web_segment_height", DEFAULTS["web_segment_height"]), DEFAULTS["web_segment_height"]))
+    web_segment_height_var.set(normalize_web_segment_height(settings.get("web_segment_height", DEFAULTS["web_segment_height"]), web_max_single_image_height_var.get()))
     web_segment_overlap_var.set(normalize_nonnegative_int_string(settings.get("web_segment_overlap", DEFAULTS["web_segment_overlap"]), DEFAULTS["web_segment_overlap"]))
     web_max_segments_var.set(normalize_positive_int_string(settings.get("web_max_segments", DEFAULTS["web_max_segments"]), DEFAULTS["web_max_segments"]))
     web_disable_animations_var.set(bool(settings.get("web_disable_animations", DEFAULTS["web_disable_animations"])))
@@ -6962,6 +6994,8 @@ def apply_settings_dict(settings):
     web_pdf_pages_per_part_var.set(normalize_positive_int_string(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"]), DEFAULTS["web_pdf_pages_per_part"]))
     web_pdf_max_total_pages_var.set(normalize_positive_int_string(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"]), DEFAULTS["web_pdf_max_total_pages"]))
     web_pdf_max_parts_var.set(normalize_positive_int_string(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"]), DEFAULTS["web_pdf_max_parts"]))
+    web_pdf_png_page_height_ratio_var.set(normalize_pdf_png_page_height_ratio_string(settings.get("web_pdf_png_page_height_ratio", DEFAULTS["web_pdf_png_page_height_ratio"])))
+    web_pdf_png_use_maximum_ratio_var.set(bool(settings.get("web_pdf_png_use_maximum_ratio", DEFAULTS["web_pdf_png_use_maximum_ratio"])))
     try:
         update_web_pdf_options_state()
         update_web_interactive_options_state()
@@ -12501,6 +12535,68 @@ def normalize_positive_int_string(value, default_value):
         parsed = int(default_value)
 
     return str(parsed)
+
+
+def normalize_web_max_single_image_height(value):
+    try:
+        parsed = int(str(value or "").strip())
+    except Exception:
+        parsed = int(DEFAULTS["web_max_single_image_height"])
+    if parsed < 2000:
+        return str(parsed)
+    return str(min(parsed, WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX))
+
+
+def validate_web_max_single_image_height_input(proposed):
+    text = str(proposed or "").strip()
+    if not text:
+        return True
+    if not text.isdigit():
+        return False
+    try:
+        return int(text) <= WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX
+    except Exception:
+        return False
+
+
+def normalize_web_segment_height(value, maximum_single_height=None):
+    try:
+        parsed = int(str(value or "").strip())
+    except Exception:
+        parsed = int(DEFAULTS["web_segment_height"])
+    try:
+        maximum = int(str(maximum_single_height if maximum_single_height is not None else DEFAULTS["web_max_single_image_height"]).strip())
+    except Exception:
+        maximum = int(DEFAULTS["web_max_single_image_height"])
+    maximum = max(1000, min(WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX, maximum))
+    if parsed < 1000:
+        parsed = min(int(DEFAULTS["web_segment_height"]), maximum)
+    return str(min(parsed, maximum, WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX))
+
+
+def validate_web_segment_height_input(proposed):
+    text = str(proposed or "").strip()
+    if not text:
+        return True
+    if not text.isdigit():
+        return False
+    try:
+        maximum_single = int(normalize_web_max_single_image_height(web_max_single_image_height_var.get()))
+        return int(text) <= min(WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX, maximum_single)
+    except Exception:
+        return False
+
+
+def sync_web_segment_height_to_single_limit(*_args):
+    single_text = str(web_max_single_image_height_var.get() or "").strip()
+    if not single_text.isdigit():
+        return
+    maximum_single = int(single_text)
+    if not 2000 <= maximum_single <= WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX:
+        return
+    normalized = normalize_web_segment_height(web_segment_height_var.get(), maximum_single)
+    if web_segment_height_var.get() != normalized:
+        web_segment_height_var.set(normalized)
 
 
 def get_saved_split_queue_value_for_mode(mode):
@@ -23011,6 +23107,41 @@ def normalize_positive_float_string(value, default_value="1.0"):
         return str(default_value)
 
 
+def normalize_pdf_png_page_height_ratio_string(value, default_value=None):
+    if default_value is None:
+        default_value = DEFAULTS["web_pdf_png_page_height_ratio"]
+    try:
+        number = float(str(value).strip())
+        if not 0.1 <= number <= 40.0:
+            raise ValueError
+        return f"{number:g}"
+    except Exception:
+        return str(default_value)
+
+
+def get_web_pdf_png_page_height_ratio_preview():
+    try:
+        viewport_width = float(str(web_viewport_width_var.get()).strip())
+    except Exception:
+        viewport_width = float(DEFAULTS["web_viewport_width"])
+    try:
+        margin_left = max(0.0, float(str(web_pdf_margin_left_in_var.get()).strip()))
+    except Exception:
+        margin_left = float(DEFAULTS["web_pdf_margin_left_in"])
+    try:
+        margin_right = max(0.0, float(str(web_pdf_margin_right_in_var.get()).strip()))
+    except Exception:
+        margin_right = float(DEFAULTS["web_pdf_margin_right_in"])
+
+    horizontal_margin_points = (margin_left + margin_right) * 72.0
+    max_content_width_points = max(1.0, 12000.0 - horizontal_margin_points)
+    points_per_css_px = min(1.0, max_content_width_points / max(1.0, viewport_width))
+    content_width_points = max(1.0, viewport_width) * points_per_css_px
+    page_width_points = min(12000.0, content_width_points + horizontal_margin_points)
+    maximum_ratio = 12000.0 / max(1.0, page_width_points)
+    return page_width_points, maximum_ratio
+
+
 def get_web_pdf_header_template_value():
     try:
         return web_pdf_header_text.get("1.0", "end").strip()
@@ -23079,6 +23210,58 @@ def sync_web_pdf_templates_from_widgets(schedule_autosave=False):
             schedule_settings_autosave()
         except Exception:
             pass
+
+
+def insert_web_pdf_template_tag(text_widget, tag):
+    tag = str(tag or "")
+    if not tag:
+        return
+    try:
+        if str(text_widget.cget("state")) == "disabled":
+            return
+        text_widget.insert("insert", tag)
+        text_widget.see("insert")
+        text_widget.focus_set()
+        sync_web_pdf_templates_from_widgets(schedule_autosave=True)
+    except Exception:
+        pass
+
+
+def post_web_pdf_template_tag_menu(button, menu):
+    try:
+        button.update_idletasks()
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+    finally:
+        try:
+            menu.grab_release()
+        except Exception:
+            pass
+
+
+def update_web_pdf_png_page_height_ratio_display(*_args):
+    page_width_points, maximum_ratio = get_web_pdf_png_page_height_ratio_preview()
+    use_maximum = bool(web_pdf_png_use_maximum_ratio_var.get())
+    if use_maximum:
+        effective_points = int(round(min(12000.0, page_width_points * maximum_ratio)))
+        web_pdf_png_page_height_effective_var.set(
+            f"Using maximum ratio {maximum_ratio:.4g}: estimated page size {page_width_points:,.0f} × "
+            f"{effective_points:,} pt (12,000 pt hard vertical limit)."
+        )
+        return
+    try:
+        ratio = float(str(web_pdf_png_page_height_ratio_var.get()).strip())
+        if not 0.1 <= ratio <= 40.0:
+            raise ValueError
+        effective_ratio = min(ratio, maximum_ratio)
+        effective_points = int(round(page_width_points * effective_ratio))
+        web_pdf_png_page_height_effective_var.set(
+            f"Estimated page width: {page_width_points:,.0f} pt; page height: {effective_points:,} pt; "
+            f"maximum ratio at this width: {maximum_ratio:.4g} (12,000 pt hard limit)."
+        )
+    except Exception:
+        web_pdf_png_page_height_effective_var.set(
+            f"Enter a height-to-width ratio of at least 0.10; estimated maximum at the current width is {maximum_ratio:.4g}."
+        )
 
 
 WEB_BROWSER_STANDARD_PATHS = {
@@ -23847,9 +24030,9 @@ def get_web_settings_dict():
         "web_max_growth_cycles": normalize_positive_int_string(web_max_growth_cycles_var.get(), DEFAULTS["web_max_growth_cycles"]),
         "web_growth_limit_action": web_growth_limit_action_var.get() if web_growth_limit_action_var.get() in {"capture_partial", "capture_warning", "fail"} else DEFAULTS["web_growth_limit_action"],
         "web_remeasure_before_capture": bool(web_remeasure_before_capture_var.get()),
-        "web_max_single_image_height": normalize_positive_int_string(web_max_single_image_height_var.get(), DEFAULTS["web_max_single_image_height"]),
+        "web_max_single_image_height": normalize_web_max_single_image_height(web_max_single_image_height_var.get()),
         "web_max_single_image_megapixels": normalize_positive_int_string(web_max_single_image_megapixels_var.get(), DEFAULTS["web_max_single_image_megapixels"]),
-        "web_segment_height": normalize_positive_int_string(web_segment_height_var.get(), DEFAULTS["web_segment_height"]),
+        "web_segment_height": normalize_web_segment_height(web_segment_height_var.get(), normalize_web_max_single_image_height(web_max_single_image_height_var.get())),
         "web_segment_overlap": normalize_nonnegative_int_string(web_segment_overlap_var.get(), DEFAULTS["web_segment_overlap"]),
         "web_max_segments": normalize_positive_int_string(web_max_segments_var.get(), DEFAULTS["web_max_segments"]),
         "web_disable_animations": bool(web_disable_animations_var.get()),
@@ -23896,6 +24079,8 @@ def get_web_settings_dict():
         "web_pdf_pages_per_part": normalize_positive_int_string(web_pdf_pages_per_part_var.get(), DEFAULTS["web_pdf_pages_per_part"]),
         "web_pdf_max_total_pages": normalize_positive_int_string(web_pdf_max_total_pages_var.get(), DEFAULTS["web_pdf_max_total_pages"]),
         "web_pdf_max_parts": normalize_positive_int_string(web_pdf_max_parts_var.get(), DEFAULTS["web_pdf_max_parts"]),
+        "web_pdf_png_page_height_ratio": normalize_pdf_png_page_height_ratio_string(web_pdf_png_page_height_ratio_var.get()),
+        "web_pdf_png_use_maximum_ratio": bool(web_pdf_png_use_maximum_ratio_var.get()),
     }
 
 
@@ -24168,7 +24353,7 @@ def update_web_options_summary(*_args):
         stability_text = (
             f"growth {'on' if web_detect_page_growth_var.get() else 'off'}"
             f"/{normalize_positive_int_string(web_max_growth_cycles_var.get(), DEFAULTS['web_max_growth_cycles'])}/{growth_action_label}; "
-            f"segments {normalize_positive_int_string(web_segment_height_var.get(), DEFAULTS['web_segment_height'])}px"
+            f"segments {normalize_web_segment_height(web_segment_height_var.get(), web_max_single_image_height_var.get())}px"
             f" + {normalize_nonnegative_int_string(web_segment_overlap_var.get(), DEFAULTS['web_segment_overlap'])}px overlap"
             f"/{normalize_positive_int_string(web_max_segments_var.get(), DEFAULTS['web_max_segments'])} max; "
             f"{fixed_behavior_label}"
@@ -24229,9 +24414,12 @@ def update_web_options_summary(*_args):
 
         if web_create_pdf_var.get():
             if web_pdf_capture_mode_var.get() == "paginated_png":
+                ratio_text = normalize_pdf_png_page_height_ratio_string(web_pdf_png_page_height_ratio_var.get())
+                ratio_label = "height:width ratio maximum" if web_pdf_png_use_maximum_ratio_var.get() else f"height:width ratio {ratio_text}"
                 pdf_parts = [
                     get_web_pdf_capture_mode_label(),
                     "auto-sized to capture",
+                    ratio_label,
                     "auto-split for tall pages",
                 ]
             else:
@@ -24399,6 +24587,20 @@ def update_web_pdf_options_state(*_args):
             widget.configure(state=("readonly" if live_state == "normal" and isinstance(widget, ttk.Combobox) else live_state))
         except Exception:
             pass
+
+    png_capture_mode = str(web_pdf_capture_mode_var.get()).strip() == "paginated_png"
+    png_state = "normal" if enabled and png_capture_mode else "disabled"
+    for widget in globals().get("web_pdf_png_widgets", []):
+        try:
+            widget.configure(state=png_state)
+        except Exception:
+            pass
+    try:
+        ratio_entry_state = "normal" if enabled and png_capture_mode and not web_pdf_png_use_maximum_ratio_var.get() else "disabled"
+        web_pdf_png_height_ratio_entry.configure(state=ratio_entry_state)
+    except Exception:
+        pass
+    update_web_pdf_png_page_height_ratio_display()
 
     large_handling = str(web_pdf_large_handling_var.get()).strip()
     split_state = "normal" if enabled and live_capture_mode and large_handling in {"automatic", "split"} else "disabled"
@@ -24770,14 +24972,16 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
     if growth_limit_action not in {"capture_partial", "capture_warning", "fail"}:
         raise ValueError("Webpage Capture growth-limit behavior must be Capture partial, Capture with warning, or Fail URL.")
     max_single_height = int(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"]))
-    if not 2000 <= max_single_height <= 30000:
-        raise ValueError("Webpage Capture maximum single-image height must be from 2000 to 30000 pixels.")
+    if not 2000 <= max_single_height <= WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX:
+        raise ValueError(f"Webpage Capture maximum single-image height must be from 2000 to {WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX} pixels.")
     max_single_megapixels = int(settings.get("web_max_single_image_megapixels", DEFAULTS["web_max_single_image_megapixels"]))
     if not 20 <= max_single_megapixels <= 150:
         raise ValueError("Webpage Capture maximum single-image size must be from 20 to 150 megapixels.")
     segment_height = int(settings.get("web_segment_height", DEFAULTS["web_segment_height"]))
-    if not 1000 <= segment_height <= 16000:
-        raise ValueError("Webpage Capture segment height must be from 1000 to 16000 pixels.")
+    if not 1000 <= segment_height <= WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX:
+        raise ValueError(f"Webpage Capture segment height must be from 1000 to {WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX} pixels.")
+    if segment_height > max_single_height:
+        raise ValueError("Webpage Capture segment height must not exceed the maximum single-image height.")
     segment_overlap = int(settings.get("web_segment_overlap", DEFAULTS["web_segment_overlap"]))
     if not 0 <= segment_overlap <= 1000:
         raise ValueError("Webpage Capture segment overlap must be from 0 to 1000 pixels.")
@@ -24842,6 +25046,21 @@ def validate_web_settings_and_urls(settings, urls, resolved_case_name="", prefli
         if pdf_capture_mode == "paginated_png":
             if image_format != "png":
                 raise ValueError("Captured PNG PDF output requires PNG as the Webpage Capture image format.")
+            use_maximum_ratio = bool(settings.get("web_pdf_png_use_maximum_ratio", DEFAULTS["web_pdf_png_use_maximum_ratio"]))
+            png_page_height_ratio = float(settings.get("web_pdf_png_page_height_ratio", DEFAULTS["web_pdf_png_page_height_ratio"]))
+            horizontal_margin_points = (margin_left + margin_right) * 72.0
+            max_content_width_points = max(1.0, 12000.0 - horizontal_margin_points)
+            points_per_css_px = min(1.0, max_content_width_points / max(1.0, float(width)))
+            estimated_page_width_points = min(12000.0, (float(width) * points_per_css_px) + horizontal_margin_points)
+            estimated_max_ratio = 12000.0 / max(1.0, estimated_page_width_points)
+            if not use_maximum_ratio:
+                if not 0.1 <= png_page_height_ratio <= 40.0:
+                    raise ValueError("Captured PNG PDF height-to-width ratio must be from 0.10 to 40.0.")
+                if png_page_height_ratio > estimated_max_ratio + 1e-9:
+                    raise ValueError(
+                        f"Captured PNG PDF height-to-width ratio is too large for the current viewport/margins. "
+                        f"The estimated maximum is {estimated_max_ratio:.4g} at {estimated_page_width_points:,.0f} pt page width."
+                    )
         else:
             page_ranges = str(settings.get("web_pdf_page_ranges", DEFAULTS["web_pdf_page_ranges"]) or "").strip()
             if page_ranges and not re.fullmatch(r"\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*", page_ranges):
@@ -24967,9 +25186,13 @@ def make_web_capture_config(job, preflight_only=False):
         "maximum_growth_cycles": int(settings.get("web_max_growth_cycles", DEFAULTS["web_max_growth_cycles"])),
         "growth_limit_action": settings.get("web_growth_limit_action", DEFAULTS["web_growth_limit_action"]),
         "remeasure_before_capture": bool(settings.get("web_remeasure_before_capture", DEFAULTS["web_remeasure_before_capture"])),
-        "maximum_single_height": int(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"])),
+        "maximum_single_height": min(WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX, int(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"]))),
         "maximum_single_pixels": int(settings.get("web_max_single_image_megapixels", DEFAULTS["web_max_single_image_megapixels"])) * 1000000,
-        "segment_height": int(settings.get("web_segment_height", DEFAULTS["web_segment_height"])),
+        "segment_height": min(
+            WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX,
+            int(settings.get("web_max_single_image_height", DEFAULTS["web_max_single_image_height"])),
+            int(settings.get("web_segment_height", DEFAULTS["web_segment_height"])),
+        ),
         "segment_overlap": int(settings.get("web_segment_overlap", DEFAULTS["web_segment_overlap"])),
         "maximum_segments": int(settings.get("web_max_segments", DEFAULTS["web_max_segments"])),
         "disable_animations": bool(settings.get("web_disable_animations", DEFAULTS["web_disable_animations"])),
@@ -25021,7 +25244,9 @@ def make_web_capture_config(job, preflight_only=False):
         "pdf_pages_per_part": int(settings.get("web_pdf_pages_per_part", DEFAULTS["web_pdf_pages_per_part"])),
         "pdf_max_total_pages": int(settings.get("web_pdf_max_total_pages", DEFAULTS["web_pdf_max_total_pages"])),
         "pdf_max_parts": int(settings.get("web_pdf_max_parts", DEFAULTS["web_pdf_max_parts"])),
-        "maximum_single_dimension": 30000,
+        "pdf_png_page_height_ratio": float(settings.get("web_pdf_png_page_height_ratio", DEFAULTS["web_pdf_png_page_height_ratio"])),
+        "pdf_png_use_maximum_ratio": bool(settings.get("web_pdf_png_use_maximum_ratio", DEFAULTS["web_pdf_png_use_maximum_ratio"])),
+        "maximum_single_dimension": WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX,
         "proxy_server": get_web_proxy_server_for_browser(),
     }
     config_path = make_gui_temp_file_path(prefix="avi-capture-gui-web-config-", suffix=".json")
@@ -25433,18 +25658,31 @@ def start_web_capture():
         web_append_log("Interactive overlays: disabled\n")
     web_append_log(f"Create PDF: {'Yes' if settings.get('web_create_pdf') else 'No'}\n")
     if settings.get('web_create_pdf'):
-        web_append_log(
-            f"PDF: {'Landscape' if settings.get('web_pdf_landscape') else 'Portrait'} | "
-            f"{settings.get('web_pdf_paper_width_in')}x{settings.get('web_pdf_paper_height_in')} in | "
-            f"scale {settings.get('web_pdf_scale')} | "
-            f"headers/footers {'on' if settings.get('web_pdf_display_header_footer') else 'off'} | "
-            f"behavior {get_web_pdf_page_behavior_label(settings.get('web_pdf_page_behavior'))} | "
-            f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))} | "
-            f"auto split {settings.get('web_pdf_auto_split_threshold_pages', DEFAULTS['web_pdf_auto_split_threshold_pages'])} pages | "
-            f"{settings.get('web_pdf_pages_per_part', DEFAULTS['web_pdf_pages_per_part'])} pages/part | "
-            f"max {settings.get('web_pdf_max_total_pages', DEFAULTS['web_pdf_max_total_pages'])} pages, "
-            f"{settings.get('web_pdf_max_parts', DEFAULTS['web_pdf_max_parts'])} parts\n"
-        )
+        if settings.get('web_pdf_capture_mode') == 'paginated_png':
+            ratio = settings.get('web_pdf_png_page_height_ratio', DEFAULTS['web_pdf_png_page_height_ratio'])
+            use_maximum_ratio = bool(settings.get('web_pdf_png_use_maximum_ratio', DEFAULTS['web_pdf_png_use_maximum_ratio']))
+            page_width_points, max_ratio = get_web_pdf_png_page_height_ratio_preview()
+            effective_ratio = max_ratio if use_maximum_ratio else min(float(ratio), max_ratio)
+            effective_height_points = min(12000.0, page_width_points * effective_ratio)
+            ratio_log = f"maximum (~{max_ratio:.4g})" if use_maximum_ratio else str(ratio)
+            web_append_log(
+                f"PDF: Captured PNG (visual match) | auto-sized | height:width ratio {ratio_log} "
+                f"(~{effective_height_points:,.0f} pt high at ~{page_width_points:,.0f} pt width; max ratio ~{max_ratio:.4g}) | "
+                f"headers/footers {'on' if settings.get('web_pdf_display_header_footer') else 'off'}\n"
+            )
+        else:
+            web_append_log(
+                f"PDF: {'Landscape' if settings.get('web_pdf_landscape') else 'Portrait'} | "
+                f"{settings.get('web_pdf_paper_width_in')}x{settings.get('web_pdf_paper_height_in')} in | "
+                f"scale {settings.get('web_pdf_scale')} | "
+                f"headers/footers {'on' if settings.get('web_pdf_display_header_footer') else 'off'} | "
+                f"behavior {get_web_pdf_page_behavior_label(settings.get('web_pdf_page_behavior'))} | "
+                f"large handling {get_web_pdf_large_handling_label(settings.get('web_pdf_large_handling'))} | "
+                f"auto split {settings.get('web_pdf_auto_split_threshold_pages', DEFAULTS['web_pdf_auto_split_threshold_pages'])} pages | "
+                f"{settings.get('web_pdf_pages_per_part', DEFAULTS['web_pdf_pages_per_part'])} pages/part | "
+                f"max {settings.get('web_pdf_max_total_pages', DEFAULTS['web_pdf_max_total_pages'])} pages, "
+                f"{settings.get('web_pdf_max_parts', DEFAULTS['web_pdf_max_parts'])} parts\n"
+            )
     web_append_log(f"URLs: {len(urls)}\n")
     web_append_log("Command:\n" + format_command_for_log(cmd) + "\n\n")
     if recovery_job_id:
@@ -25936,6 +26174,9 @@ web_pdf_auto_split_threshold_pages_var = tk.StringVar(value=DEFAULTS["web_pdf_au
 web_pdf_pages_per_part_var = tk.StringVar(value=DEFAULTS["web_pdf_pages_per_part"])
 web_pdf_max_total_pages_var = tk.StringVar(value=DEFAULTS["web_pdf_max_total_pages"])
 web_pdf_max_parts_var = tk.StringVar(value=DEFAULTS["web_pdf_max_parts"])
+web_pdf_png_page_height_ratio_var = tk.StringVar(value=DEFAULTS["web_pdf_png_page_height_ratio"])
+web_pdf_png_use_maximum_ratio_var = tk.BooleanVar(value=DEFAULTS["web_pdf_png_use_maximum_ratio"])
+web_pdf_png_page_height_effective_var = tk.StringVar(value="Effective vertical limit: 12,000 pt (hard maximum: 12,000 pt)")
 web_status_var = tk.StringVar(value="Ready")
 web_preflight_done_var = tk.BooleanVar(value=False)
 web_options_summary_var = tk.StringVar(value="")
@@ -28843,14 +29084,22 @@ web_segment_frame = ttk.LabelFrame(web_scrolling_tab, text="Long-page Segmentati
 web_segment_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 for column in range(4):
     web_segment_frame.columnconfigure(column, weight=1 if column in (1, 3) else 0)
-ttk.Label(web_segment_frame, text="Single-image height").grid(row=0, column=0, sticky="e", padx=(0, 4), pady=2)
-web_max_single_height_entry = ttk.Entry(web_segment_frame, textvariable=web_max_single_image_height_var, width=8)
+ttk.Label(web_segment_frame, text=f"Single-image height (max {WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX})").grid(row=0, column=0, sticky="e", padx=(0, 4), pady=2)
+web_max_single_height_vcmd = (root.register(validate_web_max_single_image_height_input), "%P")
+web_max_single_height_entry = ttk.Entry(
+    web_segment_frame, textvariable=web_max_single_image_height_var, width=8,
+    validate="key", validatecommand=web_max_single_height_vcmd,
+)
 web_max_single_height_entry.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=2)
 ttk.Label(web_segment_frame, text="Single-image MP").grid(row=0, column=2, sticky="e", padx=(0, 4), pady=2)
 web_max_single_mp_entry = ttk.Entry(web_segment_frame, textvariable=web_max_single_image_megapixels_var, width=7)
 web_max_single_mp_entry.grid(row=0, column=3, sticky="w", pady=2)
-ttk.Label(web_segment_frame, text="Segment height").grid(row=1, column=0, sticky="e", padx=(0, 4), pady=2)
-web_segment_height_entry = ttk.Entry(web_segment_frame, textvariable=web_segment_height_var, width=8)
+ttk.Label(web_segment_frame, text=f"Segment height (max {WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX})").grid(row=1, column=0, sticky="e", padx=(0, 4), pady=2)
+web_segment_height_vcmd = (root.register(validate_web_segment_height_input), "%P")
+web_segment_height_entry = ttk.Entry(
+    web_segment_frame, textvariable=web_segment_height_var, width=8,
+    validate="key", validatecommand=web_segment_height_vcmd,
+)
 web_segment_height_entry.grid(row=1, column=1, sticky="w", padx=(0, 12), pady=2)
 ttk.Label(web_segment_frame, text="Overlap").grid(row=1, column=2, sticky="e", padx=(0, 4), pady=2)
 web_segment_overlap_entry = ttk.Entry(web_segment_frame, textvariable=web_segment_overlap_var, width=7)
@@ -29224,6 +29473,7 @@ ttk.Checkbutton(
 
 web_pdf_option_widgets = []
 web_pdf_live_widgets = []
+web_pdf_png_widgets = []
 web_pdf_header_footer_widgets = []
 web_pdf_split_widgets = []
 web_pdf_automatic_widgets = []
@@ -29235,6 +29485,11 @@ def register_web_pdf_widget(widget):
 
 def register_web_pdf_live_widget(widget):
     web_pdf_live_widgets.append(widget)
+    return register_web_pdf_widget(widget)
+
+
+def register_web_pdf_png_widget(widget):
+    web_pdf_png_widgets.append(widget)
     return register_web_pdf_widget(widget)
 
 web_pdf_notebook = ttk.Notebook(web_pdf_options_content)
@@ -29379,6 +29634,38 @@ ttk.Label(
     justify="left",
 ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
+web_pdf_png_height_frame = ttk.LabelFrame(web_pdf_page_tab, text="Captured PNG Page Ratio", padding=8)
+web_pdf_png_height_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+web_pdf_png_height_frame.columnconfigure(1, weight=0)
+web_pdf_png_height_frame.columnconfigure(2, weight=1)
+ttk.Label(web_pdf_png_height_frame, text="Height-to-width ratio").grid(row=0, column=0, sticky="w", pady=3)
+web_pdf_png_height_ratio_entry = register_web_pdf_png_widget(ttk.Entry(
+    web_pdf_png_height_frame, textvariable=web_pdf_png_page_height_ratio_var, width=12
+))
+web_pdf_png_height_ratio_entry.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+web_pdf_png_use_maximum_ratio_check = register_web_pdf_png_widget(ttk.Checkbutton(
+    web_pdf_png_height_frame,
+    text="Always use maximum ratio",
+    variable=web_pdf_png_use_maximum_ratio_var,
+))
+web_pdf_png_use_maximum_ratio_check.grid(row=0, column=2, sticky="w", padx=(12, 0), pady=3)
+ttk.Label(
+    web_pdf_png_height_frame,
+    textvariable=web_pdf_png_page_height_effective_var,
+    justify="left",
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+ttk.Label(
+    web_pdf_png_height_frame,
+    text=(
+        "Captured PNG only. Page height is the generated PDF page width multiplied by this ratio. "
+        "A 1.00 ratio makes a square page; a 1,920-point-wide page can use up to 6.25 before reaching "
+        "WAVI's 12,000-point hard vertical limit. Enable Always use maximum ratio to use the current "
+        "maximum automatically as page width changes."
+    ),
+    wraplength=900,
+    justify="left",
+).grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
 web_pdf_margins_frame = ttk.LabelFrame(web_pdf_page_tab, text="Margins (inches)", padding=8)
 web_pdf_margins_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 web_pdf_margins_frame.columnconfigure(1, weight=1)
@@ -29474,21 +29761,63 @@ web_pdf_templates_tab.columnconfigure(1, weight=1)
 web_pdf_templates_tab.rowconfigure(1, weight=1)
 web_pdf_notebook.add(web_pdf_templates_tab, text="Header & Footer")
 
-ttk.Label(web_pdf_templates_tab, text="Header HTML").grid(row=0, column=0, sticky="w", padx=(0, 6))
-ttk.Label(web_pdf_templates_tab, text="Footer HTML").grid(row=0, column=1, sticky="w", padx=(6, 0))
+web_pdf_header_toolbar = ttk.Frame(web_pdf_templates_tab)
+web_pdf_header_toolbar.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+web_pdf_header_toolbar.columnconfigure(0, weight=1)
+ttk.Label(web_pdf_header_toolbar, text="Header HTML").grid(row=0, column=0, sticky="w")
+web_pdf_header_tag_button = ttk.Button(web_pdf_header_toolbar, text="Insert Tag ▼")
+web_pdf_header_tag_button.grid(row=0, column=1, sticky="e")
+
+web_pdf_footer_toolbar = ttk.Frame(web_pdf_templates_tab)
+web_pdf_footer_toolbar.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+web_pdf_footer_toolbar.columnconfigure(0, weight=1)
+ttk.Label(web_pdf_footer_toolbar, text="Footer HTML").grid(row=0, column=0, sticky="w")
+web_pdf_footer_tag_button = ttk.Button(web_pdf_footer_toolbar, text="Insert Tag ▼")
+web_pdf_footer_tag_button.grid(row=0, column=1, sticky="e")
+
 web_pdf_header_text = scrolledtext.ScrolledText(web_pdf_templates_tab, height=7, wrap="word")
 web_pdf_header_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(3, 0))
 web_pdf_footer_text = scrolledtext.ScrolledText(web_pdf_templates_tab, height=7, wrap="word")
 web_pdf_footer_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(3, 0))
-web_pdf_header_footer_widgets.extend([web_pdf_header_text, web_pdf_footer_text])
+
+web_pdf_header_tag_menu = tk.Menu(web_pdf_templates_tab, tearoff=False)
+web_pdf_footer_tag_menu = tk.Menu(web_pdf_templates_tab, tearoff=False)
+for web_pdf_tag_item in WEB_PDF_TEMPLATE_TAG_MENU_ITEMS:
+    if web_pdf_tag_item is None:
+        web_pdf_header_tag_menu.add_separator()
+        web_pdf_footer_tag_menu.add_separator()
+        continue
+    web_pdf_tag_label, web_pdf_tag_value = web_pdf_tag_item
+    menu_label = f"{web_pdf_tag_label}    {web_pdf_tag_value}"
+    web_pdf_header_tag_menu.add_command(
+        label=menu_label,
+        command=lambda value=web_pdf_tag_value: insert_web_pdf_template_tag(web_pdf_header_text, value),
+    )
+    web_pdf_footer_tag_menu.add_command(
+        label=menu_label,
+        command=lambda value=web_pdf_tag_value: insert_web_pdf_template_tag(web_pdf_footer_text, value),
+    )
+web_pdf_header_tag_button.configure(
+    command=lambda: post_web_pdf_template_tag_menu(web_pdf_header_tag_button, web_pdf_header_tag_menu)
+)
+web_pdf_footer_tag_button.configure(
+    command=lambda: post_web_pdf_template_tag_menu(web_pdf_footer_tag_button, web_pdf_footer_tag_menu)
+)
+
+web_pdf_header_footer_widgets.extend([
+    web_pdf_header_text,
+    web_pdf_footer_text,
+    web_pdf_header_tag_button,
+    web_pdf_footer_tag_button,
+])
 set_web_pdf_header_template_value(web_pdf_header_template_var.get())
 set_web_pdf_footer_template_value(web_pdf_footer_template_var.get())
 
 ttk.Label(
     web_pdf_templates_tab,
     text=(
-        "App placeholders: %requested_url%, %final_url%, %page_title%, %capture_utc%. "
-        "Chromium classes include date, title, url, pageNumber, and totalPages."
+        "Use Insert Tag to add WAVI capture values at the cursor position. Tags include URL, page title, local/UTC capture time, "
+        "and page number/count. Chromium classes date, title, url, pageNumber, and totalPages remain available for Live Page PDFs."
     ),
     wraplength=920,
     justify="left",
@@ -29595,6 +29924,8 @@ for web_option_var in (
     web_pdf_prefer_css_page_size_var,
     web_pdf_page_behavior_var,
     web_pdf_capture_mode_var,
+    web_pdf_png_page_height_ratio_var,
+    web_pdf_png_use_maximum_ratio_var,
 ):
     web_option_var.trace_add("write", update_web_options_summary)
 
@@ -29604,6 +29935,7 @@ for web_environment_detail_var in (
 ):
     web_environment_detail_var.trace_add("write", mark_web_environment_preset_custom)
 
+web_max_single_image_height_var.trace_add("write", sync_web_segment_height_to_single_limit)
 web_lazy_scroll_var.trace_add("write", update_web_capture_options_state)
 web_detect_page_growth_var.trace_add("write", update_web_capture_options_state)
 web_capture_mode_var.trace_add("write", update_web_capture_options_state)
@@ -29618,6 +29950,12 @@ web_wait_text_enabled_var.trace_add("write", update_web_readiness_options_state)
 web_create_pdf_var.trace_add("write", update_web_pdf_options_state)
 web_pdf_display_header_footer_var.trace_add("write", update_web_pdf_options_state)
 web_pdf_capture_mode_var.trace_add("write", update_web_pdf_options_state)
+web_pdf_png_page_height_ratio_var.trace_add("write", update_web_pdf_png_page_height_ratio_display)
+web_pdf_png_use_maximum_ratio_var.trace_add("write", update_web_pdf_png_page_height_ratio_display)
+web_pdf_png_use_maximum_ratio_var.trace_add("write", update_web_pdf_options_state)
+web_viewport_width_var.trace_add("write", update_web_pdf_png_page_height_ratio_display)
+web_pdf_margin_left_in_var.trace_add("write", update_web_pdf_png_page_height_ratio_display)
+web_pdf_margin_right_in_var.trace_add("write", update_web_pdf_png_page_height_ratio_display)
 update_web_capture_options_state()
 update_web_readiness_options_state()
 update_web_interactive_options_state()

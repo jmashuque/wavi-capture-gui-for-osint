@@ -9,7 +9,7 @@ explicitly enabled, it may read a user-selected Netscape cookies.txt file and
 inject either site-applicable cookies or the entire file into the isolated browser session.
 */
 
-const SCRIPT_SCHEMA_VERSION = 8;
+const SCRIPT_SCHEMA_VERSION = 10;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -93,6 +93,7 @@ const PDF_STREAM_CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
 const PDF_POINTS_PER_INCH = 72;
 const PAGINATED_PNG_BASE_POINTS_PER_CSS_PIXEL = 1;
 const PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS = 12000;
+const CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382;
 const BROWSER_STDERR_TAIL_CHARACTERS = 16384;
 
 const SHA256_CONSTANTS = new Uint32Array([
@@ -2215,15 +2216,26 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
       : Number(capture.page_height) || 0
   ));
 
+  const requestedPageHeightRatio = Math.max(0.1, Math.min(40.0, Number(config.pdf_png_page_height_ratio) || 1.0));
+  const useMaximumPageHeightRatio = Boolean(config.pdf_png_use_maximum_ratio);
   const horizontalMarginPoints = (marginLeftIn + marginRightIn) * PDF_POINTS_PER_INCH;
   const maxContentWidthPoints = Math.max(1, PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS - horizontalMarginPoints);
   const naturalPointsPerCssPx = PAGINATED_PNG_BASE_POINTS_PER_CSS_PIXEL;
   const pointsPerCssPx = Math.min(naturalPointsPerCssPx, maxContentWidthPoints / pageWidthCssPx);
   const totalContentHeightPoints = totalHeightCssPx * pointsPerCssPx;
-  const initialContentHeightLimitPoints = Math.max(1, PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS - ((marginTopIn + marginBottomIn) * PDF_POINTS_PER_INCH));
-  const initialPageCount = Math.max(1, Math.ceil((totalContentHeightPoints - 1e-9) / initialContentHeightLimitPoints));
   const contentWidthIn = (pageWidthCssPx * pointsPerCssPx) / PDF_POINTS_PER_INCH;
   const pageWidthIn = contentWidthIn + marginLeftIn + marginRightIn;
+  const pageWidthPoints = pageWidthIn * PDF_POINTS_PER_INCH;
+  const maximumPageHeightRatio = PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS / Math.max(1, pageWidthPoints);
+  const effectivePageHeightRatio = useMaximumPageHeightRatio
+    ? maximumPageHeightRatio
+    : Math.min(requestedPageHeightRatio, maximumPageHeightRatio);
+  const maxPageHeightPoints = Math.min(
+    PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS,
+    pageWidthPoints * effectivePageHeightRatio,
+  );
+  const initialContentHeightLimitPoints = Math.max(1, maxPageHeightPoints - ((marginTopIn + marginBottomIn) * PDF_POINTS_PER_INCH));
+  const initialPageCount = Math.max(1, Math.ceil((totalContentHeightPoints - 1e-9) / initialContentHeightLimitPoints));
   const templateValues = buildPdfTemplateReplacements(pdfContext || {});
 
   const metadata = {
@@ -2233,6 +2245,12 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
     totalContentHeightPoints,
     initialPageCount,
     maxPageDimensionPoints: PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS,
+    maxPageHeightPoints,
+    requestedPageHeightRatio,
+    useMaximumPageHeightRatio,
+    effectivePageHeightRatio,
+    maximumPageHeightRatio,
+    pageWidthPoints,
     pageWidthIn,
     contentWidthIn,
     marginTopIn,
@@ -2506,7 +2524,10 @@ window.addEventListener("unhandledrejection", (event) => {
       await settleLayout();
       const measured = measurePages();
       const fixedExtraPoints = (measured.maxFixedExtraPx / 96) * 72;
-      const maxContentHeightPoints = Math.max(1, meta.maxPageDimensionPoints - fixedExtraPoints);
+      if (fixedExtraPoints >= meta.maxPageHeightPoints - 1) {
+        throw new Error("The configured Captured PNG margins/header/footer leave no usable vertical space at the selected height-to-width ratio.");
+      }
+      const maxContentHeightPoints = Math.max(1, meta.maxPageHeightPoints - fixedExtraPoints);
       const requiredPageCount = Math.max(1, Math.ceil((meta.totalContentHeightPoints - 1e-9) / maxContentHeightPoints));
       if (requiredPageCount <= pageCount) break;
       pageCount = requiredPageCount;
@@ -2517,8 +2538,8 @@ window.addEventListener("unhandledrejection", (event) => {
     const measured = measurePages();
     const paperWidthIn = Math.max(0.01, measured.maxPageWidthPx / 96);
     const paperHeightIn = Math.max(0.01, measured.maxPageHeightPx / 96);
-    if ((paperWidthIn * 72) > meta.maxPageDimensionPoints + 0.5 || (paperHeightIn * 72) > meta.maxPageDimensionPoints + 0.5) {
-      throw new Error("The generated Captured PNG PDF page size exceeded WAVI's " + meta.maxPageDimensionPoints + "-point safety limit.");
+    if ((paperWidthIn * 72) > meta.maxPageDimensionPoints + 0.5 || (paperHeightIn * 72) > meta.maxPageHeightPoints + 0.5) {
+      throw new Error("The generated Captured PNG PDF page size exceeded WAVI's configured page-dimension limit.");
     }
 
     if (!window.__waviPdfProgress.total_images) {
@@ -2554,6 +2575,14 @@ window.addEventListener("unhandledrejection", (event) => {
       margin_application: "custom_html_content_only",
       header_footer_delivery: meta.displayHeaderFooter ? "inline_page_html" : "disabled",
       display_header_footer: Boolean(meta.displayHeaderFooter),
+      requested_page_height_ratio: meta.requestedPageHeightRatio,
+      use_maximum_page_height_ratio: Boolean(meta.useMaximumPageHeightRatio),
+      effective_page_height_ratio: meta.effectivePageHeightRatio,
+      maximum_page_height_ratio: meta.maximumPageHeightRatio,
+      page_height_ratio: meta.effectivePageHeightRatio,
+      page_width_points: meta.pageWidthPoints,
+      maximum_page_height_points: meta.maxPageHeightPoints,
+      hard_maximum_page_dimension_points: meta.maxPageDimensionPoints,
     };
     window.__waviPdfProgress.stage = "ready";
     window.__waviPdfReady = true;
@@ -2580,6 +2609,14 @@ window.addEventListener("unhandledrejection", (event) => {
       content_width_in: contentWidthIn,
       points_per_css_px: pointsPerCssPx,
       estimated_initial_page_count: initialPageCount,
+      requested_page_height_ratio: requestedPageHeightRatio,
+      use_maximum_page_height_ratio: useMaximumPageHeightRatio,
+      effective_page_height_ratio: effectivePageHeightRatio,
+      maximum_page_height_ratio: maximumPageHeightRatio,
+      page_height_ratio: effectivePageHeightRatio,
+      page_width_points: pageWidthPoints,
+      maximum_page_height_points: maxPageHeightPoints,
+      hard_maximum_page_dimension_points: PAGINATED_PNG_MAX_PAGE_DIMENSION_POINTS,
       configured_content_margin_top_in: marginTopIn,
       configured_content_margin_bottom_in: marginBottomIn,
       configured_content_margin_left_in: marginLeftIn,
@@ -3188,11 +3225,17 @@ async function captureFullPageImages(client, config, outputFolder, baseName, lay
   const height = Math.max(1, Math.ceil(Number(layout.height) || Number(config.viewport_height) || 900));
 
   try {
-    const hardMaximumDimension = Math.max(8000, Math.min(30000, Number(config.maximum_single_dimension || 30000)));
-    const maximumSingleHeight = Math.max(2000, Math.min(hardMaximumDimension, Number(config.maximum_single_height || 30000)));
+    const hardMaximumDimension = CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX;
+    const maximumSingleHeight = Math.max(2000, Math.min(
+      hardMaximumDimension,
+      Number(config.maximum_single_height || CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX),
+    ));
     const maximumSinglePixels = Math.max(20_000_000, Math.min(150_000_000, Number(config.maximum_single_pixels || 150_000_000)));
-    const shouldSegment = height > maximumSingleHeight || width > hardMaximumDimension || width * height > maximumSinglePixels;
-    let fallbackReason = shouldSegment ? "configured_limit" : "";
+    const rendererDimensionExceeded = height > hardMaximumDimension || width > hardMaximumDimension;
+    const shouldSegment = rendererDimensionExceeded || height > maximumSingleHeight || width * height > maximumSinglePixels;
+    let fallbackReason = shouldSegment
+      ? (rendererDimensionExceeded ? "renderer_dimension_safety_limit" : "configured_limit")
+      : "";
 
     if (!shouldSegment) {
       try {
@@ -3231,7 +3274,7 @@ async function captureFullPageImages(client, config, outputFolder, baseName, lay
             required_segments: 1,
             captured_segments: 1,
             maximum_segments: Math.max(1, Math.min(500, Number(config.maximum_segments || 100))),
-            segment_height: Math.max(1000, Math.min(16000, Number(config.segment_height || 12000))),
+            segment_height: Math.max(1000, Math.min(hardMaximumDimension, maximumSingleHeight, Number(config.segment_height || 12000))),
             segment_overlap: Math.max(0, Math.min(1000, Number(config.segment_overlap || 0))),
             limit_reached: false,
             captured_height_css_px: height,
@@ -3245,7 +3288,7 @@ async function captureFullPageImages(client, config, outputFolder, baseName, lay
       }
     }
 
-    const segmentHeight = Math.max(1000, Math.min(16000, Number(config.segment_height || 12000)));
+    const segmentHeight = Math.max(1000, Math.min(hardMaximumDimension, maximumSingleHeight, Number(config.segment_height || 12000)));
     const segmentOverlap = Math.max(0, Math.min(1000, Number(config.segment_overlap || 0), segmentHeight - 1));
     const segmentStep = Math.max(1, segmentHeight - segmentOverlap);
     const maximumSegments = Math.max(1, Math.min(500, Number(config.maximum_segments || 100)));
@@ -5778,6 +5821,8 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         prefer_css_page_size: Boolean(config.pdf_prefer_css_page_size),
         header_template: String(config.pdf_header_template || ""),
         footer_template: String(config.pdf_footer_template || ""),
+        png_page_height_ratio: Math.max(0.1, Math.min(40.0, Number(config.pdf_png_page_height_ratio) || 1.0)),
+        png_use_maximum_ratio: Boolean(config.pdf_png_use_maximum_ratio),
         capture_mode: pdfCaptureMode,
         page_behavior: normalizePdfPageBehavior(config.pdf_page_behavior),
         behavior_result: pdfBehaviorInfo,
