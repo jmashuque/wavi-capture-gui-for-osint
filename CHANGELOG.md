@@ -2,6 +2,14 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0917](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0917) - Firefox Browser Integration
+
+- Added the optional **WAVI Capture Helper** Firefox WebExtension for sending the active browser tab directly to WAVI as an Audio/Video, Gallery/Profile, or Webpage Capture job, with browser-submitted jobs entering the normal WAVI Job Queue as Pending.
+- Added **Tools > Browser Integration** with a disabled-by-default loopback API, configurable listener port and live status, plus pairing-token controls that verify the token when saved while independently authenticating every capture request.
+- Added persistent Firefox background handling so capture requests can continue when the extension popup closes, including final Job Queue result reporting and protection against duplicate concurrent submissions.
+- Finalized the Firefox extension identity and compatibility for its first Mozilla-signed release, including the permanent `wavi-capture-helper@localhost` ID, Firefox 142 minimum version, disabled Private Browsing support, and Firefox `browsingActivity` data-consent declaration.
+- Added Windows taskbar attention for WAVI-owned dialogs and prompts that require user action while another application is in the foreground, including browser-submitted capture conflicts.
+
 ## [v3.2026.0915](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0915) - PDF Capture Controls and Long-Page Reliability
 
 - Added **Insert Tag ▼** menus to the PDF header and footer HTML editors for inserting WAVI capture tags such as source URLs, page title, capture timestamps, and page numbers at the current cursor position.

@@ -10,8 +10,18 @@
 !README.md
 !CHANGELOG.md
 !LICENSE
+!PRIVACY.md
 !.gitattributes
 !.gitignore
+
+!firefox-extension/
+!firefox-extension/background.js
+!firefox-extension/manifest.json
+!firefox-extension/popup.css
+!firefox-extension/popup.html
+!firefox-extension/popup.js
+!firefox-extension/icons/
+!firefox-extension/icons/wavi.svg
 
 !screenshots/
 !screenshots/main1.png

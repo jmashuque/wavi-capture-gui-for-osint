@@ -23,6 +23,7 @@ import time
 import traceback
 import urllib.request
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit, urlunsplit
 from pathlib import Path, PurePosixPath
 from collections import deque
@@ -35,7 +36,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0915"
+APP_VERSION = "v3.2026.0917"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -57,8 +58,34 @@ OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_UPDATE_DIR_NAME = "gui-update"
 APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-SETTINGS_SCHEMA_VERSION = 47
+SETTINGS_SCHEMA_VERSION = 49
 WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382
+BROWSER_INTAKE_HOST = "127.0.0.1"
+BROWSER_INTAKE_DEFAULT_PORT = 17654
+BROWSER_INTAKE_MIN_PORT = 1024
+BROWSER_INTAKE_MAX_PORT = 65535
+BROWSER_INTAKE_QUEUE_PATH = "/api/v1/queue"
+BROWSER_INTAKE_AUTH_VERIFY_PATH = "/api/v1/auth/verify"
+BROWSER_INTAKE_MAX_REQUEST_BYTES = 16 * 1024
+BROWSER_INTAKE_MAX_URL_CHARS = 8192
+BROWSER_INTAKE_HANDOFF_QUEUE_MAX = 256
+BROWSER_INTAKE_SOCKET_TIMEOUT_SECONDS = 5.0
+BROWSER_INTAKE_JOB_RESULT_TIMEOUT_SECONDS = 120.0
+BROWSER_INTAKE_TOKEN_BYTES = 32
+BROWSER_INTAKE_MAX_AUTH_HEADER_CHARS = 512
+BROWSER_INTAKE_ALLOWED_JSON_FIELDS = frozenset({"url", "engine"})
+BROWSER_INTAKE_HANDOFF_POLL_MS = 100
+BROWSER_INTAKE_MAX_HANDOFFS_PER_POLL = 100
+BROWSER_INTAKE_ENGINE_LABELS = {
+    "av": "Audio/Video",
+    "gallery": "Gallery/Profile",
+    "webpage": "Webpage",
+}
+BROWSER_INTAKE_LOG_ENGINES = {
+    "av": "yt-dlp",
+    "gallery": "gallery-dl",
+    "webpage": "web-capture",
+}
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -458,6 +485,9 @@ APP_SETTINGS_DEFAULTS = {
     "window_state": "normal",
     "output_log_selected_engine": "Audio/Video",
     "output_log_follow_output": True,
+    "browser_intake_token": "",
+    "browser_intake_enabled": False,
+    "browser_intake_port": BROWSER_INTAKE_DEFAULT_PORT,
 }
 
 IMPERSONATE_NONE_LABEL = "None"
@@ -479,6 +509,9 @@ last_vpn_status = "unknown"
 adapter_display_map = {}
 vpn_adapter_menus = []
 settings_store = {}
+browser_intake_token = ""
+browser_intake_enabled = False
+browser_intake_port = BROWSER_INTAKE_DEFAULT_PORT
 profile_menu = None
 active_profile_name = DEFAULT_PROFILE_NAME
 settings_state_loading = True
@@ -544,6 +577,13 @@ APP_CLOSING = False
 SHUTDOWN_STARTED = False
 STARTUP_INTERRUPTED_PROMPT_SHOWN = False
 DEBUG_LOG_LOCK = threading.Lock()
+BROWSER_INTAKE_SERVER_LOCK = threading.Lock()
+browser_intake_server = None
+browser_intake_thread = None
+browser_intake_last_start_error = ""
+browser_intake_handoff_queue = queue.Queue(maxsize=BROWSER_INTAKE_HANDOFF_QUEUE_MAX)
+browser_intake_handoff_poller_running = False
+browser_intake_handoff_after_id = None
 THEME_SKIP_CHILDREN_ATTR = "_avi_capture_skip_theme_children"
 
 FRESH_STARTUP_MESSAGES = []
@@ -943,6 +983,946 @@ def log_debug_exception(context, exc=None):
     except Exception:
         # Debug logging must never become a new crash source.
         pass
+
+
+_WAVI_MESSAGEBOX_ATTENTION_INSTALLED = False
+
+
+def flash_wavi_taskbar():
+    """Request Windows taskbar attention for WAVI without stealing focus."""
+    if sys.platform != "win32":
+        return False
+
+    app_root = globals().get("root")
+    if app_root is None:
+        return False
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        app_root.update_idletasks()
+        hwnd = int(app_root.winfo_id())
+        if not hwnd:
+            return False
+
+        user32 = ctypes.windll.user32
+        ga_root = 2
+        outer_hwnd = user32.GetAncestor(wintypes.HWND(hwnd), ga_root)
+        if outer_hwnd:
+            hwnd = int(outer_hwnd)
+
+        foreground_hwnd = user32.GetForegroundWindow()
+        if foreground_hwnd:
+            foreground_pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(foreground_pid))
+            if int(foreground_pid.value) == os.getpid():
+                return False
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwnd", wintypes.HWND),
+                ("dwFlags", wintypes.DWORD),
+                ("uCount", wintypes.UINT),
+                ("dwTimeout", wintypes.DWORD),
+            ]
+
+        flashw_tray = 0x00000002
+        flashw_timernofg = 0x0000000C
+        info = FLASHWINFO(
+            ctypes.sizeof(FLASHWINFO),
+            wintypes.HWND(hwnd),
+            flashw_tray | flashw_timernofg,
+            0,
+            0,
+        )
+        return bool(user32.FlashWindowEx(ctypes.byref(info)))
+    except Exception as exc:
+        log_debug_exception("Could not request WAVI taskbar attention", exc)
+        return False
+
+
+def _wavi_toplevel_attention_on_map(event):
+    """Flash WAVI when one of its owned Tk windows appears while WAVI is backgrounded."""
+    try:
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, tk.Toplevel):
+            widget.after_idle(flash_wavi_taskbar)
+    except Exception as exc:
+        log_debug_exception("Could not handle WAVI popup attention event", exc)
+
+
+def install_wavi_window_attention_hooks(app_root):
+    """Install one central attention hook for Tk windows and native message boxes."""
+    global _WAVI_MESSAGEBOX_ATTENTION_INSTALLED
+
+    try:
+        app_root.bind_class("Toplevel", "<Map>", _wavi_toplevel_attention_on_map, add="+")
+    except Exception as exc:
+        log_debug_exception("Could not install WAVI Toplevel attention hook", exc)
+
+    if _WAVI_MESSAGEBOX_ATTENTION_INSTALLED:
+        return
+
+    messagebox_names = (
+        "showinfo",
+        "showwarning",
+        "showerror",
+        "askquestion",
+        "askokcancel",
+        "askyesno",
+        "askyesnocancel",
+        "askretrycancel",
+    )
+    for name in messagebox_names:
+        original = getattr(messagebox, name, None)
+        if not callable(original):
+            continue
+
+        def wrapped_messagebox(*args, _original=original, **kwargs):
+            flash_wavi_taskbar()
+            return _original(*args, **kwargs)
+
+        setattr(messagebox, name, wrapped_messagebox)
+
+    _WAVI_MESSAGEBOX_ATTENTION_INSTALLED = True
+
+
+def log_browser_intake_event(message):
+    """Write browser-intake diagnostics without touching Tkinter."""
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with DEBUG_LOG_LOCK:
+            with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"[{timestamp}] Browser intake: {str(message or '').strip()}\n")
+    except Exception:
+        pass
+
+
+def validate_browser_intake_url(value):
+    """Return a normalized HTTP(S) URL for the local browser intake API."""
+    url = str(value or "").strip()
+    if (
+        not url
+        or len(url) > BROWSER_INTAKE_MAX_URL_CHARS
+        or "\\" in url
+        or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url)
+    ):
+        return ""
+    try:
+        parsed = urlsplit(url)
+        if str(parsed.scheme or "").lower() not in {"http", "https"}:
+            return ""
+        if not parsed.hostname:
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        # Accessing .port validates malformed port text such as :abc or :99999.
+        _ = parsed.port
+    except Exception:
+        return ""
+    return url
+
+
+def browser_intake_json_object_no_duplicates(pairs):
+    """Build a JSON object while rejecting duplicate keys at any nesting level."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def normalize_browser_intake_token(value):
+    """Return a valid locally generated browser-intake token or an empty string."""
+    token = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+        return ""
+    return token
+
+
+def generate_browser_intake_token():
+    """Generate a cryptographically random URL-safe token for browser pairing."""
+    return secrets.token_urlsafe(BROWSER_INTAKE_TOKEN_BYTES)
+
+
+def normalize_browser_intake_port(value, default=None):
+    """Return a valid non-privileged TCP port or the supplied default."""
+    try:
+        port = int(str(value).strip())
+    except Exception:
+        return default
+    if port < BROWSER_INTAKE_MIN_PORT or port > BROWSER_INTAKE_MAX_PORT:
+        return default
+    return port
+
+
+def get_browser_intake_port():
+    return normalize_browser_intake_port(
+        globals().get("browser_intake_port", BROWSER_INTAKE_DEFAULT_PORT),
+        BROWSER_INTAKE_DEFAULT_PORT,
+    )
+
+
+def get_browser_intake_token():
+    return normalize_browser_intake_token(globals().get("browser_intake_token", ""))
+
+
+def ensure_browser_intake_token(persist=False):
+    """Ensure this WAVI instance has a valid browser pairing token."""
+    global browser_intake_token
+
+    token = get_browser_intake_token()
+    created = False
+    if not token:
+        token = generate_browser_intake_token()
+        browser_intake_token = token
+        created = True
+
+    try:
+        store = ensure_settings_store()
+        store = ensure_app_settings_store(store)
+        store["app_settings"]["browser_intake_token"] = token
+        store["version"] = SETTINGS_SCHEMA_VERSION
+    except Exception:
+        pass
+
+    if persist:
+        try:
+            save_app_settings(
+                show_popup=False,
+                changed_setting_label=(
+                    "Browser extension pairing token created" if created else None
+                ),
+            )
+        except Exception as exc:
+            log_debug_exception("Could not persist browser intake pairing token", exc)
+
+    return token
+
+
+def regenerate_browser_intake_token(persist=True):
+    """Replace the browser pairing token and invalidate the old extension token."""
+    global browser_intake_token
+
+    browser_intake_token = generate_browser_intake_token()
+    try:
+        store = ensure_settings_store()
+        store = ensure_app_settings_store(store)
+        store["app_settings"]["browser_intake_token"] = browser_intake_token
+        store["version"] = SETTINGS_SCHEMA_VERSION
+    except Exception:
+        pass
+
+    if persist:
+        save_app_settings(show_popup=False, changed_setting_label="Browser extension pairing token regenerated")
+    log_browser_intake_event("pairing token regenerated")
+    return browser_intake_token
+
+
+def browser_intake_authorization_valid(header_value):
+    """Validate a Bearer token without logging or exposing the supplied secret."""
+    raw = str(header_value or "")
+    if not raw or len(raw) > BROWSER_INTAKE_MAX_AUTH_HEADER_CHARS:
+        return False
+    scheme, separator, supplied = raw.partition(" ")
+    if not separator or scheme.lower() != "bearer":
+        return False
+    supplied = supplied.strip()
+    expected = get_browser_intake_token()
+    if not supplied or not expected:
+        return False
+    try:
+        return hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
+    except Exception:
+        return False
+
+
+class BrowserIntakeRequestHandler(BaseHTTPRequestHandler):
+    """Loopback browser API: validate requests and report final GUI-thread queue results."""
+
+    server_version = "WAVIBrowserIntake/1"
+    sys_version = ""
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.settimeout(BROWSER_INTAKE_SOCKET_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+    def log_message(self, _format, *_args):
+        # Avoid stderr/console noise; explicit events are written to gui-debug.log.
+        return
+
+    def _send_json(self, status_code, payload, extra_headers=None, send_body=True):
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.close_connection = True
+        try:
+            self.send_response(int(status_code))
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Connection", "close")
+            for name, value in dict(extra_headers or {}).items():
+                self.send_header(str(name), str(value))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
+        except (
+            BrokenPipeError,
+            ConnectionAbortedError,
+            ConnectionResetError,
+            TimeoutError,
+        ):
+            # The extension popup is ephemeral. If it closes while WAVI is
+            # waiting for a GUI-side dialog/job result, Firefox may abort the
+            # loopback connection before the response is written. The request
+            # has already been processed, so this is a normal client disconnect.
+            return
+        except OSError as exc:
+            # Windows can surface the same local-client disconnect through a
+            # generic OSError depending on where the socket closes. Suppress
+            # only the expected Winsock disconnect codes; preserve other I/O
+            # errors for diagnosis.
+            if getattr(exc, "winerror", None) in {10053, 10054}:
+                return
+            raise
+
+    def _reject(self, status_code, code, message, extra_headers=None, send_body=True):
+        log_browser_intake_event(f"rejected {code}: {message}")
+        self._send_json(
+            status_code,
+            {
+                "ok": False,
+                "api_version": 1,
+                "queued": False,
+                "error": str(code),
+                "message": str(message),
+            },
+            extra_headers=extra_headers,
+            send_body=send_body,
+        )
+
+    def _reject_method(self, send_body=True):
+        self._reject(
+            405,
+            "method_not_allowed",
+            "Use POST for the browser intake endpoint.",
+            extra_headers={"Allow": "POST"},
+            send_body=send_body,
+        )
+
+    def _known_path(self):
+        return self.path in {BROWSER_INTAKE_QUEUE_PATH, BROWSER_INTAKE_AUTH_VERIFY_PATH}
+
+    def do_GET(self):
+        if not self._known_path():
+            self._reject(404, "not_found", "Unknown browser intake endpoint.")
+            return
+        self._reject_method()
+
+    def do_HEAD(self):
+        if not self._known_path():
+            self._reject(404, "not_found", "Unknown browser intake endpoint.", send_body=False)
+            return
+        self._reject_method(send_body=False)
+
+    def do_OPTIONS(self):
+        # Deliberately do not provide a permissive CORS preflight response.
+        if not self._known_path():
+            self._reject(404, "not_found", "Unknown browser intake endpoint.")
+            return
+        self._reject_method()
+
+    do_PUT = do_GET
+    do_PATCH = do_GET
+    do_DELETE = do_GET
+
+    def do_POST(self):
+        if not self._known_path():
+            self._reject(404, "not_found", "Unknown browser intake endpoint.")
+            return
+
+        client_host = str(self.client_address[0] if self.client_address else "")
+        if client_host != BROWSER_INTAKE_HOST:
+            self._reject(403, "loopback_only", "Browser intake accepts loopback clients only.")
+            return
+
+        authorization = self.headers.get("Authorization")
+        if not authorization:
+            self._reject(
+                401,
+                "authentication_required",
+                "A WAVI browser-extension pairing token is required.",
+                extra_headers={"WWW-Authenticate": 'Bearer realm="WAVI browser intake"'},
+            )
+            return
+        if not browser_intake_authorization_valid(authorization):
+            self._reject(
+                401,
+                "authentication_failed",
+                "The WAVI browser-extension pairing token was rejected.",
+                extra_headers={"WWW-Authenticate": 'Bearer realm="WAVI browser intake"'},
+            )
+            return
+
+        if self.path == BROWSER_INTAKE_AUTH_VERIFY_PATH:
+            # Side-effect-free token validation used when Firefox saves/replaces
+            # its pairing token. Capture requests still authenticate separately.
+            # Keep this endpoint bodyless so it cannot grow into a second intake
+            # surface for browser-supplied data.
+            if self.headers.get("Transfer-Encoding"):
+                self._reject(400, "transfer_encoding_not_supported", "Transfer-Encoding is not supported.")
+                return
+            if self.headers.get("Content-Encoding"):
+                self._reject(415, "content_encoding_not_supported", "Content-Encoding is not supported.")
+                return
+            content_length_values = self.headers.get_all("Content-Length") or []
+            if len(content_length_values) > 1:
+                self._reject(400, "unexpected_body", "The token verification request must not contain a body.")
+                return
+            if content_length_values:
+                try:
+                    verify_content_length = int(str(content_length_values[0]).strip())
+                except Exception:
+                    self._reject(400, "unexpected_body", "The token verification request must not contain a body.")
+                    return
+                if verify_content_length != 0:
+                    self._reject(400, "unexpected_body", "The token verification request must not contain a body.")
+                    return
+            log_browser_intake_event("pairing token verified")
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "api_version": 1,
+                    "authenticated": True,
+                    "message": "Pairing token verified.",
+                },
+            )
+            return
+
+        if self.headers.get("Transfer-Encoding"):
+            self._reject(400, "transfer_encoding_not_supported", "Transfer-Encoding is not supported.")
+            return
+        if self.headers.get("Content-Encoding"):
+            self._reject(415, "content_encoding_not_supported", "Content-Encoding is not supported.")
+            return
+
+        content_type = str(self.headers.get_content_type() or "").lower()
+        charset = str(self.headers.get_content_charset() or "").lower()
+        if content_type != "application/json" or charset not in {"", "utf-8", "utf8"}:
+            self._reject(415, "unsupported_media_type", "Content-Type must be application/json using UTF-8.")
+            return
+
+        content_length_values = self.headers.get_all("Content-Length") or []
+        if len(content_length_values) != 1:
+            self._reject(411, "content_length_required", "Exactly one valid Content-Length header is required.")
+            return
+        content_length_text = str(content_length_values[0]).strip()
+        try:
+            content_length = int(content_length_text)
+        except Exception:
+            self._reject(411, "content_length_required", "A valid Content-Length header is required.")
+            return
+
+        if content_length <= 0:
+            self._reject(400, "empty_body", "The request body must contain JSON.")
+            return
+        if content_length > BROWSER_INTAKE_MAX_REQUEST_BYTES:
+            self._reject(413, "request_too_large", "The browser intake request is too large.")
+            return
+
+        try:
+            raw_body = self.rfile.read(content_length)
+            if len(raw_body) != content_length:
+                self._reject(400, "incomplete_body", "The request body was incomplete.")
+                return
+            payload = json.loads(
+                raw_body.decode("utf-8"),
+                object_pairs_hook=browser_intake_json_object_no_duplicates,
+            )
+        except UnicodeDecodeError:
+            self._reject(400, "invalid_encoding", "The request body must be UTF-8 JSON.")
+            return
+        except json.JSONDecodeError:
+            self._reject(400, "invalid_json", "The request body is not valid JSON.")
+            return
+        except ValueError as exc:
+            self._reject(400, "duplicate_json_key", str(exc))
+            return
+        except (TimeoutError, OSError):
+            self._reject(408, "request_timeout", "The browser intake request timed out.")
+            return
+        except Exception as exc:
+            log_debug_exception("Browser intake request body could not be read", exc)
+            self._reject(400, "invalid_request", "The request body could not be read.")
+            return
+
+        if not isinstance(payload, dict):
+            self._reject(400, "invalid_payload", "The JSON request must be an object.")
+            return
+
+        payload_fields = set(payload)
+        if payload_fields != BROWSER_INTAKE_ALLOWED_JSON_FIELDS:
+            missing = sorted(BROWSER_INTAKE_ALLOWED_JSON_FIELDS - payload_fields)
+            extra = sorted(payload_fields - BROWSER_INTAKE_ALLOWED_JSON_FIELDS)
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if extra:
+                details.append("unexpected: " + ", ".join(extra))
+            suffix = f" ({'; '.join(details)})" if details else ""
+            self._reject(400, "invalid_fields", "JSON must contain exactly 'url' and 'engine'." + suffix)
+            return
+
+        if not isinstance(payload.get("engine"), str):
+            self._reject(400, "invalid_engine", "Engine must be a string: av, gallery, or webpage.")
+            return
+        engine = payload["engine"].strip().lower()
+        if engine not in BROWSER_INTAKE_ENGINE_LABELS:
+            self._reject(
+                400,
+                "invalid_engine",
+                "Engine must be one of: av, gallery, webpage.",
+            )
+            return
+
+        if not isinstance(payload.get("url"), str):
+            self._reject(400, "invalid_url", "URL must be a string containing a valid http:// or https:// URL.")
+            return
+        url = validate_browser_intake_url(payload["url"])
+        if not url:
+            self._reject(400, "invalid_url", "URL must be a valid http:// or https:// URL without credentials or whitespace.")
+            return
+
+        label = BROWSER_INTAKE_ENGINE_LABELS[engine]
+        completion_event = threading.Event()
+        result_holder = {}
+        handoff = {
+            "engine": engine,
+            "engine_label": label,
+            "url": url,
+            "received_at_utc": datetime.now(timezone.utc).isoformat(),
+            "_completion_event": completion_event,
+            "_result_holder": result_holder,
+        }
+        try:
+            browser_intake_handoff_queue.put_nowait(handoff)
+        except queue.Full:
+            self._reject(503, "handoff_queue_full", "WAVI's browser intake queue is temporarily full.")
+            return
+        except Exception as exc:
+            log_debug_exception("Browser intake request could not be queued for GUI handoff", exc)
+            self._reject(503, "handoff_unavailable", "WAVI could not hand the request to the GUI thread.")
+            return
+
+        log_browser_intake_event(f"validated and queued for GUI handoff engine={engine} url={url}")
+
+        if not completion_event.wait(BROWSER_INTAKE_JOB_RESULT_TIMEOUT_SECONDS):
+            log_browser_intake_event(f"GUI handoff result timed out engine={engine} url={url}")
+            self._send_json(
+                504,
+                {
+                    "ok": False,
+                    "api_version": 1,
+                    "queued": False,
+                    "error": "gui_handoff_timeout",
+                    "engine": engine,
+                    "engine_label": label,
+                    "url": url,
+                    "message": (
+                        "WAVI did not finish creating the queued job in time. "
+                        "Check the WAVI window and Job Queue before retrying."
+                    ),
+                },
+            )
+            return
+
+        result = dict(result_holder)
+        if not result:
+            self._reject(500, "missing_gui_result", "WAVI did not return a Job Queue result.")
+            return
+
+        status_code = int(result.pop("_http_status", 200 if result.get("ok") else 422))
+        self._send_json(status_code, result)
+
+
+class BrowserIntakeHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def start_browser_intake_server():
+    """Start the configured loopback listener when browser integration is enabled."""
+    global browser_intake_server, browser_intake_thread, browser_intake_last_start_error
+
+    if not bool(globals().get("browser_intake_enabled", False)):
+        browser_intake_last_start_error = "Browser integration API is disabled."
+        return False
+
+    port = get_browser_intake_port()
+    with BROWSER_INTAKE_SERVER_LOCK:
+        if browser_intake_server is not None:
+            try:
+                active_port = int(browser_intake_server.server_address[1])
+            except Exception:
+                active_port = None
+            if active_port == port:
+                return True
+            browser_intake_last_start_error = (
+                f"Browser integration is already listening on port {active_port}."
+            )
+            return False
+
+        browser_intake_last_start_error = ""
+        try:
+            server = BrowserIntakeHTTPServer(
+                (BROWSER_INTAKE_HOST, port),
+                BrowserIntakeRequestHandler,
+            )
+        except OSError as exc:
+            browser_intake_last_start_error = str(exc)
+            log_browser_intake_event(
+                f"listener unavailable on {BROWSER_INTAKE_HOST}:{port}: {exc}"
+            )
+            return False
+        except Exception as exc:
+            browser_intake_last_start_error = str(exc)
+            log_debug_exception("Could not create browser intake listener", exc)
+            return False
+
+        browser_intake_server = server
+
+        def serve():
+            try:
+                log_browser_intake_event(
+                    f"listener started on http://{BROWSER_INTAKE_HOST}:{port}{BROWSER_INTAKE_QUEUE_PATH}"
+                )
+                server.serve_forever(poll_interval=0.2)
+            except Exception as exc:
+                if not APP_CLOSING:
+                    log_debug_exception("Browser intake listener failed", exc)
+            finally:
+                log_browser_intake_event("listener thread stopped")
+
+        thread = threading.Thread(target=serve, name="browser-intake-listener", daemon=True)
+        browser_intake_thread = thread
+        thread.start()
+        return True
+
+
+def stop_browser_intake_server():
+    """Stop the loopback listener during normal WAVI shutdown."""
+    global browser_intake_server, browser_intake_thread
+
+    with BROWSER_INTAKE_SERVER_LOCK:
+        server = browser_intake_server
+        thread = browser_intake_thread
+        browser_intake_server = None
+        browser_intake_thread = None
+
+    if server is None:
+        return
+
+    try:
+        server.shutdown()
+    except Exception as exc:
+        log_debug_exception("Could not shut down browser intake listener", exc)
+    try:
+        server.server_close()
+    except Exception as exc:
+        log_debug_exception("Could not close browser intake listener", exc)
+    try:
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+    except Exception as exc:
+        log_debug_exception("Could not join browser intake listener thread", exc)
+    log_browser_intake_event("listener stopped")
+
+
+def get_browser_intake_listener_status():
+    """Return a concise status string for the Browser Integration dialog."""
+    server = browser_intake_server
+    if not bool(globals().get("browser_intake_enabled", False)):
+        return "Disabled"
+    if server is not None:
+        try:
+            port = int(server.server_address[1])
+        except Exception:
+            port = get_browser_intake_port()
+        return f"Listening on {BROWSER_INTAKE_HOST}:{port}"
+    if browser_intake_last_start_error:
+        return f"Unavailable: {browser_intake_last_start_error}"
+    return f"Not listening on {BROWSER_INTAKE_HOST}:{get_browser_intake_port()}"
+
+
+def sync_browser_intake_server_to_settings():
+    """Make the live listener match the currently loaded app-level settings."""
+    if APP_CLOSING:
+        return False
+
+    if not bool(globals().get("browser_intake_enabled", False)):
+        stop_browser_intake_server()
+        return True
+
+    desired_port = get_browser_intake_port()
+    server = browser_intake_server
+    if server is not None:
+        try:
+            active_port = int(server.server_address[1])
+        except Exception:
+            active_port = None
+        if active_port == desired_port:
+            return True
+        stop_browser_intake_server()
+
+    return start_browser_intake_server()
+
+
+def configure_browser_intake_listener(enabled, port, persist=True):
+    """Apply browser-integration listener settings and roll back a failed rebind."""
+    global browser_intake_enabled, browser_intake_port
+
+    normalized_port = normalize_browser_intake_port(port)
+    if normalized_port is None:
+        return False, f"Listener port must be between {BROWSER_INTAKE_MIN_PORT} and {BROWSER_INTAKE_MAX_PORT}."
+
+    desired_enabled = bool(enabled)
+    previous_enabled = bool(browser_intake_enabled)
+    previous_port = get_browser_intake_port()
+    previous_running = browser_intake_server is not None
+
+    if not desired_enabled:
+        stop_browser_intake_server()
+        browser_intake_enabled = False
+        browser_intake_port = normalized_port
+    else:
+        needs_rebind = False
+        if browser_intake_server is not None:
+            try:
+                needs_rebind = int(browser_intake_server.server_address[1]) != normalized_port
+            except Exception:
+                needs_rebind = True
+        if needs_rebind:
+            stop_browser_intake_server()
+
+        browser_intake_enabled = True
+        browser_intake_port = normalized_port
+        if not start_browser_intake_server():
+            failure = browser_intake_last_start_error or "The listener could not be started."
+            stop_browser_intake_server()
+            browser_intake_enabled = previous_enabled
+            browser_intake_port = previous_port
+            if previous_enabled and previous_running:
+                start_browser_intake_server()
+            return False, failure
+
+    if persist:
+        label = (
+            f"Browser integration API {'enabled' if browser_intake_enabled else 'disabled'}; "
+            f"listener port {get_browser_intake_port()}"
+        )
+        if not save_app_settings(show_popup=False, changed_setting_label=label):
+            return False, "Listener settings changed for this session, but WAVI could not save them."
+
+    return True, get_browser_intake_listener_status()
+
+
+def add_browser_intake_url_to_job_queue(engine, url):
+    """Add one browser-intake URL through the existing queue pathway for the requested engine."""
+    engine = str(engine or "").strip().lower()
+    url = validate_browser_intake_url(url)
+    if engine not in BROWSER_INTAKE_ENGINE_LABELS or not url:
+        return False
+
+    if engine == "av":
+        validate_inputs(urls_override=[url])
+        return bool(add_urls_to_queue_as_job([url]))
+    if engine == "gallery":
+        return bool(add_image_urls_to_queue_as_job([url]))
+    if engine == "webpage":
+        return bool(add_web_urls_to_queue_as_job([url]))
+    return False
+
+
+def complete_browser_intake_handoff(handoff, result):
+    """Publish one GUI-thread browser-intake result back to the waiting HTTP worker."""
+    if not isinstance(handoff, dict):
+        return
+    holder = handoff.get("_result_holder")
+    if isinstance(holder, dict):
+        holder.clear()
+        holder.update(dict(result or {}))
+    event = handoff.get("_completion_event")
+    if isinstance(event, threading.Event):
+        event.set()
+
+
+def browser_intake_failure_result(engine, url, code, message, http_status=422):
+    """Build a consistent final failure response for a GUI-thread intake request."""
+    label = BROWSER_INTAKE_ENGINE_LABELS.get(engine, "")
+    return {
+        "ok": False,
+        "api_version": 1,
+        "queued": False,
+        "error": str(code),
+        "engine": str(engine or ""),
+        "engine_label": label,
+        "url": str(url or ""),
+        "message": str(message),
+        "_http_status": int(http_status),
+    }
+
+
+def process_browser_intake_handoff(handoff):
+    """Process one validated browser request on Tk's main thread and return its final queue result."""
+    if threading.current_thread() is not threading.main_thread():
+        log_browser_intake_event("GUI handoff rejected because processing was not on the main thread")
+        return browser_intake_failure_result(
+            "", "", "gui_thread_required", "WAVI could not process the request on the GUI thread.", 503
+        )
+
+    if not isinstance(handoff, dict):
+        log_browser_intake_event("GUI handoff rejected because the payload was not an object")
+        return browser_intake_failure_result(
+            "", "", "invalid_gui_handoff", "WAVI received an invalid GUI handoff.", 500
+        )
+
+    engine = str(handoff.get("engine", "") or "").strip().lower()
+    url = validate_browser_intake_url(handoff.get("url"))
+    if engine not in BROWSER_INTAKE_ENGINE_LABELS or not url:
+        log_browser_intake_event("GUI handoff rejected because validated request data was no longer valid")
+        return browser_intake_failure_result(
+            engine, url, "invalid_gui_handoff", "WAVI could not validate the handed-off request.", 422
+        )
+
+    label = BROWSER_INTAKE_ENGINE_LABELS[engine]
+    log_engine = BROWSER_INTAKE_LOG_ENGINES.get(engine, "yt-dlp")
+    try:
+        added = add_browser_intake_url_to_job_queue(engine, url)
+    except Exception as exc:
+        log_debug_exception("Browser intake Job Queue creation failed", exc)
+        append_log_for_engine(log_engine, f"\nBrowser intake failed: {label}\n{url}\n{exc}\n")
+        log_browser_intake_event(f"GUI handoff queue creation failed engine={engine} url={url}: {exc}")
+        return browser_intake_failure_result(
+            engine,
+            url,
+            "job_creation_error",
+            f"WAVI could not create the {label} job: {exc}",
+            422,
+        )
+
+    if not added:
+        log_browser_intake_event(f"GUI handoff did not create a queue job engine={engine} url={url}")
+        return browser_intake_failure_result(
+            engine,
+            url,
+            "job_creation_failed",
+            f"WAVI did not create the {label} job. Check the WAVI window for details.",
+            422,
+        )
+
+    job_id = ""
+    try:
+        if job_queue:
+            job_id = str(job_queue[-1].get("job_id", "") or "")
+    except Exception:
+        job_id = ""
+
+    append_log_for_engine(
+        log_engine,
+        f"Browser intake queued: {label}\n{url}" + (f"\nJob ID: {job_id}" if job_id else "") + "\n",
+    )
+    log_browser_intake_event(
+        f"GUI handoff created pending queue job engine={engine} url={url}"
+        + (f" job_id={job_id}" if job_id else "")
+    )
+    return {
+        "ok": True,
+        "api_version": 1,
+        "queued": True,
+        "status": "pending",
+        "engine": engine,
+        "engine_label": label,
+        "url": url,
+        "job_id": job_id,
+        "message": "Queued in WAVI.",
+    }
+
+
+def poll_browser_intake_handoffs():
+    """Drain validated browser requests from the worker queue on Tk's main thread."""
+    global browser_intake_handoff_after_id
+
+    browser_intake_handoff_after_id = None
+    if APP_CLOSING or not browser_intake_handoff_poller_running:
+        return
+
+    processed = 0
+    while processed < BROWSER_INTAKE_MAX_HANDOFFS_PER_POLL:
+        try:
+            handoff = browser_intake_handoff_queue.get_nowait()
+        except queue.Empty:
+            break
+        except Exception as exc:
+            log_debug_exception("Browser intake GUI handoff queue could not be read", exc)
+            break
+
+        result = None
+        try:
+            result = process_browser_intake_handoff(handoff)
+        except Exception as exc:
+            log_debug_exception("Browser intake GUI handoff processing failed", exc)
+            engine = str(handoff.get("engine", "") or "").strip().lower() if isinstance(handoff, dict) else ""
+            url = validate_browser_intake_url(handoff.get("url")) if isinstance(handoff, dict) else ""
+            result = browser_intake_failure_result(
+                engine, url, "gui_handoff_error", "WAVI could not finish processing the browser request.", 500
+            )
+        finally:
+            try:
+                complete_browser_intake_handoff(handoff, result)
+            except Exception as exc:
+                log_debug_exception("Browser intake GUI result publication failed", exc)
+            try:
+                browser_intake_handoff_queue.task_done()
+            except Exception:
+                pass
+        processed += 1
+
+    delay_ms = 0 if not browser_intake_handoff_queue.empty() else BROWSER_INTAKE_HANDOFF_POLL_MS
+    browser_intake_handoff_after_id = safe_after(delay_ms, poll_browser_intake_handoffs)
+
+
+def start_browser_intake_handoff_poller():
+    """Start the Tk-side browser intake poller from the GUI thread."""
+    global browser_intake_handoff_poller_running, browser_intake_handoff_after_id
+
+    if browser_intake_handoff_poller_running or APP_CLOSING:
+        return
+    browser_intake_handoff_poller_running = True
+    browser_intake_handoff_after_id = safe_after(0, poll_browser_intake_handoffs)
+    log_browser_intake_event("GUI handoff poller started")
+
+
+def stop_browser_intake_handoff_poller():
+    """Stop the Tk-side browser intake poller during WAVI shutdown."""
+    global browser_intake_handoff_poller_running, browser_intake_handoff_after_id
+
+    browser_intake_handoff_poller_running = False
+    after_id = browser_intake_handoff_after_id
+    browser_intake_handoff_after_id = None
+    if after_id is not None:
+        try:
+            root.after_cancel(after_id)
+        except Exception:
+            pass
+    log_browser_intake_event("GUI handoff poller stopped")
 
 
 def web_capture_temp_profile_appears_active(profile_root):
@@ -5701,7 +6681,7 @@ def decrypt_cookies_dialog():
     dialog.geometry(f"+{x}+{y}")
 
 
-def validate_inputs():
+def validate_inputs(urls_override=None):
     script_path = script_path_var.get().strip()
     yt_dlp_path = yt_dlp_path_var.get().strip()
     input_file_paths = parse_input_file_paths()
@@ -5709,7 +6689,14 @@ def validate_inputs():
     output_root = output_root_var.get().strip()
     ffmpeg_folder = ffmpeg_folder_var.get().strip()
 
-    pasted_urls = urls_text.get("1.0", "end").strip()
+    if urls_override is None:
+        pasted_urls = urls_text.get("1.0", "end").strip()
+    else:
+        pasted_urls = "\n".join(
+            cleaned
+            for cleaned in (clean_extracted_url(url) for url in (urls_override or []))
+            if cleaned
+        ).strip()
 
     if not script_path or not os.path.isfile(script_path):
         raise ValueError("PowerShell script path is missing or invalid.")
@@ -7726,13 +8713,28 @@ def get_app_settings_dict():
         "window_state": get_current_window_state(),
         "output_log_selected_engine": normalize_output_log_view(output_log_selected_engine),
         "output_log_follow_output": bool(output_log_follow_output),
+        "browser_intake_token": get_browser_intake_token(),
+        "browser_intake_enabled": bool(browser_intake_enabled),
+        "browser_intake_port": get_browser_intake_port(),
     }
     settings.update(get_proxy_settings_dict(include_sensitive=False))
     return settings
 
 
 def apply_app_settings_dict(settings):
+    global browser_intake_token, browser_intake_enabled, browser_intake_port
+
     settings = settings if isinstance(settings, dict) else {}
+    browser_intake_token = normalize_browser_intake_token(
+        settings.get("browser_intake_token", APP_SETTINGS_DEFAULTS["browser_intake_token"])
+    )
+    browser_intake_enabled = bool(
+        settings.get("browser_intake_enabled", APP_SETTINGS_DEFAULTS["browser_intake_enabled"])
+    )
+    browser_intake_port = normalize_browser_intake_port(
+        settings.get("browser_intake_port", APP_SETTINGS_DEFAULTS["browser_intake_port"]),
+        BROWSER_INTAKE_DEFAULT_PORT,
+    )
     delete_cookies_on_exit_var.set(
         bool(settings.get("delete_cookies_on_exit", APP_SETTINGS_DEFAULTS["delete_cookies_on_exit"]))
     )
@@ -7823,6 +8825,12 @@ def apply_app_settings_dict(settings):
 
     update_vpn_section_visibility()
 
+    if not settings_state_loading:
+        try:
+            sync_browser_intake_server_to_settings()
+        except Exception as exc:
+            log_debug_exception("Could not synchronize browser integration listener after loading settings", exc)
+
 
 def get_universal_archive_status(engine, settings=None):
     """Return a consistent app-level universal archive status for capture logs and summaries."""
@@ -7878,6 +8886,8 @@ def get_app_settings_summary_lines():
         format_universal_archive_status_line("gallery-dl"),
         format_universal_archive_status_line("web-capture"),
         f"Proxy: {get_proxy_status_summary()}",
+        f"Browser integration API: {'enabled' if browser_intake_enabled else 'disabled'}",
+        f"Browser integration listener port: {get_browser_intake_port()}",
     ]
 
 
@@ -10243,6 +11253,7 @@ def load_settings(show_popup=True, startup=False, path=None):
         active_profile_name = DEFAULT_PROFILE_NAME
         selected_profile_var.set(DEFAULT_PROFILE_NAME)
         apply_app_settings_dict(settings_store["app_settings"])
+        ensure_browser_intake_token(persist=False)
         append_log(f"Settings file not found. Using defaults.\nExpected path: {settings_path}\n")
         log_app_settings_status()
         log_domain_presets_status("Loaded domain presets")
@@ -10255,6 +11266,7 @@ def load_settings(show_popup=True, startup=False, path=None):
 
         settings_store = normalize_settings_store(raw)
         apply_app_settings_dict(settings_store.get("app_settings", {}))
+        ensure_browser_intake_token(persist=False)
 
         requested_profile = str(
             settings_store.get("app_settings", {}).get("active_profile", DEFAULT_PROFILE_NAME) or ""
@@ -10307,6 +11319,7 @@ def load_settings(show_popup=True, startup=False, path=None):
         active_profile_name = DEFAULT_PROFILE_NAME
         selected_profile_var.set(DEFAULT_PROFILE_NAME)
         apply_app_settings_dict(settings_store["app_settings"])
+        ensure_browser_intake_token(persist=False)
         append_log(f"Settings file was found but could not be loaded. Using defaults.\nError: {e}\n")
         log_app_settings_status()
 
@@ -10489,6 +11502,7 @@ def delete_settings_file():
 
         apply_settings_dict(make_default_profile_settings())
         apply_app_settings_dict(APP_SETTINGS_DEFAULTS.copy())
+        ensure_browser_intake_token(persist=False)
         clear_url_text_widget(urls_text, reset_history=True)
         target_status_var.set("Impersonate targets: Not checked")
         preflight_done_var.set(False)
@@ -10532,7 +11546,9 @@ def reset_defaults():
     selected_profile_var.set(DEFAULT_PROFILE_NAME)
     update_window_title()
 
-    apply_app_settings_dict(APP_SETTINGS_DEFAULTS.copy())
+    reset_app_settings = APP_SETTINGS_DEFAULTS.copy()
+    reset_app_settings["browser_intake_token"] = ensure_browser_intake_token(persist=False)
+    apply_app_settings_dict(reset_app_settings)
     store["profiles"][DEFAULT_PROFILE_NAME] = get_settings_dict()
     store["app_settings"] = get_app_settings_dict()
     save_settings(show_popup=False)
@@ -23001,6 +24017,16 @@ def on_close():
     APP_CLOSING = True
 
     try:
+        stop_browser_intake_handoff_poller()
+    except Exception as e:
+        log_debug_exception("Browser intake handoff poller shutdown failed", e)
+
+    try:
+        stop_browser_intake_server()
+    except Exception as e:
+        log_debug_exception("Browser intake shutdown handling failed", e)
+
+    try:
         disable_start_controls_for_shutdown()
         root.configure(cursor="watch")
         root.update_idletasks()
@@ -25928,6 +26954,7 @@ def apply_screen_aware_startup_geometry():
 
 
 root = tk.Tk()
+install_wavi_window_attention_hooks(root)
 try:
     ORIGINAL_TTK_THEME = ttk.Style(root).theme_use()
 except Exception:
@@ -26521,6 +27548,142 @@ def refresh_context_capture_menu(_event=None):
     add_context_capture_menu_after_file()
 
 
+def open_browser_integration_dialog():
+    """Configure the local browser-integration API and Firefox pairing token."""
+    token = ensure_browser_intake_token(persist=True)
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Browser Integration")
+    dialog.transient(root)
+    dialog.resizable(False, False)
+
+    frame = ttk.Frame(dialog, padding=14)
+    frame.pack(fill="both", expand=True)
+    frame.columnconfigure(1, weight=1)
+
+    ttk.Label(
+        frame,
+        text=(
+            "Browser integration lets the Firefox extension send the active tab to a specific WAVI capture engine. "
+            "The API listens only on 127.0.0.1 and is disabled by default."
+        ),
+        wraplength=580,
+        justify="left",
+    ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+    enabled_var = tk.BooleanVar(value=bool(browser_intake_enabled))
+    port_var = tk.StringVar(value=str(get_browser_intake_port()))
+    listener_status_var = tk.StringVar(value=get_browser_intake_listener_status())
+    action_status_var = tk.StringVar(value="")
+
+    ttk.Checkbutton(
+        frame,
+        text="Enable browser integration API",
+        variable=enabled_var,
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+    ttk.Label(frame, text="Listener port:").grid(row=2, column=0, sticky="w")
+    port_entry = ttk.Entry(frame, textvariable=port_var, width=10)
+    port_entry.grid(row=2, column=1, sticky="w", padx=(8, 0))
+    ttk.Label(
+        frame,
+        text=f"{BROWSER_INTAKE_MIN_PORT}–{BROWSER_INTAKE_MAX_PORT}; Firefox must use the same port",
+    ).grid(row=2, column=2, sticky="w", padx=(10, 0))
+
+    ttk.Label(frame, text="Listener status:").grid(row=3, column=0, sticky="nw", pady=(8, 0))
+    ttk.Label(frame, textvariable=listener_status_var, wraplength=450, justify="left").grid(
+        row=3, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(8, 0)
+    )
+
+    def apply_listener_settings():
+        ok, message = configure_browser_intake_listener(
+            enabled_var.get(),
+            port_var.get(),
+            persist=True,
+        )
+        if not ok:
+            enabled_var.set(bool(browser_intake_enabled))
+            port_var.set(str(get_browser_intake_port()))
+            listener_status_var.set(get_browser_intake_listener_status())
+            action_status_var.set(f"Could not apply listener settings: {message}")
+            return False
+        listener_status_var.set(get_browser_intake_listener_status())
+        action_status_var.set(
+            "Browser integration settings saved. "
+            + ("The local API is ready." if browser_intake_enabled else "The local API is disabled.")
+        )
+        return True
+
+    ttk.Button(frame, text="Apply Listener Settings", command=apply_listener_settings).grid(
+        row=4, column=0, columnspan=3, sticky="w", pady=(10, 14)
+    )
+
+    separator = ttk.Separator(frame, orient="horizontal")
+    separator.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+    ttk.Label(frame, text="Firefox pairing token:").grid(row=6, column=0, columnspan=3, sticky="w")
+    ttk.Label(
+        frame,
+        text=(
+            "Copy this token into the WAVI Capture Firefox extension. Treat it as a local secret. "
+            "The extension verifies the token when it is saved, and WAVI verifies it again for every capture request."
+        ),
+        wraplength=580,
+        justify="left",
+    ).grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 8))
+
+    token_var = tk.StringVar(value=token)
+    token_entry = ttk.Entry(frame, textvariable=token_var, width=64, state="readonly")
+    token_entry.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+
+    def copy_token():
+        value = token_var.get().strip()
+        if not value:
+            return
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(value)
+            root.update_idletasks()
+            action_status_var.set("Token copied to the clipboard.")
+        except Exception as exc:
+            action_status_var.set(f"Could not copy token: {exc}")
+
+    def regenerate_token():
+        if not messagebox.askyesno(
+            "Regenerate pairing token",
+            "Regenerate the browser-integration pairing token?\n\n"
+            "The token currently saved in Firefox will stop working until you replace it with the new token.",
+            parent=dialog,
+        ):
+            return
+        new_token = regenerate_browser_intake_token(persist=True)
+        token_var.set(new_token)
+        action_status_var.set("New token generated. Copy it into the Firefox extension.")
+
+    button_frame = ttk.Frame(frame)
+    button_frame.grid(row=9, column=0, columnspan=3, sticky="ew")
+    ttk.Button(button_frame, text="Copy Token", command=copy_token).pack(side="left")
+    ttk.Button(button_frame, text="Regenerate Token", command=regenerate_token).pack(side="left", padx=(8, 0))
+    ttk.Button(button_frame, text="Close", command=dialog.destroy).pack(side="right")
+
+    ttk.Label(frame, textvariable=action_status_var, wraplength=580, justify="left").grid(
+        row=10, column=0, columnspan=3, sticky="ew", pady=(10, 0)
+    )
+
+    port_entry.bind("<Return>", lambda _event: apply_listener_settings())
+
+    try:
+        configure_tk_widget_theme(dialog, get_theme_colors())
+    except Exception:
+        pass
+
+    try:
+        dialog.grab_set()
+        port_entry.focus_set()
+    except Exception:
+        pass
+
+
 # Menu bar keeps less-used actions out of the main workflow.
 menu_bar = tk.Menu(root)
 root.config(menu=menu_bar)
@@ -26542,6 +27705,8 @@ menu_bar.add_cascade(label="Tools", menu=tools_menu)
 tools_menu.add_command(label="Proxy Options", command=open_proxy_options_dialog)
 tools_menu.add_command(label="Update Deno", command=update_deno_direct)
 tools_menu.add_command(label="Domain Presets", command=open_domain_presets_window)
+tools_menu.add_separator()
+tools_menu.add_command(label="Browser Integration...", command=open_browser_integration_dialog)
 profile_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Profile", menu=profile_menu)
 
@@ -27468,10 +28633,14 @@ image_scope_custom_keywords_var.trace_add("write", on_image_scope_keywords_text_
 sync_image_scope_common_keyword_vars_from_selected()
 
 
-def validate_image_inputs():
+def validate_image_inputs(urls_override=None):
     script_path = image_script_path_var.get().strip()
     gallery_path = gallery_dl_path_var.get().strip()
-    urls = get_image_url_list()
+    urls = (
+        [cleaned for cleaned in (clean_extracted_url(url) for url in (urls_override or [])) if cleaned]
+        if urls_override is not None
+        else get_image_url_list()
+    )
     input_paths = parse_image_input_file_paths()
     cookies_file = image_cookies_file_var.get().strip()
     output_root = image_output_root_var.get().strip()
@@ -27681,7 +28850,7 @@ def run_image_preflight_check():
 
 def add_image_urls_to_queue_as_job(urls=None):
     try:
-        validate_image_inputs()
+        validate_image_inputs(urls_override=urls if urls is not None else None)
         clean_urls = []
         seen = set()
         for url in (urls if urls is not None else get_image_url_list()):
@@ -30925,6 +32094,7 @@ def deferred_job_queue_startup():
     refresh_job_queue_window()
 
 load_settings(show_popup=False, startup=True)
+ensure_browser_intake_token(persist=True)
 settings_state_loading = False
 root.bind("<Configure>", on_root_window_configure, add="+")
 initialize_url_box_from_persistence_and_input_files()
@@ -30937,6 +32107,11 @@ schedule_playlist_preview_autoload(delay_ms=500)
 apply_app_theme()
 install_global_scroll_recognition(root)
 update_window_title()
+start_browser_intake_handoff_poller()
+if browser_intake_enabled:
+    start_browser_intake_server()
+else:
+    log_browser_intake_event("listener disabled by app setting")
 if check_vpn_var.get():
     safe_after(300, refresh_network_adapters)
 else:

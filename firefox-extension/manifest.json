@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "WAVI Capture Helper",
+  "version": "0.1.0",
+  "description": "Send the active Firefox tab URL to a locally running WAVI Capture GUI for OSINT instance and choose the capture engine.",
+  "homepage_url": "https://github.com/jmashuque/wavi-capture-gui-for-osint",
+  "incognito": "not_allowed",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "action": {
+    "default_title": "Send to WAVI Capture",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "48": "icons/wavi.svg",
+      "96": "icons/wavi.svg"
+    }
+  },
+  "icons": {
+    "48": "icons/wavi.svg",
+    "96": "icons/wavi.svg"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "wavi-capture-helper@localhost",
+      "strict_min_version": "142.0",
+      "data_collection_permissions": {
+        "required": [
+          "browsingActivity"
+        ]
+      }
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  },
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  }
+}

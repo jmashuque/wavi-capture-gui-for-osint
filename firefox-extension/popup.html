@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en-CA">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WAVI Capture Helper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup-shell">
+    <header class="app-header">
+      <img class="app-icon" src="icons/wavi.svg" alt="">
+      <div class="app-heading">
+        <h1>WAVI Capture Helper</h1>
+        <div class="app-subtitle">Send the current Firefox tab to WAVI</div>
+      </div>
+    </header>
+
+    <section class="panel tab-panel" aria-labelledby="current-tab-label">
+      <div class="section-heading-row">
+        <div id="current-tab-label" class="section-label">Current tab</div>
+        <div id="tab-badge" class="mini-badge neutral">Reading…</div>
+      </div>
+      <div id="tab-host" class="tab-host">Reading current tab…</div>
+      <div id="current-url" class="url" title="">Reading current tab…</div>
+    </section>
+
+    <section class="pairing-section" aria-labelledby="pairing-label">
+      <div class="pairing-summary">
+        <div>
+          <div id="pairing-label" class="section-label">Browser integration</div>
+          <div class="pairing-state-row">
+            <span id="pairing-dot" class="state-dot neutral" aria-hidden="true"></span>
+            <span id="pairing-state">Checking saved token…</span>
+          </div>
+        </div>
+        <button id="manage-pairing" type="button" class="secondary-button compact-button">Manage</button>
+      </div>
+
+      <div id="pairing-editor" class="pairing-editor" hidden>
+        <label for="listener-port" class="field-label">Listener port</label>
+        <div class="pairing-row port-row">
+          <input id="listener-port" type="number" min="1024" max="65535" step="1" inputmode="numeric" autocomplete="off" value="17654">
+          <button id="save-port" type="button" class="secondary-button compact-button">Save port</button>
+        </div>
+
+        <label for="pairing-token" class="field-label token-field-label">Pairing token</label>
+        <div class="pairing-row">
+          <input id="pairing-token" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token from WAVI">
+          <button id="save-token" type="button" class="secondary-button compact-button">Save</button>
+        </div>
+        <div class="pairing-editor-actions">
+          <div class="pairing-help">WAVI: Tools → Browser Integration…</div>
+          <button id="forget-token" type="button" class="text-button">Forget token</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="send-section" aria-labelledby="send-label">
+      <div id="send-label" class="section-label send-label">Send to</div>
+      <div class="actions">
+        <button class="engine-button" type="button" data-engine="av" disabled>
+          <span class="engine-copy">
+            <span class="engine-title">Audio / Video</span>
+            <span class="engine-subtitle">yt-dlp capture</span>
+          </span>
+          <span class="engine-action" aria-hidden="true">Send</span>
+        </button>
+        <button class="engine-button" type="button" data-engine="gallery" disabled>
+          <span class="engine-copy">
+            <span class="engine-title">Gallery / Profile</span>
+            <span class="engine-subtitle">gallery-dl capture</span>
+          </span>
+          <span class="engine-action" aria-hidden="true">Send</span>
+        </button>
+        <button class="engine-button" type="button" data-engine="webpage" disabled>
+          <span class="engine-copy">
+            <span class="engine-title">Webpage Capture</span>
+            <span class="engine-subtitle">WAVI webpage engine</span>
+          </span>
+          <span class="engine-action" aria-hidden="true">Send</span>
+        </button>
+      </div>
+    </section>
+
+    <div id="status" class="status info" role="status" aria-live="polite">Loading…</div>
+
+    <footer class="popup-footer">
+      <span id="local-endpoint">Local connection: 127.0.0.1:17654</span>
+      <span id="extension-version"></span>
+    </footer>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

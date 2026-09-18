@@ -17,6 +17,7 @@ A portable Windows GUI for running webpage, audio, video, and gallery/profile ca
   - [Capture Audio or Video](#capture-audio-or-video)
   - [Capture a Gallery or Profile](#capture-a-gallery-or-profile)
   - [Capture a Webpage](#capture-a-webpage)
+  - [Send a Firefox Tab to WAVI](#send-a-firefox-tab-to-wavi)
   - [Use the Job Queue](#use-the-job-queue)
   - [Review Capture Output](#review-capture-output)
   - [Resume Failed or Interrupted Captures](#resume-failed-or-interrupted-captures)
@@ -28,6 +29,7 @@ A portable Windows GUI for running webpage, audio, video, and gallery/profile ca
   - [Audio/Video Capture](#audiovideo-capture)
   - [Gallery/Profile Capture](#galleryprofile-capture)
   - [Webpage Capture](#webpage-capture)
+  - [Browser Integration](#browser-integration)
   - [Job Queue, Persistence, and Recovery](#job-queue-persistence-and-recovery)
   - [Domain Presets, Proxy, VPN, and Archives](#domain-presets-proxy-vpn-and-archives)
   - [Update Checks](#update-checks)
@@ -92,6 +94,7 @@ The app helps users:
 - queue multiple jobs and recover failed or interrupted work when Job Persistence is enabled
 - preview audio/video metadata and thumbnails before capture
 - browse local case files and verify SHA-256 manifests
+- accept the active Firefox tab as a pending job for a user-selected capture engine through the local browser-integration API
 
 ## What the App Does Not Do
 
@@ -100,10 +103,11 @@ The app does not:
 - include or auto-install `yt-dlp`, `gallery-dl`, FFmpeg/FFprobe, Deno, Chromium browsers, Python, or PowerShell
 - bypass endpoint security, firewalls, website controls, access restrictions, login requirements, bot challenges, or rate limits
 - decide whether a capture is legal, approved, proportionate, or in scope
-- collect passwords, automate sign-ins, use the normal browser profile, extract browser cookies, solve interactive challenges, or perform unrestricted page interaction
+- collect passwords, automate sign-ins, use the normal browser profile for capture, automatically extract browser cookies during capture, solve interactive challenges, or perform unrestricted page interaction
 - guarantee that any source platform is supported
 - analyze evidence, identify people, assess authenticity, or determine evidentiary value
 - upload, sync, or retain cases outside the selected local output paths
+- transfer Firefox session cookies through the browser extension
 
 ## Warnings
 
@@ -144,6 +148,8 @@ Required files/tools:
 Keep `interactive-whitelist.txt` and `interactive-blacklist.txt` beside `gui.py`. They are read only when **Interactive Overlays** is enabled, but they should remain in every staged app folder so the feature is available and its default safety rules are not lost.
 
 `deno.exe` should be beside `yt-dlp.exe`. `gallery-dl.exe` can be beside the app or selected manually in the Gallery/Profile Capture tab. Webpage Capture uses the selected installed Chromium-family browser executable; the browser itself is not bundled. Webpage Capture keeps its temporary isolated browser workspace under the app-owned `gui-temp` folder and removes it after use.
+
+The optional **WAVI Capture Helper** browser extension requires Firefox 142 or later. Firefox is not required for normal WAVI capture workflows.
 
 Recommended source pages:
 
@@ -289,6 +295,35 @@ The default Webpage workflow creates a full-page PNG using a new isolated browse
 5. Start the capture and review the image, webpage capture record (`.webcapture.json`), run log, and SHA-256 manifest. Review any **Complete with warnings**, **Partial**, or **Failed** classification before treating the capture as complete. After a successful run, **Copy Case Summary** includes the classification totals along with the case paths, tools, and selected Webpage options.
 
 Webpage Capture does not dismiss consent banners, sign in, solve MFA/CAPTCHA challenges, submit forms, or provide unrestricted browsing. The optional **Interactive Overlays** feature can open and capture a limited number of likely gallery, media, or post items that match its safety rules; it remains disabled by default. An approved cookies file can be selected when required. See [Advanced Webpage Capture](#webpage-capture) for readiness, scrolling, browser environment, interactive capture, evidence outputs, PDFs, and long-page controls.
+
+### Send a Firefox Tab to WAVI
+
+The optional **WAVI Capture Helper** extension can send the active Firefox tab to a specific WAVI capture engine as a new **Pending** Job Queue entry. It requires Firefox 142 or later. Browser integration is disabled by default and does not start captures automatically.
+
+Install the extension once before pairing it with WAVI:
+
+1. Open the latest WAVI release at <https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest>.
+2. Under **Assets**, download the Mozilla-signed `wavi-capture-firefox-v<version>.xpi` file. Do not use GitHub's **Source code (zip)** as the browser extension.
+3. In Firefox, open **Add-ons and themes** (`about:addons`). Select the gear button, choose **Install Add-on From File...**, select the downloaded `.xpi`, review Firefox's permission and data-use notice, and confirm the installation.
+4. Optionally pin **WAVI Capture Helper** to the Firefox toolbar for easier access.
+
+Pair the extension with WAVI:
+
+5. In WAVI, open **Tools > Browser Integration...**.
+6. Enable **Browser integration API**, confirm the listener port, and click **Apply Listener Settings**. The default port is `17654`.
+7. Click **Copy Token**. Treat the pairing token as a local secret.
+8. Open **WAVI Capture Helper**, select **Manage**, and make sure its listener port matches WAVI. Paste the pairing token and click **Save**. The extension verifies the token with the running WAVI application before saving it.
+
+Send a tab to WAVI:
+
+9. Open an approved `http://` or `https://` page in Firefox, open **WAVI Capture Helper**, and choose **Audio / Video**, **Gallery / Profile**, or **Webpage Capture**.
+10. Confirm the returned WAVI Job ID, then review the new **Pending** job in WAVI before starting it.
+
+If WAVI needs input for a same-domain collision or another prompt, its taskbar button can flash for attention. The browser request can continue if the extension popup closes while you switch to WAVI.
+
+Browser integration sends the active tab's full URL and the selected capture engine to the locally running WAVI application. It does not transfer Firefox cookies, page contents, saved passwords, or other browser-session data. Because a URL can itself contain sensitive query parameters or fragments, review unusually sensitive URLs before sending them.
+
+If Firefox refuses to install the file, confirm that you downloaded the Mozilla-signed `.xpi` from the WAVI release rather than the repository source ZIP or an unsigned development package.
 
 ### Use the Job Queue
 
@@ -755,6 +790,45 @@ Every successful capture artifact and the Webpage run log are hashed. New manife
 After a successful direct or queued Webpage capture, **Copy Case Summary** provides a plain-text summary of case paths, tool/browser information, capture settings, evidence options, and completeness totals. Its **▼** menu copies or exports Webpage-only captured and failed URLs for the case. Completed queue-job summaries can also be copied from the Job Queue.
 
 Webpage recovery records original URL indexes and their completeness classifications. Continuing a failed or interrupted Webpage job submits only unresolved original URLs, even when earlier failures are followed by later successful captures. **Partial** results remain terminal for recovery and are not retried by Continue, while **Failed** results remain retryable. Site design, authentication challenges, anti-automation controls, browser or endpoint policy, infinite/virtualized content, and Chromium's own image/PDF limits can still prevent a complete capture.
+
+### Browser Integration
+
+**WAVI Capture Helper** is an optional convenience feature for sending the page currently open in Firefox to WAVI without copying and pasting the URL. It does not perform the capture itself. Every browser submission becomes an ordinary **Pending** WAVI Job Queue entry, so the user can review it before starting the capture.
+
+Configure the connection from **Tools > Browser Integration...**. The browser-integration API is disabled by default. When enabled, WAVI listens only on the local computer (`127.0.0.1`), not on the local network or the public Internet. WAVI and the Firefox extension must use the same listener port. If WAVI cannot use a newly selected port, it keeps the previous working listener instead of silently leaving browser integration unavailable.
+
+**Pairing and access control**
+
+WAVI creates a random pairing token that acts as the local authorization secret between Firefox and WAVI. When a token is saved in the extension, WAVI verifies it first, and every later browser submission must authenticate again. If a saved token should no longer be trusted, use **Regenerate Token** in WAVI and pair the extension again; the previous token stops working immediately.
+
+Treat the pairing token like a password for the local browser-integration interface. Do not post it in screenshots, case notes, tickets, or shared documentation.
+
+**What the extension can send**
+
+The extension sends only:
+
+- the full URL of the active Firefox tab
+- the capture engine selected by the user: **Audio / Video**, **Gallery / Profile**, or **Webpage Capture**
+
+It does not send Firefox cookies, page contents, saved passwords, browsing history, or arbitrary capture settings. The extension does not have permission to read Firefox cookies. A URL can still contain sensitive information in its path, query parameters, or fragment, so review unusually sensitive URLs before submitting them.
+
+Firefox stores the listener port and pairing token in the extension's local storage. The extension also keeps limited status information, such as the latest result and WAVI Job ID, so it can show whether a submission succeeded. It does not keep a browser-side history of submitted URLs. The resulting Pending job is stored by WAVI in the same way as other Job Queue entries.
+
+**Local-only connection**
+
+Firefox displays permission for the extension to communicate with `127.0.0.1`, which means the local computer. WAVI Capture Helper uses that permission only for the listener port configured in the extension and WAVI. It does not send browser submissions to the WAVI developer, Mozilla, analytics services, or another remote service. See [PRIVACY.md](PRIVACY.md) for the project privacy policy.
+
+Private Browsing is intentionally disabled for WAVI Capture Helper because browser-submitted URLs become normal WAVI Job Queue records.
+
+**If browser integration does not work**
+
+- Confirm WAVI is open and **Browser integration API** is enabled.
+- Confirm WAVI reports that it is listening and that the same port is set in **WAVI Capture Helper > Manage**.
+- If the extension reports that the token was rejected, copy the current token from WAVI and save it again in the extension.
+- If the WAVI taskbar button flashes, switch to WAVI and respond to the displayed prompt. The browser request can continue while the extension popup is closed.
+- If Firefox will not install the extension, use the Mozilla-signed `.xpi` from an official WAVI release.
+
+Keep browser integration disabled when it is not required if that better matches your organization's workstation or evidence-handling policy.
 
 ### Job Queue, Persistence, and Recovery
 
