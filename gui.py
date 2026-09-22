@@ -36,7 +36,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0917"
+APP_VERSION = "v3.2026.0922"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -58,7 +58,7 @@ OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_UPDATE_DIR_NAME = "gui-update"
 APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-SETTINGS_SCHEMA_VERSION = 49
+SETTINGS_SCHEMA_VERSION = 53
 WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382
 BROWSER_INTAKE_HOST = "127.0.0.1"
 BROWSER_INTAKE_DEFAULT_PORT = 17654
@@ -89,6 +89,8 @@ BROWSER_INTAKE_LOG_ENGINES = {
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+APP_LOGO_PNG_PATH = os.path.join(ROOT, "gui-assets", "wavi.png")
+APP_ICON_ICO_PATH = os.path.join(ROOT, "gui-assets", "wavi.ico")
 GUI_UPDATE_DIR = os.path.join(ROOT, APP_UPDATE_DIR_NAME)
 SETTINGS_FILE = os.path.join(ROOT, "gui-settings.json")
 JOBS_FILE = os.path.join(ROOT, "gui-jobs.json")
@@ -121,32 +123,76 @@ IMAGE_CAPTURE_TAB_LABEL = "Gallery/Profile Capture"
 DEFAULT_WEB_PDF_HEADER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
     'display:flex; justify-content:space-between; box-sizing:border-box;">'
-    '<span>%best_url%</span><span>Captured: %capture_timestamp_local%</span></div>'
+    '<span>%url%</span><span>Captured: %datetime%</span></div>'
 )
 DEFAULT_WEB_PDF_FOOTER_TEMPLATE = (
     '<div style="width:100%; font-size:8px; color:#444; padding:0 0.3in; '
     'display:flex; justify-content:flex-end; box-sizing:border-box;">'
-    '<span class="pageNumber"></span>/<span class="totalPages"></span></div>'
+    '<span>%page_number%</span>/<span>%page_count%</span></div>'
+)
+
+DEFAULT_IMAGE_EVIDENCE_STAMP_TEMPLATE = (
+    "%url%\n"
+    "%utcdatetime%"
+)
+
+IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS = (
+    "%url%",
+    "%domain%",
+    "%source_count%",
+    None,
+    "%date%",
+    "%time%",
+    "%datetime%",
+    "%utcdatetime%",
+    None,
+    "%case%",
+    "%engine%",
+    "%version%",
+    None,
+    "%filename%",
+    "%ext%",
+    "%original%",
+    "%sha256%",
+)
+IMAGE_EVIDENCE_STAMP_ALLOWED_TAGS = frozenset(
+    item for item in IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS if item is not None
 )
 
 WEB_PDF_TEMPLATE_TAG_MENU_ITEMS = (
-    ("Best URL", "%best_url%"),
-    ("Requested URL", "%requested_url%"),
-    ("Final URL", "%final_url%"),
-    ("Page title", "%page_title%"),
+    "%url%",
+    "%requested_url%",
+    "%final_url%",
+    "%domain%",
+    "%title%",
     None,
-    ("Capture timestamp (local)", "%capture_timestamp_local%"),
-    ("Capture timestamp (local alias)", "%capture_local%"),
-    ("Capture date (local)", "%capture_date_local%"),
-    ("Capture time (local)", "%capture_time_local%"),
-    ("Capture timestamp (UTC)", "%capture_timestamp_utc%"),
-    ("Capture date (UTC)", "%capture_date_utc%"),
-    ("Capture time (UTC)", "%capture_time_utc%"),
-    ("Raw capture UTC (ISO)", "%capture_utc%"),
+    "%date%",
+    "%time%",
+    "%datetime%",
+    "%utcdatetime%",
     None,
-    ("Page number", "%page_number%"),
-    ("Page count", "%page_count%"),
+    "%case%",
+    "%engine%",
+    "%version%",
+    None,
+    "%page_number%",
+    "%page_count%",
 )
+
+# Long-standing PDF header/footer tags remain supported for saved templates,
+# but normalized names are the only tags shown in the Insert Tag menus.
+WEB_PDF_TEMPLATE_LEGACY_TAGS = frozenset({
+    "%best_url%",
+    "%page_title%",
+    "%capture_utc%",
+    "%capture_timestamp_utc%",
+    "%capture_date_utc%",
+    "%capture_time_utc%",
+    "%capture_local%",
+    "%capture_timestamp_local%",
+    "%capture_date_local%",
+    "%capture_time_local%",
+})
 
 DEFAULTS = {
     "script_path": os.path.join(ROOT, "script-ytdlp.ps1"),
@@ -155,7 +201,7 @@ DEFAULTS = {
     "gallery_dl_path": os.path.join(ROOT, "gallery-dl.exe"),
     "image_input_file": os.path.join(ROOT, "image-urls.txt"),
     "image_case_name": "Case-%datetime%",
-    "image_filename_template": "%category%/%subcategory%/%id%_%filename%.%extension%",
+    "image_filename_template": "%datetime%_%domain%_%id%_%filename%.%ext%",
     "image_cookies_file": os.path.join(ROOT, "cookies.txt"),
     "image_use_cookies_file": False,
     "image_output_root": os.path.join(ROOT, "Investigations"),
@@ -164,6 +210,9 @@ DEFAULTS = {
     "image_write_metadata": True,
     "image_write_info_json": True,
     "image_write_tags": True,
+    "image_evidence_derivative": False,
+    "image_evidence_match_source_format": False,
+    "image_evidence_stamp_template": DEFAULT_IMAGE_EVIDENCE_STAMP_TEMPLATE,
     "image_rate_limit": "normal",
     "image_max_items_enabled": False,
     "image_max_items": "",
@@ -278,7 +327,7 @@ DEFAULTS = {
     "web_pdf_png_use_maximum_ratio": False,
     "input_file": os.path.join(ROOT, "urls.txt"),
     "case_name": "Case-%datetime%",
-    "filename_template": "%extractor%/%uploader%/%upload_date%_%id%_%title%.%ext%",
+    "filename_template": "%datetime%_%domain%_%id%_%title%.%ext%",
     "cookies_file": os.path.join(ROOT, "cookies.txt"),
     "use_cookies_file": False,
     "output_root": os.path.join(ROOT, "Investigations"),
@@ -319,6 +368,10 @@ DEFAULTS = {
     "download_speed_limit_enabled": False,
     "download_speed_limit": "1 MiB/s",
     "retry_behavior": "normal",
+    "retry_custom_retries": "5",
+    "retry_custom_fragment_retries": "5",
+    "retry_custom_socket_timeout": "30",
+    "retry_custom_sleep_max": "120",
     "throttle_detection_enabled": False,
     "throttled_rate": "100 KiB/s",
     "http_chunk_size_enabled": False,
@@ -393,6 +446,10 @@ DOMAIN_PRESET_SETTING_KEYS = [
     "download_speed_limit_enabled",
     "download_speed_limit",
     "retry_behavior",
+    "retry_custom_retries",
+    "retry_custom_fragment_retries",
+    "retry_custom_socket_timeout",
+    "retry_custom_sleep_max",
     "throttle_detection_enabled",
     "throttled_rate",
     "http_chunk_size_enabled",
@@ -418,6 +475,9 @@ DOMAIN_PRESET_SETTING_KEYS = [
     "image_write_metadata",
     "image_write_info_json",
     "image_write_tags",
+    "image_evidence_derivative",
+    "image_evidence_match_source_format",
+    "image_evidence_stamp_template",
     "image_rate_limit",
     "image_max_items_enabled",
     "image_max_items",
@@ -1043,11 +1103,23 @@ def flash_wavi_taskbar():
         return False
 
 
+def apply_wavi_window_icon(window):
+    """Apply the WAVI Windows icon directly to a Tk root or Toplevel window."""
+    try:
+        if os.path.isfile(APP_ICON_ICO_PATH):
+            window.iconbitmap(APP_ICON_ICO_PATH)
+            return True
+    except Exception as exc:
+        log_debug_exception("Could not apply WAVI window icon", exc)
+    return False
+
+
 def _wavi_toplevel_attention_on_map(event):
-    """Flash WAVI when one of its owned Tk windows appears while WAVI is backgrounded."""
+    """Apply WAVI branding and flash when an owned Tk window appears in the background."""
     try:
         widget = getattr(event, "widget", None)
         if isinstance(widget, tk.Toplevel):
+            apply_wavi_window_icon(widget)
             widget.after_idle(flash_wavi_taskbar)
     except Exception as exc:
         log_debug_exception("Could not handle WAVI popup attention event", exc)
@@ -3565,26 +3637,57 @@ def get_capture_engine_template_value(engine="yt-dlp"):
     return CAPTURE_ENGINE_TEMPLATE_VALUES.get(normalized, safe_case_name(normalized) or "capture")
 
 
-def get_case_template_values(now=None, domains=None, presets=None, playlist=None, engine="yt-dlp"):
-    now = now or datetime.now()
-    utc_now = now.astimezone(timezone.utc) if getattr(now, "tzinfo", None) else datetime.now(timezone.utc)
+def normalize_template_datetime(now=None):
+    if now is None:
+        return datetime.now().astimezone()
+    if getattr(now, "tzinfo", None) is None:
+        return now.astimezone()
+    return now
 
+
+def get_capture_time_template_values(now=None, engine="yt-dlp"):
+    local_now = normalize_template_datetime(now)
+    utc_now = local_now.astimezone(timezone.utc)
     return {
-        "%date%": now.strftime("%Y-%m-%d"),
-        "%time%": now.strftime("%H%M%S"),
-        "%datetime%": now.strftime("%Y-%m-%d_%H%M%S"),
+        "%date%": local_now.strftime("%Y-%m-%d"),
+        "%time%": local_now.strftime("%H%M%S"),
+        "%datetime%": local_now.strftime("%Y-%m-%d_%H%M%S"),
         "%utcdatetime%": utc_now.strftime("%Y%m%d_%H%M%SZ"),
         "%engine%": get_capture_engine_template_value(engine),
+    }
+
+
+def get_filename_domain_template_value(domains=None, fallback="unknown-domain"):
+    cleaned = []
+    seen = set()
+    for value in domains or []:
+        item = safe_case_name(str(value or "").strip()).strip("._-")
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        cleaned.append(item)
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) > 1:
+        return "multiple-domains"
+    return fallback
+
+
+def get_case_template_values(now=None, domains=None, presets=None, playlist=None, engine="yt-dlp"):
+    local_now = normalize_template_datetime(now)
+    values = get_capture_time_template_values(local_now, engine=engine)
+    values.update({
         "%domains%": format_case_tag_list(domains, "domains"),
         "%presets%": format_case_tag_list(presets, "presets"),
         "%playlist%": format_case_playlist_tag(playlist),
-        "%year%": now.strftime("%Y"),
-        "%month%": now.strftime("%m"),
-        "%day%": now.strftime("%d"),
-        "%hour%": now.strftime("%H"),
-        "%minute%": now.strftime("%M"),
-        "%second%": now.strftime("%S"),
-    }
+        "%year%": local_now.strftime("%Y"),
+        "%month%": local_now.strftime("%m"),
+        "%day%": local_now.strftime("%d"),
+        "%hour%": local_now.strftime("%H"),
+        "%minute%": local_now.strftime("%M"),
+        "%second%": local_now.strftime("%S"),
+    })
+    return values
 
 
 def render_case_name_template(template, now=None, domains=None, presets=None, playlist=None, engine="yt-dlp"):
@@ -3620,6 +3723,7 @@ YTDLP_FILENAME_TAGS = [
     ("%id%", "%(id)s", "SAMPLEID"),
     ("%display_id%", "%(display_id|id)s", "sample-display-id"),
     ("%ext%", "%(ext)s", "mp4"),
+    ("%domain%", "%(webpage_url_domain|extractor)s", "example.com"),
     ("%extractor%", "%(extractor)s", "extractor"),
     ("%extractor_key%", "%(extractor_key)s", "Extractor"),
     ("%uploader%", "%(uploader|unknown)s", "unknown"),
@@ -3633,27 +3737,77 @@ YTDLP_FILENAME_TAGS = [
     ("%playlist_title%", "%(playlist_title|playlist|unknown)s", "Sample Playlist"),
     ("%playlist_id%", "%(playlist_id|unknown)s", "SAMPLEPL"),
     ("%playlist_index%", "%(playlist_index|000)s", "001"),
-    ("%webpage_domain%", "%(webpage_url_domain|extractor)s", "example.com"),
     ("%epoch%", "%(epoch)s", "1760000000"),
 ]
 
+COMMON_FILENAME_COMPAT_ALIASES = {
+    "%webpage_domain%": "%domain%",
+    "%extension%": "%ext%",
+}
+
+
+def apply_filename_template_compat_aliases(template, aliases):
+    rendered = str(template or "")
+    for alias, canonical in sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True):
+        rendered = rendered.replace(alias, canonical)
+    return rendered
+
+
+YTDLP_FILENAME_COMPAT_ALIASES = dict(COMMON_FILENAME_COMPAT_ALIASES)
+
 GALLERYDL_FILENAME_TAGS = [
-    ("%filename%", "{filename}", "sample-image"),
-    ("%extension%", "{extension}", "jpg"),
+    (
+        "%filename%",
+        "{filename|file_name|name|media_id|file_id|image_id|id|post_id|shortcode|post_shortcode|token|hash|md5|num|'item'}",
+        "sample-image",
+    ),
     ("%ext%", "{extension}", "jpg"),
-    ("%category%", "{category}", "category"),
-    ("%subcategory%", "{subcategory}", "post"),
-    ("%id%", "{id}", "SAMPLEID"),
-    ("%title%", "{title}", "Sample Title"),
-    ("%author%", "{author}", "sample-author"),
-    ("%username%", "{username}", "sample-user"),
-    ("%user%", "{user}", "sample-user"),
-    ("%date%", "{date}", "2026-06-23"),
-    ("%date_utc%", "{date!s}", "2026-06-23"),
-    ("%num%", "{num}", "001"),
-    ("%count%", "{count}", "1"),
-    ("%url%", "{url}", "https-example"),
+    ("%category%", "{category|'unknown-category'}", "category"),
+    ("%subcategory%", "{subcategory|'item'}", "post"),
+    (
+        "%id%",
+        "{id|media_id|file_id|image_id|post_id|tweet_id|submission_id|shortcode|post_shortcode|token|hash|md5|num|'item'}",
+        "SAMPLEID",
+    ),
+    (
+        "%title%",
+        "{title|name|subject|shortcode|post_shortcode|media_id|id|filename|'untitled'}",
+        "Sample Title",
+    ),
+    (
+        "%author%",
+        "{author|username|creator|uploader|fullname|owner_username|user[username]|user[name]|owner_id|'unknown-author'}",
+        "sample-author",
+    ),
+    (
+        "%username%",
+        "{username|author|creator|uploader|owner_username|user[username]|user[name]|fullname|owner_id|'unknown-user'}",
+        "sample-user",
+    ),
+    (
+        "%user%",
+        "{user[username]|user[name]|username|author|creator|uploader|owner_username|fullname|owner_id|'unknown-user'}",
+        "sample-user",
+    ),
+    ("%item_date%", "{date|post_date|created|created_at|'unknown-date'}", "2026-06-23"),
+    ("%num%", "{num|index|page|position|'1'}", "001"),
+    ("%count%", "{count|total|'1'}", "1"),
+    (
+        "%url%",
+        "{post_url|source_url|url|file_url|download_url|display_url|video_url|image_url|_url|extractor.url}",
+        "https-example",
+    ),
 ]
+
+GALLERYDL_FILENAME_COMPAT_ALIASES = dict(COMMON_FILENAME_COMPAT_ALIASES)
+
+GALLERYDL_FILENAME_LEGACY_ALIASES = [
+    ("%date_utc%", "{date!s}", "2026-06-23"),
+]
+
+WEB_FILENAME_COMPAT_ALIASES = {
+    "%webpage_domain%": COMMON_FILENAME_COMPAT_ALIASES["%webpage_domain%"],
+}
 
 WEB_CASE_NAME_TAGS = [
     "%date%",
@@ -3671,9 +3825,10 @@ WEB_CASE_NAME_TAGS = [
 ]
 
 WEB_FILENAME_TAGS = [
-    ("%date%", "20260710"),
+    ("%date%", "2026-07-10"),
     ("%time%", "223000"),
-    ("%datetime%", "20260710-223000"),
+    ("%datetime%", "2026-07-10_223000"),
+    ("%utcdatetime%", "20260711_023000Z"),
     ("%engine%", "webpage"),
     ("%domain%", "example.com"),
     ("%title%", "Sample Page Title"),
@@ -3688,7 +3843,7 @@ WEB_INTERACTIVE_FILENAME_TAGS = WEB_FILENAME_TAGS + [("%overlayindex%", "001"), 
 
 def filename_template_has_ext_placeholder(template):
     text = str(template or "").lower()
-    return "%ext%" in text or "%(ext" in text
+    return any(tag in text for tag in ("%ext%", "%extension%", "%(ext"))
 
 
 def normalize_filename_template(template):
@@ -3729,6 +3884,7 @@ def validate_filename_template(template):
 
 def render_filename_template_for_ytdlp(template, now=None, domains=None, presets=None, playlist=None, resolved_case_name=None):
     rendered = validate_filename_template(template)
+    rendered = apply_filename_template_compat_aliases(rendered, YTDLP_FILENAME_COMPAT_ALIASES)
 
     for tag, value in get_case_template_values(now, domains=domains, presets=presets, playlist=playlist, engine="yt-dlp").items():
         rendered = rendered.replace(tag, safe_case_name(str(value)))
@@ -3744,6 +3900,7 @@ def render_filename_template_for_ytdlp(template, now=None, domains=None, presets
 
 def render_filename_template_example(template, now=None, domains=None, presets=None, playlist=None, resolved_case_name=None):
     rendered = validate_filename_template(template)
+    rendered = apply_filename_template_compat_aliases(rendered, YTDLP_FILENAME_COMPAT_ALIASES)
 
     for tag, value in get_case_template_values(now, domains=domains, presets=presets, playlist=playlist, engine="yt-dlp").items():
         rendered = rendered.replace(tag, safe_case_name(str(value)))
@@ -3799,7 +3956,7 @@ def normalize_gallery_filename_template(template):
         template = template[1:]
 
     if not gallery_filename_template_has_extension_placeholder(template):
-        template = f"{template}.%extension%"
+        template = f"{template}.%ext%"
 
     return template
 
@@ -3826,14 +3983,17 @@ def validate_gallery_filename_template(template):
 
 def render_gallery_filename_template_for_tool(template, now=None, domains=None, presets=None, playlist=None, resolved_case_name=None):
     rendered = validate_gallery_filename_template(template)
+    rendered = apply_filename_template_compat_aliases(rendered, GALLERYDL_FILENAME_COMPAT_ALIASES)
 
     for tag, value in get_case_template_values(now, domains=domains, presets=presets, playlist=playlist, engine="gallery-dl").items():
         rendered = rendered.replace(tag, safe_case_name(str(value)))
 
+    rendered = rendered.replace("%domain%", safe_case_name(get_filename_domain_template_value(domains)))
+
     if resolved_case_name:
         rendered = rendered.replace("%case%", safe_case_name(str(resolved_case_name)))
 
-    for tag, native, _sample in sorted(GALLERYDL_FILENAME_TAGS, key=lambda item: len(item[0]), reverse=True):
+    for tag, native, _sample in sorted(GALLERYDL_FILENAME_TAGS + GALLERYDL_FILENAME_LEGACY_ALIASES, key=lambda item: len(item[0]), reverse=True):
         rendered = rendered.replace(tag, native)
 
     return validate_gallery_filename_template(rendered)
@@ -3841,14 +4001,17 @@ def render_gallery_filename_template_for_tool(template, now=None, domains=None, 
 
 def render_gallery_filename_template_example(template, now=None, domains=None, presets=None, playlist=None, resolved_case_name=None):
     rendered = validate_gallery_filename_template(template)
+    rendered = apply_filename_template_compat_aliases(rendered, GALLERYDL_FILENAME_COMPAT_ALIASES)
 
     for tag, value in get_case_template_values(now, domains=domains, presets=presets, playlist=playlist, engine="gallery-dl").items():
         rendered = rendered.replace(tag, safe_case_name(str(value)))
 
+    rendered = rendered.replace("%domain%", safe_case_name(get_filename_domain_template_value(domains, fallback="example.com")))
+
     if resolved_case_name:
         rendered = rendered.replace("%case%", safe_case_name(str(resolved_case_name)))
 
-    for tag, _native, sample in sorted(GALLERYDL_FILENAME_TAGS, key=lambda item: len(item[0]), reverse=True):
+    for tag, _native, sample in sorted(GALLERYDL_FILENAME_TAGS + GALLERYDL_FILENAME_LEGACY_ALIASES, key=lambda item: len(item[0]), reverse=True):
         rendered = rendered.replace(tag, safe_case_name(str(sample)))
 
     return rendered
@@ -3887,6 +4050,83 @@ def insert_image_filename_template_tag(tag):
     except Exception:
         current = image_filename_template_var.get()
         image_filename_template_var.set(f"{current}{tag}")
+
+
+def get_image_evidence_stamp_template_value():
+    try:
+        if "image_evidence_stamp_text" in globals():
+            return image_evidence_stamp_text.get("1.0", "end-1c")
+    except Exception:
+        pass
+    try:
+        return str(image_evidence_stamp_template_var.get())
+    except Exception:
+        return DEFAULTS["image_evidence_stamp_template"]
+
+
+def set_image_evidence_stamp_template_value(value):
+    value = str(value if value is not None else DEFAULTS["image_evidence_stamp_template"])
+    try:
+        image_evidence_stamp_template_var.set(value)
+    except Exception:
+        pass
+    try:
+        if "image_evidence_stamp_text" in globals():
+            image_evidence_stamp_text.delete("1.0", "end")
+            image_evidence_stamp_text.insert("1.0", value)
+    except Exception:
+        pass
+
+
+def sync_image_evidence_stamp_template_from_widget(schedule_autosave=False):
+    try:
+        image_evidence_stamp_template_var.set(get_image_evidence_stamp_template_value())
+    except Exception:
+        pass
+    if schedule_autosave:
+        try:
+            schedule_settings_autosave()
+        except Exception:
+            pass
+
+
+def insert_image_evidence_stamp_tag(tag):
+    tag = str(tag or "")
+    if not tag:
+        return
+    try:
+        image_evidence_stamp_text.insert("insert", tag)
+        image_evidence_stamp_text.see("insert")
+        image_evidence_stamp_text.focus_set()
+        sync_image_evidence_stamp_template_from_widget(schedule_autosave=True)
+    except Exception:
+        pass
+
+
+def post_image_evidence_stamp_tag_menu():
+    try:
+        image_evidence_stamp_tag_button.update_idletasks()
+        image_evidence_stamp_tag_menu.tk_popup(
+            image_evidence_stamp_tag_button.winfo_rootx(),
+            image_evidence_stamp_tag_button.winfo_rooty() + image_evidence_stamp_tag_button.winfo_height(),
+        )
+    finally:
+        try:
+            image_evidence_stamp_tag_menu.grab_release()
+        except Exception:
+            pass
+
+
+def validate_image_evidence_stamp_template(template):
+    value = str(template or "")
+    if not value.strip():
+        raise ValueError("Gallery/Profile evidence stamp template cannot be blank when Evidence stamping is enabled.")
+    if len(value) > 8000:
+        raise ValueError("Gallery/Profile evidence stamp template is too long (maximum 8,000 characters).")
+    unknown = sorted(set(re.findall(r"%[A-Za-z0-9_]+%", value)) - IMAGE_EVIDENCE_STAMP_ALLOWED_TAGS)
+    if unknown:
+        raise ValueError("Unsupported Gallery/Profile evidence stamp tag(s): " + ", ".join(unknown))
+    return value
 
 
 def set_url_preview_pending_playlist_name(value):
@@ -4105,6 +4345,9 @@ def query_capture_tool_versions_for_job(settings):
     if engine == "gallery-dl":
         script_path = settings.get("image_script_path", "")
         gallery_path = settings.get("gallery_dl_path", "")
+        ffmpeg_folder = str(settings.get("ffmpeg_folder", "") or "").strip()
+        ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+        ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
         return {
             "app": APP_VERSION,
             "engine": "gallery-dl",
@@ -4114,6 +4357,10 @@ def query_capture_tool_versions_for_job(settings):
                 [gallery_path, "--version"],
                 cwd=os.path.dirname(os.path.abspath(gallery_path)) if gallery_path else ROOT,
             ) if gallery_path else {"version": "not configured", "ok": False},
+            "ffmpeg_path": ffmpeg_exe,
+            "ffmpeg": get_tool_first_line([ffmpeg_exe, "-version"]) if ffmpeg_exe and os.path.isfile(ffmpeg_exe) else {"version": "not configured", "ok": False},
+            "ffprobe_path": ffprobe_exe,
+            "ffprobe": get_tool_first_line([ffprobe_exe, "-version"]) if ffprobe_exe and os.path.isfile(ffprobe_exe) else {"version": "not configured", "ok": False},
         }
 
     script_path = settings.get("script_path", "")
@@ -4419,7 +4666,7 @@ def build_case_summary_text(exit_code, submitted_url_count, paths, versions, cou
         f"  Failure handling: {setting_value('failure_handling', failure_handling_var.get())}",
         f"  Rate limit: {setting_value('rate_limit', rate_limit_var.get())}",
         f"  Download speed limit: {'enabled' if bool(setting_value('download_speed_limit_enabled', download_speed_limit_enabled_var.get())) else 'disabled'}; {setting_value('download_speed_limit', download_speed_limit_var.get())}",
-        f"  Retry behavior: {setting_value('retry_behavior', retry_behavior_var.get())}",
+        f"  Retry behavior: {format_retry_behavior_summary(settings)}",
         f"  Throttle detection: {'enabled' if bool(setting_value('throttle_detection_enabled', throttle_detection_enabled_var.get())) else 'disabled'}; {setting_value('throttled_rate', throttled_rate_var.get())}",
         f"  HTTP chunk size: {'enabled' if bool(setting_value('http_chunk_size_enabled', http_chunk_size_enabled_var.get())) else 'disabled'}; {setting_value('http_chunk_size', http_chunk_size_var.get())}",
         f"  Concurrent captures: {setting_value('concurrent_captures', concurrent_captures_var.get())}",
@@ -4494,6 +4741,7 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
         "Case paths:",
         f"  Case folder: {paths.get('case_folder', '')}",
         f"  Media folder: {paths.get('media_folder', '')}",
+        f"  Evidence derivatives folder: {paths.get('evidence_derivatives_folder', '')}",
         f"  Logs folder: {paths.get('logs_folder', '')}",
         f"  Manifests folder: {paths.get('manifests_folder', '')}",
         f"  Gallery archive: {paths.get('download_archive', '')}",
@@ -4510,6 +4758,10 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
         f"  PowerShell script: {versions.get('powershell_script', '')}",
         f"  gallery-dl path: {versions.get('gallery_dl_path', '')}",
         f"  gallery-dl: {versions.get('gallery_dl', {}).get('version', 'unavailable')}",
+        f"  FFmpeg path: {versions.get('ffmpeg_path', '')}",
+        f"  FFmpeg: {versions.get('ffmpeg', {}).get('version', 'unavailable')}",
+        f"  FFprobe path: {versions.get('ffprobe_path', '')}",
+        f"  FFprobe: {versions.get('ffprobe', {}).get('version', 'unavailable')}",
         "",
         "Capture options:",
         f"  Profile: {_summary_setting(settings, '_profile_name', selected_profile_var.get())}",
@@ -4518,6 +4770,8 @@ def build_image_case_summary_text(exit_code, submitted_url_count, paths, version
         f"  Filename template: {_summary_setting(settings, 'image_filename_template', image_filename_template_var.get())}",
         f"  Capture mode: {_image_capture_mode_label(_summary_setting(settings, 'image_capture_mode', image_capture_mode_var.get()))}",
         f"  Metadata outputs: {metadata_text}",
+        f"  Evidence stamping: {_summary_enabled(_summary_setting(settings, 'image_evidence_derivative', image_evidence_derivative_var.get()))}",
+        f"  Evidence stamp output: {'Match source format' if bool(_summary_setting(settings, 'image_evidence_match_source_format', image_evidence_match_source_format_var.get())) else 'PNG (lossless default)'}",
         f"  Archive mode: {_image_archive_mode_label(_summary_setting(settings, 'image_archive_mode', image_archive_mode_var.get()))}",
         f"  Universal archive: {get_universal_archive_status('gallery-dl', settings).get('state', 'disabled')}",
         f"  Maximum items: {max_items}",
@@ -5806,32 +6060,45 @@ def build_url_box_button_grid(
     show_mode_getter=None,
     history_state_sync=None,
 ):
-    """Build the shared single-column URL-box toolbar used by all capture tabs."""
+    """Build the shared compact URL-box toolbar used by all capture tabs."""
     configure_url_text_widget_history(text_widget, history_state_sync)
-    row = 0
+    parent.columnconfigure(0, weight=1)
+    parent.columnconfigure(1, weight=1)
 
-    for label, command in core_actions:
+    # Keep the common file/list actions grouped while reducing the toolbar from
+    # nine stacked rows to five. This prevents the URL row from forcing lower
+    # capture controls off-screen on 1920x1080 work areas without shrinking
+    # button labels or changing any command behaviour.
+    core_actions = list(core_actions)
+
+    for index, (label, command) in enumerate(core_actions[:4]):
+        row = index // 2
+        column = index % 2
         ttk.Button(
             parent,
             text=label,
             command=command,
-            width=14,
+            width=10,
         ).grid(
             row=row,
-            column=0,
+            column=column,
             sticky="ew",
-            pady=(0 if row == 0 else 6, 0),
+            padx=(0, 3) if column == 0 else (3, 0),
+            pady=(0 if row == 0 else 3, 0),
         )
-        row += 1
 
-    ttk.Button(parent, text="Undo", command=lambda: undo_url_text_widget(text_widget, history_state_sync), width=14).grid(
-        row=row, column=0, sticky="ew", pady=(6, 0)
+    row = 2
+    ttk.Button(parent, text="Undo", command=lambda: undo_url_text_widget(text_widget, history_state_sync), width=10).grid(
+        row=row, column=0, sticky="ew", padx=(0, 3), pady=(3, 0)
+    )
+    ttk.Button(parent, text="Redo", command=lambda: redo_url_text_widget(text_widget, history_state_sync), width=10).grid(
+        row=row, column=1, sticky="ew", padx=(3, 0), pady=(3, 0)
     )
     row += 1
-    ttk.Button(parent, text="Redo", command=lambda: redo_url_text_widget(text_widget, history_state_sync), width=14).grid(
-        row=row, column=0, sticky="ew", pady=(6, 0)
-    )
-    row += 1
+
+    # Keep Copy paired with Show at the bottom of the two-column action rows.
+    # Advanced remains the only full-width row beneath the paired controls.
+    copy_action = core_actions[4] if len(core_actions) > 4 else None
 
     def post_menu_below(button, menu):
         """Open a popup menu directly below a standard toolbar button."""
@@ -5846,10 +6113,8 @@ def build_url_box_button_grid(
     advanced_menu = tk.Menu(parent, tearoff=False)
     for label, command in advanced_actions:
         advanced_menu.add_command(label=label, command=command)
-    advanced_button = ttk.Button(parent, text="Advanced ▼", width=14)
+    advanced_button = ttk.Button(parent, text="Advanced ▼", width=10)
     advanced_button.configure(command=lambda: post_menu_below(advanced_button, advanced_menu))
-    advanced_button.grid(row=row, column=0, sticky="ew", pady=(6, 0))
-    row += 1
 
     show_mode_var = tk.StringVar(parent, value="all")
     if callable(show_mode_getter):
@@ -5887,8 +6152,20 @@ def build_url_box_button_grid(
                 pass
         post_menu_below(show_button, show_menu)
 
-    show_button = ttk.Button(parent, text="Show ▼", width=14, command=post_show_menu)
-    show_button.grid(row=row, column=0, sticky="ew", pady=(6, 0))
+    show_button = ttk.Button(parent, text="Show ▼", width=10, command=post_show_menu)
+
+    if copy_action is not None:
+        copy_label, copy_command = copy_action
+        ttk.Button(parent, text=copy_label, command=copy_command, width=10).grid(
+            row=row, column=0, sticky="ew", padx=(0, 3), pady=(3, 0)
+        )
+        show_button.grid(row=row, column=1, sticky="ew", padx=(3, 0), pady=(3, 0))
+        row += 1
+    else:
+        show_button.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        row += 1
+
+    advanced_button.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 
     return show_button
 
@@ -7013,6 +7290,7 @@ def get_expected_image_run_paths_for_values(output_root, resolved_case_name):
     return {
         "case_folder": case_folder,
         "media_folder": os.path.join(case_folder, "media"),
+        "evidence_derivatives_folder": os.path.join(case_folder, "derived", "evidence"),
         "logs_folder": os.path.join(case_folder, "logs"),
         "manifests_folder": manifests_folder,
         "download_archive": os.path.join(manifests_folder, "gallery-dl-archive.sqlite3"),
@@ -7246,6 +7524,14 @@ def build_powershell_command_for_job(job):
 
     retry_behavior = normalize_retry_behavior(settings.get("retry_behavior", DEFAULTS["retry_behavior"]))
     cmd += ["-RetryBehavior", retry_behavior.capitalize()]
+    if retry_behavior == "custom":
+        custom_retry = get_custom_retry_settings(settings, strict=True)
+        cmd += [
+            "-CustomRetryCount", str(custom_retry["retries"]),
+            "-CustomFragmentRetryCount", str(custom_retry["fragment_retries"]),
+            "-CustomSocketTimeoutSeconds", str(custom_retry["socket_timeout"]),
+            "-CustomRetrySleepMaxSeconds", str(custom_retry["sleep_max"]),
+        ]
 
     if bool(settings.get("throttle_detection_enabled", DEFAULTS["throttle_detection_enabled"])):
         throttled_rate = download_speed_limit_to_ytdlp_value(settings.get("throttled_rate", DEFAULTS["throttled_rate"]))
@@ -7507,7 +7793,11 @@ def get_settings_dict():
         "rate_limit": rate_limit_var.get(),
         "download_speed_limit_enabled": download_speed_limit_enabled_var.get(),
         "download_speed_limit": normalize_download_speed_limit_value(download_speed_limit_var.get()) or DEFAULTS["download_speed_limit"],
-        "retry_behavior": retry_behavior_var.get(),
+        "retry_behavior": normalize_retry_behavior(retry_behavior_var.get()),
+        "retry_custom_retries": normalize_bounded_int_string(retry_custom_retries_var.get(), DEFAULTS["retry_custom_retries"], 0, 100),
+        "retry_custom_fragment_retries": normalize_bounded_int_string(retry_custom_fragment_retries_var.get(), DEFAULTS["retry_custom_fragment_retries"], 0, 100),
+        "retry_custom_socket_timeout": normalize_bounded_int_string(retry_custom_socket_timeout_var.get(), DEFAULTS["retry_custom_socket_timeout"], 1, 900),
+        "retry_custom_sleep_max": normalize_bounded_int_string(retry_custom_sleep_max_var.get(), DEFAULTS["retry_custom_sleep_max"], 1, 3600),
         "throttle_detection_enabled": throttle_detection_enabled_var.get(),
         "throttled_rate": normalize_download_speed_limit_value(throttled_rate_var.get()) or DEFAULTS["throttled_rate"],
         "http_chunk_size_enabled": http_chunk_size_enabled_var.get(),
@@ -7557,6 +7847,9 @@ def get_settings_dict():
         "image_write_metadata": image_write_metadata_var.get(),
         "image_write_info_json": image_write_info_json_var.get(),
         "image_write_tags": image_write_tags_var.get(),
+        "image_evidence_derivative": image_evidence_derivative_var.get(),
+        "image_evidence_match_source_format": image_evidence_match_source_format_var.get(),
+        "image_evidence_stamp_template": get_image_evidence_stamp_template_value(),
         "image_rate_limit": image_rate_limit_var.get(),
         "image_max_items_enabled": image_max_items_enabled_var.get(),
         "image_max_items": normalize_optional_positive_int_string(image_max_items_var.get()),
@@ -7766,6 +8059,11 @@ def apply_settings_dict(settings):
         pass
 
     retry_behavior_var.set(normalize_retry_behavior(settings.get("retry_behavior", DEFAULTS["retry_behavior"])))
+    retry_custom_retries_var.set(normalize_bounded_int_string(settings.get("retry_custom_retries", DEFAULTS["retry_custom_retries"]), DEFAULTS["retry_custom_retries"], 0, 100))
+    retry_custom_fragment_retries_var.set(normalize_bounded_int_string(settings.get("retry_custom_fragment_retries", DEFAULTS["retry_custom_fragment_retries"]), DEFAULTS["retry_custom_fragment_retries"], 0, 100))
+    retry_custom_socket_timeout_var.set(normalize_bounded_int_string(settings.get("retry_custom_socket_timeout", DEFAULTS["retry_custom_socket_timeout"]), DEFAULTS["retry_custom_socket_timeout"], 1, 900))
+    retry_custom_sleep_max_var.set(normalize_bounded_int_string(settings.get("retry_custom_sleep_max", DEFAULTS["retry_custom_sleep_max"]), DEFAULTS["retry_custom_sleep_max"], 1, 3600))
+    update_custom_retry_state()
 
     throttle_detection_enabled_var.set(bool(settings.get("throttle_detection_enabled", DEFAULTS["throttle_detection_enabled"])))
     saved_throttled_rate = normalize_download_speed_limit_value(settings.get("throttled_rate", DEFAULTS["throttled_rate"]))
@@ -7831,6 +8129,9 @@ def apply_settings_dict(settings):
     image_write_metadata_var.set(bool(settings.get("image_write_metadata", DEFAULTS["image_write_metadata"])))
     image_write_info_json_var.set(bool(settings.get("image_write_info_json", DEFAULTS["image_write_info_json"])))
     image_write_tags_var.set(bool(settings.get("image_write_tags", DEFAULTS["image_write_tags"])))
+    image_evidence_derivative_var.set(bool(settings.get("image_evidence_derivative", DEFAULTS["image_evidence_derivative"])))
+    image_evidence_match_source_format_var.set(bool(settings.get("image_evidence_match_source_format", DEFAULTS["image_evidence_match_source_format"])))
+    set_image_evidence_stamp_template_value(str(settings.get("image_evidence_stamp_template", DEFAULTS["image_evidence_stamp_template"]) or DEFAULTS["image_evidence_stamp_template"]))
     image_rate_limit_var.set(settings.get("image_rate_limit", DEFAULTS["image_rate_limit"]))
     image_max_items_enabled_var.set(bool(settings.get("image_max_items_enabled", DEFAULTS["image_max_items_enabled"])))
     image_max_items_var.set(normalize_optional_positive_int_string(settings.get("image_max_items", DEFAULTS["image_max_items"])))
@@ -9323,7 +9624,7 @@ def open_domain_presets_window():
         list_outer,
         textvariable=preset_status_var,
         anchor="w",
-    ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 
     def get_checked_preset_names():
         presets = live_presets()
@@ -12900,13 +13201,17 @@ def get_job_queue_counts():
     return counts
 
 
-def format_job_queue_summary():
+def format_job_queue_visible_count():
     counts = get_job_queue_counts()
     visible_count = len(get_visible_job_queue_jobs())
+    return f"Showing {visible_count}/{counts.get('total', 0)} job(s)"
+
+
+def format_job_queue_summary():
+    counts = get_job_queue_counts()
     total_urls = sum(len(job.get("urls", [])) for job in job_queue)
     completed_urls = sum(int(job.get("completed_urls", 0) or 0) for job in job_queue)
     return (
-        f"Showing {visible_count}/{counts.get('total', 0)} job(s) | "
         f"Running {counts.get('running', 0)} | Pending {counts.get('pending', 0)} | "
         f"Interrupted {counts.get('interrupted', 0)} | Failed {counts.get('failed', 0)} | "
         f"Completed {counts.get('completed', 0)} | Checked {counts.get('checked', 0)} | "
@@ -12915,13 +13220,17 @@ def format_job_queue_summary():
 
 
 def update_job_queue_summary_label():
-    summary = format_job_queue_summary()
-    for var in (job_queue_summary_var, job_queue_visible_count_var):
-        try:
-            if var is not None:
-                var.set(summary)
-        except Exception:
-            pass
+    try:
+        if job_queue_summary_var is not None:
+            job_queue_summary_var.set(format_job_queue_summary())
+    except Exception:
+        pass
+
+    try:
+        if job_queue_visible_count_var is not None:
+            job_queue_visible_count_var.set(format_job_queue_visible_count())
+    except Exception:
+        pass
 
     try:
         update_job_queue_recovery_banner()
@@ -15262,12 +15571,12 @@ def open_job_queue(select_tab=True):
     filter_combo.grid(row=0, column=1, sticky="w", padx=(0, 10))
     filter_combo.bind("<<ComboboxSelected>>", on_job_queue_filter_changed)
 
-    job_queue_summary_var = tk.StringVar(value="")
-    ttk.Label(filter_bar, textvariable=job_queue_summary_var).grid(row=0, column=2, columnspan=2, sticky="w")
+    job_queue_visible_count_var = tk.StringVar(value="")
+    ttk.Label(filter_bar, textvariable=job_queue_visible_count_var).grid(row=0, column=2, columnspan=2, sticky="w")
 
     job_queue_recovery_banner_var = tk.StringVar(value="")
     job_queue_recovery_banner_frame = ttk.Frame(filter_bar, padding=(8, 6))
-    job_queue_recovery_banner_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+    job_queue_recovery_banner_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(3, 0))
     job_queue_recovery_banner_frame.columnconfigure(0, weight=1)
     ttk.Label(
         job_queue_recovery_banner_frame,
@@ -15522,9 +15831,12 @@ def open_job_queue(select_tab=True):
     bottom = ttk.Frame(job_queue_window, padding=(8, 0, 8, 2))
     bottom.grid(row=3, column=0, sticky="ew")
 
+    job_queue_summary_var = tk.StringVar(value="")
+    ttk.Label(bottom, textvariable=job_queue_summary_var).pack(fill="x", side="top", pady=(0, 3))
+
     job_queue_progress_var = tk.DoubleVar(value=0)
     progress = ttk.Progressbar(bottom, variable=job_queue_progress_var, maximum=100, mode="determinate")
-    progress.pack(fill="x", side="top", pady=(0, 6))
+    progress.pack(fill="x", side="top", pady=(0, 4))
 
     job_queue_status_var = tk.StringVar(value="Queue is empty.")
     ttk.Label(bottom, textvariable=job_queue_status_var).pack(fill="x", side="top")
@@ -16141,20 +16453,31 @@ def open_about_dialog():
     dialog.resizable(False, False)
     dialog.transient(root)
     dialog.grab_set()
+    apply_wavi_window_icon(dialog)
 
     frame = ttk.Frame(dialog, padding=16)
     frame.pack(fill="both", expand=True)
+    frame.columnconfigure(0, weight=1)
+
+    header_frame = ttk.Frame(frame)
+    header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+    if app_logo_photo is not None:
+        ttk.Label(header_frame, image=app_logo_photo).pack(side="left", anchor="n", padx=(0, 12))
+
+    header_text = ttk.Frame(header_frame)
+    header_text.pack(side="left", fill="x", expand=True)
 
     ttk.Label(
-        frame,
+        header_text,
         text="Webpage/Audio/Video/Image Capture GUI for OSINT",
         font=("Segoe UI", 12, "bold"),
-    ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+    ).pack(anchor="w", pady=(2, 4))
 
     ttk.Label(
-        frame,
+        header_text,
         text=f"Version: {APP_VERSION}",
-    ).grid(row=1, column=0, sticky="w", pady=(0, 12))
+    ).pack(anchor="w")
 
     ttk.Label(
         frame,
@@ -16165,12 +16488,12 @@ def open_about_dialog():
         ),
         wraplength=520,
         justify="left",
-    ).grid(row=2, column=0, sticky="w", pady=(0, 12))
+    ).grid(row=1, column=0, sticky="w", pady=(0, 12))
 
     ttk.Label(
         frame,
         text="Repository:",
-    ).grid(row=3, column=0, sticky="w", pady=(0, 2))
+    ).grid(row=2, column=0, sticky="w", pady=(0, 2))
 
     repo_url = "https://github.com/jmashuque/wavi-capture-gui-for-osint/"
     repo_label = ttk.Label(
@@ -16179,11 +16502,11 @@ def open_about_dialog():
         cursor="hand2",
         foreground="blue",
     )
-    repo_label.grid(row=4, column=0, sticky="w", pady=(0, 14))
+    repo_label.grid(row=3, column=0, sticky="w", pady=(0, 14))
     repo_label.bind("<Button-1>", lambda event: webbrowser.open(repo_url))
 
     button_frame = ttk.Frame(frame)
-    button_frame.grid(row=5, column=0, sticky="e")
+    button_frame.grid(row=4, column=0, sticky="e")
 
     ttk.Button(
         button_frame,
@@ -20621,9 +20944,99 @@ def binary_size_to_ytdlp_value(value):
 
 def normalize_retry_behavior(value):
     value = str(value or "").strip().lower()
-    if value in {"light", "normal", "aggressive"}:
+    if value in {"light", "normal", "aggressive", "custom"}:
         return value
     return "normal"
+
+
+def parse_bounded_int(value, minimum, maximum):
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        return None
+    if parsed < int(minimum) or parsed > int(maximum):
+        return None
+    return parsed
+
+
+def normalize_bounded_int_string(value, default_value, minimum, maximum):
+    parsed = parse_bounded_int(value, minimum, maximum)
+    if parsed is None:
+        parsed = parse_bounded_int(default_value, minimum, maximum)
+    if parsed is None:
+        parsed = int(minimum)
+    return str(parsed)
+
+
+def get_custom_retry_settings(settings=None, strict=False):
+    source = settings if isinstance(settings, dict) else {
+        "retry_custom_retries": retry_custom_retries_var.get(),
+        "retry_custom_fragment_retries": retry_custom_fragment_retries_var.get(),
+        "retry_custom_socket_timeout": retry_custom_socket_timeout_var.get(),
+        "retry_custom_sleep_max": retry_custom_sleep_max_var.get(),
+    }
+    specs = {
+        "retries": ("retry_custom_retries", 0, 100),
+        "fragment_retries": ("retry_custom_fragment_retries", 0, 100),
+        "socket_timeout": ("retry_custom_socket_timeout", 1, 900),
+        "sleep_max": ("retry_custom_sleep_max", 1, 3600),
+    }
+    result = {}
+    for result_key, (setting_key, minimum, maximum) in specs.items():
+        raw = source.get(setting_key, DEFAULTS[setting_key])
+        parsed = parse_bounded_int(raw, minimum, maximum)
+        if parsed is None:
+            if strict:
+                raise ValueError(
+                    f"Custom retry setting {setting_key} is invalid. Enter an integer from {minimum} to {maximum}."
+                )
+            parsed = int(DEFAULTS[setting_key])
+        result[result_key] = parsed
+    return result
+
+
+def format_retry_behavior_summary(settings=None):
+    if isinstance(settings, dict):
+        behavior = normalize_retry_behavior(settings.get("retry_behavior", DEFAULTS["retry_behavior"]))
+    else:
+        behavior = normalize_retry_behavior(retry_behavior_var.get())
+    if behavior != "custom":
+        return behavior
+    values = get_custom_retry_settings(settings, strict=False)
+    return (
+        f"custom ({values['retries']} retries; {values['fragment_retries']} fragment; "
+        f"socket {values['socket_timeout']}s; sleep max {values['sleep_max']}s)"
+    )
+
+
+def update_custom_retry_state(*_args):
+    try:
+        state = "normal" if normalize_retry_behavior(retry_behavior_var.get()) == "custom" else "disabled"
+        for widget in globals().get("custom_retry_widgets", []):
+            widget.configure(state=state)
+    except Exception:
+        pass
+
+
+def on_custom_retry_commit(_event=None):
+    specs = [
+        (retry_custom_retries_var, "Retries", DEFAULTS["retry_custom_retries"], 0, 100),
+        (retry_custom_fragment_retries_var, "Fragment retries", DEFAULTS["retry_custom_fragment_retries"], 0, 100),
+        (retry_custom_socket_timeout_var, "Socket timeout", DEFAULTS["retry_custom_socket_timeout"], 1, 900),
+        (retry_custom_sleep_max_var, "Retry sleep max", DEFAULTS["retry_custom_sleep_max"], 1, 3600),
+    ]
+    for variable, label, default_value, minimum, maximum in specs:
+        raw = variable.get()
+        parsed = parse_bounded_int(raw, minimum, maximum)
+        if parsed is None:
+            messagebox.showerror(
+                f"Invalid {label.lower()}",
+                f"{label} must be a whole number from {minimum} to {maximum}.",
+            )
+            variable.set(default_value)
+        else:
+            variable.set(str(parsed))
+    update_capture_options_summary()
 
 
 def normalize_format_strategy(value):
@@ -20965,7 +21378,7 @@ def update_capture_options_summary(*_args):
         }
         cache_text = cache_names.get(normalize_gui_cache_mode(gui_cache_mode_var.get()), "cache after run")
         manifest_text = manifest_names.get(normalize_manifest_mode(manifest_mode_var.get()), "full manifest")
-        retry_text = f"retry {normalize_retry_behavior(retry_behavior_var.get())}"
+        retry_text = f"retry {format_retry_behavior_summary()}"
         throttle_text = f"throttle {throttled_rate_var.get()}" if throttle_detection_enabled_var.get() else "throttle off"
         chunk_text = f"chunk {http_chunk_size_var.get()}" if http_chunk_size_enabled_var.get() else "chunks auto"
         failure_text = "stop on fail" if failure_handling_var.get() == "stop" else "continue on fail"
@@ -22583,7 +22996,7 @@ def open_case_browser(select_tab=True, silent=False):
     )
     scale_menu.grid(row=0, column=6, sticky="e")
 
-    ttk.Label(browser_controls, text="View").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+    ttk.Label(browser_controls, text="View").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(3, 0))
     view_menu = ttk.Combobox(
         browser_controls,
         textvariable=browser_view_mode_var,
@@ -22591,12 +23004,12 @@ def open_case_browser(select_tab=True, silent=False):
         state="readonly",
         width=10,
     )
-    view_menu.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(6, 0))
+    view_menu.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=(3, 0))
 
-    ttk.Label(browser_controls, text="Search").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(6, 0))
+    ttk.Label(browser_controls, text="Search").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(3, 0))
     browser_search_entry = ttk.Entry(browser_controls, textvariable=browser_search_var)
-    browser_search_entry.grid(row=2, column=1, columnspan=5, sticky="ew", padx=(0, 8), pady=(6, 0))
-    ttk.Button(browser_controls, text="Clear", command=lambda: browser_search_var.set("")).grid(row=2, column=6, sticky="e", pady=(6, 0))
+    browser_search_entry.grid(row=2, column=1, columnspan=5, sticky="ew", padx=(0, 8), pady=(3, 0))
+    ttk.Button(browser_controls, text="Clear", command=lambda: browser_search_var.set("")).grid(row=2, column=6, sticky="e", pady=(3, 0))
     browser_search_var.trace_add("write", schedule_browser_search_refresh)
 
     try:
@@ -25145,17 +25558,9 @@ def render_web_filename_template_example(template, now=None, resolved_case_name=
     if not template:
         raise ValueError("Filename Template cannot be blank.")
 
-    now_utc = now or datetime.now(timezone.utc)
-    if getattr(now_utc, "tzinfo", None) is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
-    else:
-        now_utc = now_utc.astimezone(timezone.utc)
-
-    sample_values = {
-        "%date%": now_utc.strftime("%Y%m%d"),
-        "%time%": now_utc.strftime("%H%M%S"),
-        "%datetime%": now_utc.strftime("%Y%m%d-%H%M%S"),
-        "%engine%": get_capture_engine_template_value("web-capture"),
+    local_now = normalize_template_datetime(now)
+    sample_values = get_capture_time_template_values(local_now, engine="web-capture")
+    sample_values.update({
         "%domain%": "example.com",
         "%title%": "Sample Page Title",
         "%index%": "001",
@@ -25163,8 +25568,8 @@ def render_web_filename_template_example(template, now=None, resolved_case_name=
         "%profile%": "sample-profile",
         "%mode%": {"viewport": "viewport", "both": "full-page-and-viewport"}.get(capture_mode, "full-page"),
         "%case%": safe_case_name(str(resolved_case_name or "Case-Sample")),
-    }
-    rendered = template
+    })
+    rendered = apply_filename_template_compat_aliases(template, WEB_FILENAME_COMPAT_ALIASES)
     for tag, value in sample_values.items():
         rendered = rendered.replace(tag, value)
     rendered = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", rendered)
@@ -25178,7 +25583,7 @@ def update_web_filename_template_preview(*_args):
         capture_mode = web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport", "both"} else "full_page"
         example = render_web_filename_template_example(
             web_filename_template_var.get(),
-            now=datetime.now(timezone.utc),
+            now=datetime.now().astimezone(),
             resolved_case_name=resolved_case,
             capture_mode=capture_mode,
         )
@@ -25224,17 +25629,9 @@ def render_web_interactive_filename_template_example(template, now=None, resolve
     if not template:
         raise ValueError("Filename Template cannot be blank.")
 
-    now_utc = now or datetime.now(timezone.utc)
-    if getattr(now_utc, "tzinfo", None) is None:
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
-    else:
-        now_utc = now_utc.astimezone(timezone.utc)
-
-    sample_values = {
-        "%date%": now_utc.strftime("%Y%m%d"),
-        "%time%": now_utc.strftime("%H%M%S"),
-        "%datetime%": now_utc.strftime("%Y%m%d-%H%M%S"),
-        "%engine%": get_capture_engine_template_value("web-capture"),
+    local_now = normalize_template_datetime(now)
+    sample_values = get_capture_time_template_values(local_now, engine="web-capture")
+    sample_values.update({
         "%domain%": "example.com",
         "%title%": "Sample Page Title",
         "%index%": "001",
@@ -25244,8 +25641,8 @@ def render_web_interactive_filename_template_example(template, now=None, resolve
         "%contentid%": "content-12345",
         "%mode%": {"viewport": "viewport", "both": "full-page-and-viewport"}.get(capture_mode, "full-page"),
         "%case%": safe_case_name(str(resolved_case_name or "Case-Sample")),
-    }
-    rendered = template
+    })
+    rendered = apply_filename_template_compat_aliases(template, WEB_FILENAME_COMPAT_ALIASES)
     for tag, value in sample_values.items():
         rendered = rendered.replace(tag, value)
     rendered = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", rendered)
@@ -25259,7 +25656,7 @@ def update_web_interactive_filename_template_preview(*_args):
         resolved_case = get_resolved_web_case_name(now=datetime.now())
         example = render_web_interactive_filename_template_example(
             web_interactive_filename_template_var.get(),
-            now=datetime.now(timezone.utc),
+            now=datetime.now().astimezone(),
             resolved_case_name=resolved_case,
             capture_mode=web_capture_mode_var.get() if web_capture_mode_var.get() in {"full_page", "viewport", "both"} else "full_page",
             overlay_index="001",
@@ -25483,6 +25880,7 @@ def update_web_options_summary(*_args):
             readiness_event,
             f"quiet {normalize_positive_int_string(web_network_quiet_ms_var.get(), DEFAULTS['web_network_quiet_ms'])}ms/"
             f"{normalize_nonnegative_int_string(web_network_settle_timeout_var.get(), DEFAULTS['web_network_settle_timeout'])}s max",
+            "visual settle",
         ]
         condition_labels = []
         if web_wait_selector_enabled_var.get():
@@ -26954,6 +27352,16 @@ def apply_screen_aware_startup_geometry():
 
 
 root = tk.Tk()
+apply_wavi_window_icon(root)
+
+app_logo_photo = None
+try:
+    if os.path.isfile(APP_LOGO_PNG_PATH):
+        app_logo_photo = tk.PhotoImage(master=root, file=APP_LOGO_PNG_PATH)
+except Exception as exc:
+    app_logo_photo = None
+    log_debug_exception("Could not load WAVI logo image", exc)
+
 install_wavi_window_attention_hooks(root)
 try:
     ORIGINAL_TTK_THEME = ttk.Style(root).theme_use()
@@ -27045,6 +27453,10 @@ download_speed_limit_var = tk.StringVar(value=normalize_download_speed_limit_val
 download_speed_limit_enabled_var = tk.BooleanVar(value=bool(DEFAULTS["download_speed_limit_enabled"]))
 download_speed_slider_var = tk.DoubleVar(value=download_speed_bytes_to_slider(parse_download_speed_limit_to_bytes(download_speed_limit_var.get()) or DOWNLOAD_SPEED_DEFAULT_BYTES))
 retry_behavior_var = tk.StringVar(value=DEFAULTS["retry_behavior"])
+retry_custom_retries_var = tk.StringVar(value=DEFAULTS["retry_custom_retries"])
+retry_custom_fragment_retries_var = tk.StringVar(value=DEFAULTS["retry_custom_fragment_retries"])
+retry_custom_socket_timeout_var = tk.StringVar(value=DEFAULTS["retry_custom_socket_timeout"])
+retry_custom_sleep_max_var = tk.StringVar(value=DEFAULTS["retry_custom_sleep_max"])
 throttle_detection_enabled_var = tk.BooleanVar(value=DEFAULTS["throttle_detection_enabled"])
 throttled_rate_var = tk.StringVar(value=DEFAULTS["throttled_rate"])
 http_chunk_size_enabled_var = tk.BooleanVar(value=DEFAULTS["http_chunk_size_enabled"])
@@ -27080,6 +27492,9 @@ image_archive_mode_var = tk.StringVar(value=DEFAULTS["image_archive_mode"])
 image_write_metadata_var = tk.BooleanVar(value=DEFAULTS["image_write_metadata"])
 image_write_info_json_var = tk.BooleanVar(value=DEFAULTS["image_write_info_json"])
 image_write_tags_var = tk.BooleanVar(value=DEFAULTS["image_write_tags"])
+image_evidence_derivative_var = tk.BooleanVar(value=DEFAULTS["image_evidence_derivative"])
+image_evidence_match_source_format_var = tk.BooleanVar(value=DEFAULTS["image_evidence_match_source_format"])
+image_evidence_stamp_template_var = tk.StringVar(value=DEFAULTS["image_evidence_stamp_template"])
 image_rate_limit_var = tk.StringVar(value=DEFAULTS["image_rate_limit"])
 image_max_items_enabled_var = tk.BooleanVar(value=DEFAULTS["image_max_items_enabled"])
 image_max_items_var = tk.StringVar(value=DEFAULTS["image_max_items"])
@@ -27255,6 +27670,10 @@ for option_var in [
     download_speed_limit_var,
     download_speed_limit_enabled_var,
     retry_behavior_var,
+    retry_custom_retries_var,
+    retry_custom_fragment_retries_var,
+    retry_custom_socket_timeout_var,
+    retry_custom_sleep_max_var,
     throttle_detection_enabled_var,
     throttled_rate_var,
     http_chunk_size_enabled_var,
@@ -27287,6 +27706,9 @@ for option_var in [
     image_write_metadata_var,
     image_write_info_json_var,
     image_write_tags_var,
+    image_evidence_derivative_var,
+    image_evidence_match_source_format_var,
+    image_evidence_stamp_template_var,
     image_rate_limit_var,
     image_max_items_enabled_var,
     image_max_items_var,
@@ -28614,6 +29036,10 @@ def get_image_settings_dict():
         "image_write_metadata": bool(image_write_metadata_var.get()),
         "image_write_info_json": bool(image_write_info_json_var.get()),
         "image_write_tags": bool(image_write_tags_var.get()),
+        "image_evidence_derivative": bool(image_evidence_derivative_var.get()),
+        "image_evidence_match_source_format": bool(image_evidence_match_source_format_var.get()),
+        "image_evidence_stamp_template": get_image_evidence_stamp_template_value(),
+        "ffmpeg_folder": ffmpeg_folder_var.get().strip(),
         "image_rate_limit": image_rate_limit_var.get(),
         "image_max_items_enabled": bool(image_max_items_enabled_var.get()),
         "image_max_items": normalize_optional_positive_int_string(image_max_items_var.get()),
@@ -28660,6 +29086,12 @@ def validate_image_inputs(urls_override=None):
     if not image_case_name_var.get().strip():
         raise ValueError("Gallery/Profile Capture Case Name cannot be blank.")
     validate_gallery_filename_template(image_filename_template_var.get())
+    if image_evidence_derivative_var.get() and image_capture_mode_var.get() != "metadata_only":
+        validate_image_evidence_stamp_template(get_image_evidence_stamp_template_value())
+        ffmpeg_exe = resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+        ffprobe_exe = resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+        if not os.path.isfile(ffmpeg_exe) or not os.path.isfile(ffprobe_exe):
+            raise ValueError("Gallery/Profile evidence stamping requires ffmpeg.exe and ffprobe.exe in the configured FFmpeg folder.")
     update_image_case_folder_preview()
 
 
@@ -28688,6 +29120,14 @@ def validate_gallery_queue_job_inputs(job):
         job.get("resolved_case_name", "").strip(),
         label="Gallery/Profile Capture Queue Job Case Name",
     )
+    capture_mode = str(settings.get("image_capture_mode", DEFAULTS["image_capture_mode"]) or DEFAULTS["image_capture_mode"]).lower()
+    if bool(settings.get("image_evidence_derivative", DEFAULTS["image_evidence_derivative"])) and capture_mode != "metadata_only":
+        validate_image_evidence_stamp_template(str(settings.get("image_evidence_stamp_template", DEFAULTS["image_evidence_stamp_template"]) or DEFAULTS["image_evidence_stamp_template"]))
+        ffmpeg_folder = str(settings.get("ffmpeg_folder", ffmpeg_folder_var.get()) or "").strip()
+        ffmpeg_path = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+        ffprobe_path = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+        if not os.path.isfile(ffmpeg_path) or not os.path.isfile(ffprobe_path):
+            raise ValueError("Gallery/Profile evidence stamping requires ffmpeg.exe and ffprobe.exe in the configured FFmpeg folder.")
 
 
 def build_gallery_powershell_command_for_job(job):
@@ -28725,6 +29165,18 @@ def build_gallery_powershell_command_for_job(job):
         cmd += ["-MetadataOnly"]
     elif capture_mode == "media_only":
         cmd += ["-MediaOnly"]
+    if bool(settings.get("image_evidence_derivative", DEFAULTS["image_evidence_derivative"])) and capture_mode != "metadata_only":
+        stamp_template = str(settings.get("image_evidence_stamp_template", DEFAULTS["image_evidence_stamp_template"]) or DEFAULTS["image_evidence_stamp_template"])
+        validate_image_evidence_stamp_template(stamp_template)
+        stamp_template_b64 = base64.b64encode(stamp_template.encode("utf-8")).decode("ascii")
+        cmd += [
+            "-CreateEvidenceDerivative",
+            "-FFmpegFolder", str(settings.get("ffmpeg_folder", ffmpeg_folder_var.get()) or "").strip(),
+            "-WaviVersion", APP_VERSION,
+            "-EvidenceStampTemplateBase64", stamp_template_b64,
+        ]
+        if bool(settings.get("image_evidence_match_source_format", DEFAULTS["image_evidence_match_source_format"])):
+            cmd += ["-MatchEvidenceSourceFormat"]
     if capture_mode != "media_only":
         if bool(settings.get("image_write_metadata", True)):
             cmd += ["-WriteMetadata"]
@@ -28765,6 +29217,11 @@ def image_preflight_check(show_success_popup=True):
 
     add_check("PowerShell script exists", bool(script_path and os.path.isfile(script_path)), script_path or "not set")
     add_check("gallery-dl exists", bool(gallery_path and os.path.isfile(gallery_path)), gallery_path or "not set")
+    if image_evidence_derivative_var.get() and image_capture_mode_var.get() != "metadata_only":
+        ffmpeg_path = resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
+        ffprobe_path = resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+        add_check("ffmpeg.exe available for evidence stamping", os.path.isfile(ffmpeg_path), ffmpeg_path or "not set")
+        add_check("ffprobe.exe available for evidence stamping", os.path.isfile(ffprobe_path), ffprobe_path or "not set")
     add_check("URLs available", bool(urls), f"{len(urls)} URL(s)")
 
     try:
@@ -29241,6 +29698,8 @@ def update_image_options_state(*_args):
         max_state = "normal" if image_max_items_enabled_var.get() else "disabled"
         range_state = "normal" if image_item_range_enabled_var.get() else "disabled"
         metadata_state = "disabled" if image_capture_mode_var.get() == "media_only" else "normal"
+        evidence_state = "disabled" if image_capture_mode_var.get() == "metadata_only" else "normal"
+        evidence_match_state = "normal" if (evidence_state == "normal" and image_evidence_derivative_var.get()) else "disabled"
         for widget in globals().get("image_max_item_widgets", []):
             try:
                 widget.configure(state=max_state)
@@ -29254,6 +29713,16 @@ def update_image_options_state(*_args):
         for widget in globals().get("image_metadata_sidecar_widgets", []):
             try:
                 widget.configure(state=metadata_state)
+            except Exception:
+                pass
+        for widget in globals().get("image_evidence_derivative_widgets", []):
+            try:
+                widget.configure(state=evidence_state)
+            except Exception:
+                pass
+        for widget in globals().get("image_evidence_match_source_format_widgets", []):
+            try:
+                widget.configure(state=evidence_match_state)
             except Exception:
                 pass
     except Exception:
@@ -29313,6 +29782,7 @@ def update_image_options_summary(*_args):
             f"Retries: {retries}",
             f"Timeout: {timeout}s",
             f"Concurrent: {get_image_concurrent_capture_limit()}",
+            f"Evidence stamping: {'on (' + ('source format' if image_evidence_match_source_format_var.get() else 'PNG') + ')' if image_evidence_derivative_var.get() else 'off'}",
             f"Scope: {scope_text}",
         ]
         image_options_summary_var.set("; ".join(parts))
@@ -29335,6 +29805,8 @@ def hide_image_capture_options_panel(save=False):
 
 
 def hide_image_advanced_options_panel(save=False):
+    if save:
+        sync_image_evidence_stamp_template_from_widget(schedule_autosave=False)
     remove_grid_managed_widget(image_advanced_options_panel)
 
     try:
@@ -29403,6 +29875,9 @@ for image_option_var in [
     image_write_metadata_var,
     image_write_info_json_var,
     image_write_tags_var,
+    image_evidence_derivative_var,
+    image_evidence_match_source_format_var,
+    image_evidence_stamp_template_var,
     image_rate_limit_var,
     image_max_items_enabled_var,
     image_max_items_var,
@@ -29491,6 +29966,7 @@ def build_image_capture_tab():
         fname_menu.add_command(label=tag, command=lambda value=tag: insert_image_filename_template_tag(value))
     fname_menu.add_separator()
     fname_menu.add_command(label="%case%", command=lambda: insert_image_filename_template_tag("%case%"))
+    fname_menu.add_command(label="%domain%", command=lambda: insert_image_filename_template_tag("%domain%"))
     fname_menu.add_separator()
     for tag, _native, _sample in GALLERYDL_FILENAME_TAGS:
         fname_menu.add_command(label=tag, command=lambda value=tag: insert_image_filename_template_tag(value))
@@ -29987,7 +30463,7 @@ ttk.Label(
     text="The initial viewport is captured before lazy-load scrolling. Very tall full pages may be saved as numbered segments.",
     wraplength=420,
     justify="left",
-).pack(anchor="w", pady=(6, 0))
+).pack(anchor="w", pady=(3, 0))
 
 web_image_output_frame = ttk.LabelFrame(web_capture_tab_options, text="Image Format", padding=8)
 web_image_output_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
@@ -30016,7 +30492,7 @@ ttk.Label(
     text="PNG is lossless and recommended. Quality applies only to JPEG and WebP. Captured PNG PDF output requires PNG.",
     wraplength=420,
     justify="left",
-).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
 web_execution_frame = ttk.LabelFrame(web_capture_tab_options, text="Capture Execution", padding=8)
 web_execution_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -30098,7 +30574,7 @@ ttk.Label(
 ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 Tooltip(web_dom_ready_radio, "Continue after Chromium reports that the document has been parsed, without requiring the full load event.")
 Tooltip(web_load_ready_radio, "Continue after Chromium reports the full page load event.")
-Tooltip(web_additional_wait_entry, "Runs after the selected load event, network settling, and all enabled page conditions.")
+Tooltip(web_additional_wait_entry, "Runs after the selected load event, network settling, and enabled page conditions, before WAVI performs its final visual-stability check.")
 
 web_condition_frame = ttk.LabelFrame(web_readiness_tab, text="Page Conditions", padding=8)
 web_condition_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
@@ -30187,7 +30663,7 @@ for column, (label, value) in enumerate((
     ).grid(row=0, column=column, sticky="w", padx=(0 if column == 0 else 12, 0), pady=2)
 ttk.Label(
     web_readiness_timeout_frame,
-    text="Applies to load-event, network-settling, and page-condition timeouts. Invalid selectors and navigation failures always fail.",
+    text="Applies to load-event, network-settling, page-condition, and visual-stability timeouts. Invalid selectors and navigation failures always fail.",
     wraplength=920,
     justify="left",
 ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
@@ -30303,7 +30779,7 @@ ttk.Checkbutton(
     command=update_web_options_summary,
 ).pack(side="left")
 web_fixed_row = ttk.Frame(web_stabilization_frame)
-web_fixed_row.pack(fill="x", pady=(6, 0))
+web_fixed_row.pack(fill="x", pady=(3, 0))
 ttk.Label(web_fixed_row, text="Fixed/sticky:").pack(side="left", padx=(0, 6))
 for label, value in (("Preserve", "preserve_layout"), ("Neutralize", "neutralize_fixed_sticky"), ("Hide likely navigation", "hide_likely_navigation_overlays")):
     ttk.Radiobutton(
@@ -30691,7 +31167,7 @@ ttk.Label(
     ),
     wraplength=420,
     justify="left",
-).pack(anchor="w", pady=(6, 0))
+).pack(anchor="w", pady=(3, 0))
 
 web_pdf_output_frame = ttk.LabelFrame(web_pdf_general_tab, text="Output", padding=8)
 web_pdf_output_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
@@ -30730,10 +31206,10 @@ ttk.Label(
     text="Landscape, site backgrounds, paper/scale, page ranges, and CSS page sizing apply only to Live Page PDFs.",
     wraplength=420,
     justify="left",
-).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
 web_pdf_behavior_frame = ttk.LabelFrame(web_pdf_general_tab, text="Live Page Layout", padding=8)
-web_pdf_behavior_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+web_pdf_behavior_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 for column in range(3):
     web_pdf_behavior_frame.columnconfigure(column, weight=1)
 for column, (web_pdf_behavior_text, web_pdf_behavior_value) in enumerate((
@@ -30756,7 +31232,7 @@ ttk.Label(
     ),
     wraplength=920,
     justify="left",
-).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
 # Page tab: compact paper, scale, page-range, and margin controls.
 web_pdf_page_tab = ttk.Frame(web_pdf_notebook, padding=8)
@@ -30792,7 +31268,7 @@ ttk.Label(
     text="Leave pages blank for all pages. Examples: 1-5 or 1,3,5-8.",
     wraplength=420,
     justify="left",
-).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=4, column=0, columnspan=2, sticky="w", pady=(3, 0))
 ttk.Label(
     web_pdf_layout_frame,
     text=(
@@ -30801,7 +31277,7 @@ ttk.Label(
     ),
     wraplength=420,
     justify="left",
-).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
 web_pdf_png_height_frame = ttk.LabelFrame(web_pdf_page_tab, text="Captured PNG Page Ratio", padding=8)
 web_pdf_png_height_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -30920,7 +31396,7 @@ ttk.Label(
     ),
     wraplength=900,
     justify="left",
-).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+).grid(row=3, column=0, columnspan=4, sticky="w", pady=(3, 0))
 
 # Templates tab: dedicated space for custom HTML without forcing the whole
 # PDF overlay to grow vertically.
@@ -30956,15 +31432,13 @@ for web_pdf_tag_item in WEB_PDF_TEMPLATE_TAG_MENU_ITEMS:
         web_pdf_header_tag_menu.add_separator()
         web_pdf_footer_tag_menu.add_separator()
         continue
-    web_pdf_tag_label, web_pdf_tag_value = web_pdf_tag_item
-    menu_label = f"{web_pdf_tag_label}    {web_pdf_tag_value}"
     web_pdf_header_tag_menu.add_command(
-        label=menu_label,
-        command=lambda value=web_pdf_tag_value: insert_web_pdf_template_tag(web_pdf_header_text, value),
+        label=web_pdf_tag_item,
+        command=lambda value=web_pdf_tag_item: insert_web_pdf_template_tag(web_pdf_header_text, value),
     )
     web_pdf_footer_tag_menu.add_command(
-        label=menu_label,
-        command=lambda value=web_pdf_tag_value: insert_web_pdf_template_tag(web_pdf_footer_text, value),
+        label=web_pdf_tag_item,
+        command=lambda value=web_pdf_tag_item: insert_web_pdf_template_tag(web_pdf_footer_text, value),
     )
 web_pdf_header_tag_button.configure(
     command=lambda: post_web_pdf_template_tag_menu(web_pdf_header_tag_button, web_pdf_header_tag_menu)
@@ -30985,12 +31459,12 @@ set_web_pdf_footer_template_value(web_pdf_footer_template_var.get())
 ttk.Label(
     web_pdf_templates_tab,
     text=(
-        "Use Insert Tag to add WAVI capture values at the cursor position. Tags include URL, page title, local/UTC capture time, "
-        "and page number/count. Chromium classes date, title, url, pageNumber, and totalPages remain available for Live Page PDFs."
+        "Use Insert Tag to add WAVI capture values at the cursor position. The menu uses the same normalized tag names as "
+        "the other WAVI template menus. Chromium classes date, title, url, pageNumber, and totalPages remain available for Live Page PDFs."
     ),
     wraplength=920,
     justify="left",
-).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 
 def on_web_pdf_template_edit(_event=None):
     sync_web_pdf_templates_from_widgets(schedule_autosave=True)
@@ -31213,7 +31687,7 @@ ttk.Label(
     text="Item range uses gallery-dl range syntax, for example 1-25.",
     wraplength=280,
     justify="left",
-).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
 image_limits_frame.columnconfigure(1, weight=1)
 image_max_item_widgets = [image_max_entry]
 image_item_range_widgets = [image_range_entry]
@@ -31283,7 +31757,7 @@ image_advanced_options_content.columnconfigure(1, weight=1, uniform="image_advan
 
 ttk.Label(
     image_advanced_options_content,
-    text="These settings control gallery-dl pacing, retries, and timeout behavior.",
+    text="These settings control gallery-dl pacing, retries, timeout behavior, and optional evidence stamping.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -31319,6 +31793,76 @@ image_concurrent_captures_menu = ttk.Combobox(
 )
 image_concurrent_captures_menu.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
 image_retry_frame.columnconfigure(1, weight=1)
+
+image_evidence_frame = ttk.LabelFrame(image_advanced_options_content, text="Evidence Stamping", padding=8)
+image_evidence_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+image_evidence_frame.columnconfigure(0, weight=1)
+
+image_evidence_derivative_check = ttk.Checkbutton(
+    image_evidence_frame,
+    text="Enable evidence stamping for newly captured static images",
+    variable=image_evidence_derivative_var,
+    command=update_image_options_summary,
+)
+image_evidence_derivative_check.grid(row=0, column=0, sticky="w", pady=2)
+
+image_evidence_match_source_format_check = ttk.Checkbutton(
+    image_evidence_frame,
+    text="Match evidence source format",
+    variable=image_evidence_match_source_format_var,
+    command=update_image_options_summary,
+)
+image_evidence_match_source_format_check.grid(row=1, column=0, sticky="w", pady=(2, 2))
+
+image_evidence_stamp_toolbar = ttk.Frame(image_evidence_frame)
+image_evidence_stamp_toolbar.grid(row=2, column=0, sticky="ew")
+image_evidence_stamp_toolbar.columnconfigure(0, weight=1)
+ttk.Label(image_evidence_stamp_toolbar, text="Stamped text template").grid(row=0, column=0, sticky="w")
+image_evidence_stamp_tag_button = ttk.Button(
+    image_evidence_stamp_toolbar,
+    text="Insert Tag ▼",
+    command=post_image_evidence_stamp_tag_menu,
+)
+image_evidence_stamp_tag_button.grid(row=0, column=1, sticky="e")
+
+image_evidence_stamp_text = scrolledtext.ScrolledText(image_evidence_frame, height=7, wrap="word")
+image_evidence_stamp_text.grid(row=3, column=0, sticky="nsew", pady=(3, 0))
+image_evidence_stamp_text.insert("1.0", image_evidence_stamp_template_var.get())
+
+image_evidence_stamp_tag_menu = tk.Menu(image_evidence_frame, tearoff=False)
+for image_evidence_tag_item in IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS:
+    if image_evidence_tag_item is None:
+        image_evidence_stamp_tag_menu.add_separator()
+        continue
+    image_evidence_stamp_tag_menu.add_command(
+        label=image_evidence_tag_item,
+        command=lambda value=image_evidence_tag_item: insert_image_evidence_stamp_tag(value),
+    )
+
+def on_image_evidence_stamp_template_edit(_event=None):
+    sync_image_evidence_stamp_template_from_widget(schedule_autosave=True)
+
+image_evidence_stamp_text.bind("<KeyRelease>", on_image_evidence_stamp_template_edit)
+image_evidence_stamp_text.bind("<FocusOut>", on_image_evidence_stamp_template_edit)
+
+ttk.Label(
+    image_evidence_frame,
+    text=(
+        "Tags are resolved separately for each stamped artifact. For multi-URL runs, %url% resolves to a "
+        "non-attributing multiple-URL label instead of claiming a specific submitted URL belongs to the item."
+    ),
+    wraplength=920,
+    justify="left",
+).grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+image_evidence_derivative_widgets = [
+    image_evidence_derivative_check,
+    image_evidence_stamp_text,
+    image_evidence_stamp_tag_button,
+]
+image_evidence_match_source_format_widgets = [
+    image_evidence_match_source_format_check,
+]
 
 
 add_options_panel_close_button(
@@ -31532,7 +32076,7 @@ ttk.Label(
     text="Enabled only for playlist/multi-item sources. Check an option to pass that playlist flag. Saved values are preserved when unchecked.",
     wraplength=900,
     justify="left",
-).grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
+).grid(row=2, column=0, columnspan=6, sticky="w", pady=(3, 0))
 
 output_record_frame = ttk.LabelFrame(capture_options_content, text="Output Records", padding=8)
 output_record_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -31566,7 +32110,7 @@ ttk.Label(
     text="Cache controls when Case Browser thumbnails/details are prepared. Manifest controls whether all case files or only this run's files are hashed.",
     wraplength=900,
     justify="left",
-).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+).grid(row=1, column=0, columnspan=4, sticky="w", pady=(3, 0))
 
 date_filter_frame = ttk.Frame(date_outer_frame)
 date_filter_frame.grid(row=0, column=0, columnspan=6, sticky="ew")
@@ -31723,7 +32267,7 @@ ttk.Label(
     text="Sidecar files remain separate from the final media file and are easier to inspect, hash, compare, and preserve independently.",
     wraplength=900,
     justify="left",
-).grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(6, 0))
+).grid(row=2, column=0, columnspan=4, sticky="ew", padx=4, pady=(3, 0))
 
 embed_frame = ttk.LabelFrame(metadata_options_content, text="Embed Options", padding=8)
 embed_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -31756,7 +32300,7 @@ ttk.Label(
     text="Embedding applies in Media + sidecars or Media + Embedded mode. Media + Embedded ignores sidecar files. Some embed options depend on output format, available metadata, and FFmpeg/mutagen support.",
     wraplength=900,
     justify="left",
-).grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=(6, 0))
+).grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=(3, 0))
 
 add_options_panel_close_button(
     metadata_options_content,
@@ -31797,7 +32341,7 @@ ttk.Label(
     text="Enter one or more keywords separated by commas. The script builds a safe case-insensitive title filter.",
     wraplength=900,
     justify="left",
-).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+).grid(row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
 impersonate_frame = ttk.LabelFrame(advanced_options_content, text="Impersonate Target", padding=8)
 impersonate_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -31825,14 +32369,14 @@ impersonate_menu = impersonate_menu_box
 ttk.Label(
     impersonate_frame,
     textvariable=target_status_var,
-).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
 ttk.Checkbutton(
     impersonate_frame,
     text="Show specific targets",
     variable=show_all_impersonate_targets_var,
     command=lambda: target_status_var.set("Impersonate targets: Not checked"),
-).grid(row=1, column=2, sticky="e", pady=(6, 0))
+).grid(row=1, column=2, sticky="e", pady=(3, 0))
 
 failure_rate_options_row = ttk.Frame(advanced_options_content)
 failure_rate_options_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -31884,7 +32428,7 @@ ttk.Label(
     text="Values above 1 use the Job Queue and check for matching URL domains before concurrent runs.",
     wraplength=360,
     justify="left",
-).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
 
 add_options_panel_close_button(
     advanced_options_content,
@@ -31933,19 +32477,49 @@ ttk.Label(retry_frame, text="Retry profile").grid(row=0, column=0, sticky="w", p
 retry_behavior_menu = ttk.Combobox(
     retry_frame,
     textvariable=retry_behavior_var,
-    values=["light", "normal", "aggressive"],
+    values=["light", "normal", "aggressive", "custom"],
     state="readonly",
     width=14,
 )
 retry_behavior_menu.grid(row=0, column=1, sticky="w", pady=3)
-retry_behavior_menu.bind("<<ComboboxSelected>>", lambda event: update_capture_options_summary())
+retry_behavior_menu.bind(
+    "<<ComboboxSelected>>",
+    lambda event: (update_custom_retry_state(), update_capture_options_summary()),
+)
+
+custom_retry_widgets = []
+
+ttk.Label(retry_frame, text="Retries").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+retry_custom_retries_entry = ttk.Entry(retry_frame, textvariable=retry_custom_retries_var, width=8)
+retry_custom_retries_entry.grid(row=1, column=1, sticky="w", pady=3)
+custom_retry_widgets.append(retry_custom_retries_entry)
+
+ttk.Label(retry_frame, text="Fragment retries").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+retry_custom_fragment_retries_entry = ttk.Entry(retry_frame, textvariable=retry_custom_fragment_retries_var, width=8)
+retry_custom_fragment_retries_entry.grid(row=2, column=1, sticky="w", pady=3)
+custom_retry_widgets.append(retry_custom_fragment_retries_entry)
+
+ttk.Label(retry_frame, text="Socket timeout (s)").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+retry_custom_socket_timeout_entry = ttk.Entry(retry_frame, textvariable=retry_custom_socket_timeout_var, width=8)
+retry_custom_socket_timeout_entry.grid(row=3, column=1, sticky="w", pady=3)
+custom_retry_widgets.append(retry_custom_socket_timeout_entry)
+
+ttk.Label(retry_frame, text="Retry sleep max (s)").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=3)
+retry_custom_sleep_max_entry = ttk.Entry(retry_frame, textvariable=retry_custom_sleep_max_var, width=8)
+retry_custom_sleep_max_entry.grid(row=4, column=1, sticky="w", pady=3)
+custom_retry_widgets.append(retry_custom_sleep_max_entry)
+
+for custom_retry_entry in custom_retry_widgets:
+    custom_retry_entry.bind("<Return>", on_custom_retry_commit)
+    custom_retry_entry.bind("<FocusOut>", on_custom_retry_commit)
 
 ttk.Label(
     retry_frame,
-    text="Light reduces retries; Aggressive raises retries and retry sleep windows for unstable sources.",
+    text="Presets keep their existing behaviour. Custom also sets yt-dlp's socket timeout and maximum exponential retry sleep.",
     wraplength=430,
     justify="left",
-).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+).grid(row=5, column=0, columnspan=2, sticky="w", pady=(3, 0))
+update_custom_retry_state()
 
 download_speed_frame = ttk.LabelFrame(pacing_options_content, text="Download Speed Limit", padding=8)
 download_speed_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
@@ -31982,7 +32556,7 @@ ttk.Label(
     text="Range: 1 KiB/s to 1 GiB/s. The slider increases logarithmically; edit the value directly for precision.",
     wraplength=720,
     justify="left",
-).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(3, 0))
 
 sync_download_speed_limit_controls_from_var(show_errors=False)
 

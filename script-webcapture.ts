@@ -9,7 +9,7 @@ explicitly enabled, it may read a user-selected Netscape cookies.txt file and
 inject either site-applicable cookies or the entire file into the isolated browser session.
 */
 
-const SCRIPT_SCHEMA_VERSION = 10;
+const SCRIPT_SCHEMA_VERSION = 11;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -486,15 +486,24 @@ async function uniqueOutputPath(folder, baseName, extension) {
   throw new Error("Could not create a unique output filename.");
 }
 
-function renderFilenameTemplate(template, context) {
-  const date = context.date;
+function captureTimeFilenameTags(dateValue) {
+  const date = dateValue instanceof Date && !Number.isNaN(dateValue.getTime()) ? dateValue : new Date();
   const p = (value, width = 2) => String(value).padStart(width, "0");
+  return {
+    "%date%": `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}`,
+    "%time%": `${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`,
+    "%datetime%": `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())}_${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`,
+    "%utcdatetime%": `${date.getUTCFullYear()}${p(date.getUTCMonth() + 1)}${p(date.getUTCDate())}_${p(date.getUTCHours())}${p(date.getUTCMinutes())}${p(date.getUTCSeconds())}Z`,
+  };
+}
+
+function renderFilenameTemplate(template, context) {
+  const domainTagValue = safeFileComponent(context.domain, "unknown-domain", 90);
   const tags = {
-    "%date%": `${date.getUTCFullYear()}${p(date.getUTCMonth() + 1)}${p(date.getUTCDate())}`,
-    "%time%": `${p(date.getUTCHours())}${p(date.getUTCMinutes())}${p(date.getUTCSeconds())}`,
-    "%datetime%": stampUtc(date),
+    ...captureTimeFilenameTags(context.date),
     "%engine%": "webpage",
-    "%domain%": safeFileComponent(context.domain, "unknown-domain", 90),
+    "%domain%": domainTagValue,
+    "%webpage_domain%": domainTagValue,
     "%title%": safeFileComponent(context.title, "untitled", 120),
     "%index%": String(context.index).padStart(3, "0"),
     "%urlindex%": String(context.index).padStart(3, "0"),
@@ -560,23 +569,56 @@ function buildPdfTemplateReplacements(context) {
   const finalUrl = String(context?.final_url || "");
   const bestUrl = finalUrl || requestedUrl;
   const pageTitle = String(context?.page_title || "");
+  const caseName = String(context?.case_name || "");
+  const appVersion = String(context?.app_version || "");
   const pageNumber = context?.page_number == null ? "" : String(context.page_number);
   const pageCount = context?.page_count == null ? "" : String(context.page_count);
+  let domain = "";
+  try { domain = new URL(bestUrl).hostname || ""; } catch { /* keep blank */ }
   const parsed = captureUtc ? new Date(captureUtc) : null;
   const validDate = parsed instanceof Date && !Number.isNaN(parsed.getTime()) ? parsed : null;
+  const pad2 = (value) => String(value).padStart(2, "0");
+  const normalizedDateLocal = validDate
+    ? `${validDate.getFullYear()}-${pad2(validDate.getMonth() + 1)}-${pad2(validDate.getDate())}`
+    : "";
+  const normalizedTimeLocal = validDate
+    ? `${pad2(validDate.getHours())}${pad2(validDate.getMinutes())}${pad2(validDate.getSeconds())}`
+    : "";
+  const normalizedDateTimeLocal = normalizedDateLocal && normalizedTimeLocal
+    ? `${normalizedDateLocal}_${normalizedTimeLocal}`
+    : "";
+  const normalizedUtcDateTime = validDate
+    ? `${validDate.getUTCFullYear()}${pad2(validDate.getUTCMonth() + 1)}${pad2(validDate.getUTCDate())}_${pad2(validDate.getUTCHours())}${pad2(validDate.getUTCMinutes())}${pad2(validDate.getUTCSeconds())}Z`
+    : "";
+
+  // Preserve the long-standing PDF/header-footer placeholders exactly for
+  // saved templates while exposing normalized WAVI names in new menus.
   const captureDateUtc = validDate
-    ? `${validDate.getUTCFullYear()}-${String(validDate.getUTCMonth() + 1).padStart(2, "0")}-${String(validDate.getUTCDate()).padStart(2, "0")}`
+    ? `${validDate.getUTCFullYear()}-${pad2(validDate.getUTCMonth() + 1)}-${pad2(validDate.getUTCDate())}`
     : "";
   const captureTimeUtc = validDate
-    ? `${String(validDate.getUTCHours()).padStart(2, "0")}:${String(validDate.getUTCMinutes()).padStart(2, "0")}:${String(validDate.getUTCSeconds()).padStart(2, "0")} UTC`
+    ? `${pad2(validDate.getUTCHours())}:${pad2(validDate.getUTCMinutes())}:${pad2(validDate.getUTCSeconds())} UTC`
     : "";
   const captureTimestampUtc = captureDateUtc && captureTimeUtc ? `${captureDateUtc} ${captureTimeUtc}` : captureUtc;
   const captureDateLocal = formatPdfTemplateLocal(captureUtc, "date");
   const captureTimeLocal = formatPdfTemplateLocal(captureUtc, "time");
   const captureTimestampLocal = formatPdfTemplateLocal(captureUtc, "datetime");
   return {
+    "%url%": htmlEscape(bestUrl),
     "%requested_url%": htmlEscape(requestedUrl),
     "%final_url%": htmlEscape(finalUrl),
+    "%domain%": htmlEscape(domain),
+    "%title%": htmlEscape(pageTitle),
+    "%date%": htmlEscape(normalizedDateLocal),
+    "%time%": htmlEscape(normalizedTimeLocal),
+    "%datetime%": htmlEscape(normalizedDateTimeLocal),
+    "%utcdatetime%": htmlEscape(normalizedUtcDateTime),
+    "%case%": htmlEscape(caseName),
+    "%engine%": "webpage",
+    "%version%": htmlEscape(appVersion),
+    "%page_number%": htmlEscape(pageNumber),
+    "%page_count%": htmlEscape(pageCount),
+
     "%best_url%": htmlEscape(bestUrl),
     "%page_title%": htmlEscape(pageTitle),
     "%capture_utc%": htmlEscape(captureUtc),
@@ -587,8 +629,6 @@ function buildPdfTemplateReplacements(context) {
     "%capture_timestamp_local%": htmlEscape(captureTimestampLocal),
     "%capture_date_local%": htmlEscape(captureDateLocal),
     "%capture_time_local%": htmlEscape(captureTimeLocal),
-    "%page_number%": htmlEscape(pageNumber),
-    "%page_count%": htmlEscape(pageCount),
   };
 }
 
@@ -1745,6 +1785,8 @@ async function waitForNetworkQuiet(state, quietMs = 750, maximumMs = 5000) {
       elapsed_ms: 0,
       inflight_at_end: state.inflight.size,
       maximum_inflight: Number(state.maximumInflight) || state.inflight.size,
+      ignored_background_requests: Number(state.ignoredBackgroundRequests) || 0,
+      ignored_background_request_types: state.ignoredBackgroundRequestTypes || {},
       reason: "Network settling was disabled.",
     };
   }
@@ -1760,7 +1802,9 @@ async function waitForNetworkQuiet(state, quietMs = 750, maximumMs = 5000) {
         elapsed_ms: Date.now() - startedAt,
         inflight_at_end: 0,
         maximum_inflight: Number(state.maximumInflight) || 0,
-        reason: "The network remained quiet for the configured duration.",
+        ignored_background_requests: Number(state.ignoredBackgroundRequests) || 0,
+        ignored_background_request_types: state.ignoredBackgroundRequestTypes || {},
+        reason: "The network remained quiet for the configured duration. Long-lived WebSocket/EventSource/Ping traffic is ignored for readiness.",
       };
     }
     await delay(100);
@@ -1773,7 +1817,9 @@ async function waitForNetworkQuiet(state, quietMs = 750, maximumMs = 5000) {
     elapsed_ms: Date.now() - startedAt,
     inflight_at_end: state.inflight.size,
     maximum_inflight: Number(state.maximumInflight) || state.inflight.size,
-    reason: "Network activity did not remain quiet before the maximum settling duration elapsed.",
+    ignored_background_requests: Number(state.ignoredBackgroundRequests) || 0,
+    ignored_background_request_types: state.ignoredBackgroundRequestTypes || {},
+    reason: "Network activity did not remain quiet before the maximum settling duration elapsed. Long-lived WebSocket/EventSource/Ping traffic is ignored for readiness.",
   };
 }
 
@@ -1886,6 +1932,117 @@ async function waitForPageConditions(client, config) {
   };
 }
 
+async function waitForVisualStability(client, config, stage = "visual_stability") {
+  const quietMs = Math.max(500, Math.min(2500, Number(config.network_quiet_ms || 1000)));
+  const maximumMs = Math.max(3000, Math.min(10000, Math.max(quietMs * 4, 4000)));
+  const sampleMs = Math.max(100, Math.min(500, Math.floor(quietMs / 4)));
+  const expression = `
+    (async () => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const getHeight = () => Math.max(
+        document.body ? document.body.scrollHeight : 0,
+        document.documentElement ? document.documentElement.scrollHeight : 0,
+        document.body ? document.body.offsetHeight : 0,
+        document.documentElement ? document.documentElement.offsetHeight : 0,
+        window.innerHeight || 0
+      );
+      const getImageState = () => {
+        const images = Array.from(document.images || []);
+        let pending = 0;
+        let failed = 0;
+        for (const image of images) {
+          const hasSource = Boolean(image.currentSrc || image.src);
+          if (!image.complete) pending += 1;
+          else if (hasSource && Number(image.naturalWidth || 0) <= 0) failed += 1;
+        }
+        return { total: images.length, pending, failed };
+      };
+      const started = Date.now();
+      const root = document.documentElement || document.body;
+      let mutationCount = 0;
+      let lastMutationAt = started;
+      const observer = root && typeof MutationObserver !== "undefined"
+        ? new MutationObserver((records) => {
+            mutationCount += records.length;
+            lastMutationAt = Date.now();
+          })
+        : null;
+      if (observer) {
+        observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+      }
+      let lastHeight = getHeight();
+      let lastHeightChangeAt = started;
+      let heightChanges = 0;
+      let samples = 0;
+      let maximumPendingImages = 0;
+      let settled = false;
+      let finalImageState = getImageState();
+      try {
+        while (Date.now() - started < ${maximumMs}) {
+          await sleep(${sampleMs});
+          samples += 1;
+          const height = getHeight();
+          if (Math.abs(height - lastHeight) > 1) {
+            lastHeight = height;
+            lastHeightChangeAt = Date.now();
+            heightChanges += 1;
+          }
+          finalImageState = getImageState();
+          maximumPendingImages = Math.max(maximumPendingImages, finalImageState.pending);
+          const fontsReady = !document.fonts || document.fonts.status === "loaded";
+          const readyState = String(document.readyState || "");
+          const documentReady = readyState === "interactive" || readyState === "complete";
+          const quietForMs = Date.now() - Math.max(lastMutationAt, lastHeightChangeAt);
+          if (documentReady && fontsReady && finalImageState.pending === 0 && quietForMs >= ${quietMs}) {
+            settled = true;
+            break;
+          }
+        }
+      } finally {
+        if (observer) observer.disconnect();
+      }
+      finalImageState = getImageState();
+      const fontsReady = !document.fonts || document.fonts.status === "loaded";
+      const readyState = String(document.readyState || "");
+      const documentReady = readyState === "interactive" || readyState === "complete";
+      const quietForMs = Date.now() - Math.max(lastMutationAt, lastHeightChangeAt);
+      const reasons = [];
+      if (!documentReady) reasons.push("document readyState is " + (readyState || "unknown"));
+      if (!fontsReady) reasons.push("document fonts are still loading");
+      if (finalImageState.pending > 0) reasons.push(finalImageState.pending + " image(s) are still loading");
+      if (quietForMs < ${quietMs}) reasons.push("DOM/layout changes did not remain quiet for ${quietMs} ms");
+      return {
+        settled,
+        timed_out: !settled,
+        quiet_ms: ${quietMs},
+        maximum_ms: ${maximumMs},
+        sample_ms: ${sampleMs},
+        elapsed_ms: Date.now() - started,
+        samples,
+        mutation_count: mutationCount,
+        height_changes: heightChanges,
+        final_height: getHeight(),
+        image_count: finalImageState.total,
+        pending_images_at_end: finalImageState.pending,
+        failed_images_at_end: finalImageState.failed,
+        maximum_pending_images: maximumPendingImages,
+        fonts_ready: fontsReady,
+        document_ready_state: readyState,
+        quiet_for_ms_at_end: quietForMs,
+        reason: settled
+          ? "The rendered document, images, fonts, and layout remained stable for the bounded quiet period."
+          : (reasons.length ? reasons.join("; ") + "." : "Visual stability was not reached before the bounded wait expired."),
+      };
+    })()
+  `;
+  const result = await evaluate(client, expression, maximumMs + 5000);
+  return {
+    enabled: true,
+    stage: String(stage || "visual_stability"),
+    ...result,
+  };
+}
+
 async function applyReadinessTimeoutAction(client, actionValue, stage, message, warnings, timeoutRecords) {
   const action = normalizeReadinessTimeoutAction(actionValue);
   const record = {
@@ -1931,6 +2088,13 @@ async function performLazyScroll(client, config) {
       maximum_growth_cycles: Math.max(1, Math.min(500, Number(config.maximum_growth_cycles || 25))),
       growth_limit_reached: false,
       growth_limit_action: normalizeGrowthLimitAction(config.growth_limit_action),
+      stable_checks_required: Math.max(1, Math.min(20, Number(config.stable_height_checks || 3))),
+      stable_checks_completed: 0,
+      dom_mutations: 0,
+      maximum_pending_images: 0,
+      final_pending_images: 0,
+      failed_images_at_end: 0,
+      fonts_ready_at_end: null,
       termination_reason: "disabled",
     };
   }
@@ -1950,6 +2114,17 @@ async function performLazyScroll(client, config) {
         document.documentElement ? document.documentElement.offsetHeight : 0,
         window.innerHeight || 0
       );
+      const getImageState = () => {
+        const images = Array.from(document.images || []);
+        let pending = 0;
+        let failed = 0;
+        for (const image of images) {
+          const hasSource = Boolean(image.currentSrc || image.src);
+          if (!image.complete) pending += 1;
+          else if (hasSource && Number(image.naturalWidth || 0) <= 0) failed += 1;
+        }
+        return { total: images.length, pending, failed };
+      };
       const started = Date.now();
       const initialHeight = getHeight();
       let lastHeight = initialHeight;
@@ -1960,43 +2135,63 @@ async function performLazyScroll(client, config) {
       let growthCycles = 0;
       let growthLimitReached = false;
       let terminationReason = "iteration_limit";
-      window.scrollTo(0, 0);
-      await sleep(Math.min(500, ${waitMs}));
-      while (iterations < 2000) {
-        const height = getHeight();
-        const step = Math.max(240, Math.floor((window.innerHeight || 900) * 0.8));
-        const nextY = Math.min(window.scrollY + step, Math.max(0, height - (window.innerHeight || 900)));
-        window.scrollTo(0, nextY);
-        await sleep(${waitMs});
-        const newHeight = getHeight();
-        maximumHeight = Math.max(maximumHeight, newHeight);
-        const grew = newHeight > lastHeight;
-        if (grew) {
-          stable = 0;
-          if (${detectGrowth}) growthCycles += 1;
-        } else {
-          stable += 1;
+      let mutationCount = 0;
+      let lastMutationCount = 0;
+      let maximumPendingImages = 0;
+      const root = document.documentElement || document.body;
+      const observer = root && typeof MutationObserver !== "undefined"
+        ? new MutationObserver((records) => { mutationCount += records.length; })
+        : null;
+      if (observer) {
+        observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+      }
+      try {
+        window.scrollTo(0, 0);
+        await sleep(Math.min(500, ${waitMs}));
+        while (iterations < 2000) {
+          const height = getHeight();
+          const step = Math.max(240, Math.floor((window.innerHeight || 900) * 0.8));
+          const nextY = Math.min(window.scrollY + step, Math.max(0, height - (window.innerHeight || 900)));
+          window.scrollTo(0, nextY);
+          await sleep(${waitMs});
+          const newHeight = getHeight();
+          maximumHeight = Math.max(maximumHeight, newHeight);
+          const grew = newHeight > lastHeight + 1;
+          if (grew && ${detectGrowth}) growthCycles += 1;
+          lastHeight = newHeight;
+          iterations += 1;
+
+          const imageState = getImageState();
+          maximumPendingImages = Math.max(maximumPendingImages, imageState.pending);
+          const fontsReady = !document.fonts || document.fonts.status === "loaded";
+          const mutationDelta = mutationCount - lastMutationCount;
+          lastMutationCount = mutationCount;
+          const atBottom = window.scrollY + (window.innerHeight || 0) >= newHeight - 4;
+          const contentStable = !grew && mutationDelta === 0 && imageState.pending === 0 && fontsReady;
+          if (atBottom && contentStable) stable += 1;
+          else stable = 0;
+
+          if (${detectGrowth} && growthCycles >= ${maximumGrowthCycles}) {
+            growthLimitReached = true;
+            terminationReason = "growth_limit";
+            break;
+          }
+          if (atBottom && stable >= ${stableChecks}) {
+            terminationReason = "stable_content";
+            break;
+          }
+          if (Date.now() - started >= ${maxMs}) {
+            timedOut = true;
+            terminationReason = "time_limit";
+            break;
+          }
         }
-        lastHeight = newHeight;
-        iterations += 1;
-        const atBottom = window.scrollY + (window.innerHeight || 0) >= newHeight - 4;
-        if (${detectGrowth} && growthCycles >= ${maximumGrowthCycles}) {
-          growthLimitReached = true;
-          terminationReason = "growth_limit";
-          break;
-        }
-        if (atBottom && stable >= ${stableChecks}) {
-          terminationReason = "stable_height";
-          break;
-        }
-        if (Date.now() - started >= ${maxMs}) {
-          timedOut = true;
-          terminationReason = "time_limit";
-          break;
-        }
+      } finally {
+        if (observer) observer.disconnect();
       }
       window.scrollTo(0, 0);
       await sleep(Math.min(1000, ${waitMs} * 2));
+      const finalImageState = getImageState();
       return {
         performed: true,
         iterations,
@@ -2008,6 +2203,13 @@ async function performLazyScroll(client, config) {
         growth_cycles: growthCycles,
         maximum_growth_cycles: ${maximumGrowthCycles},
         growth_limit_reached: growthLimitReached,
+        stable_checks_required: ${stableChecks},
+        stable_checks_completed: stable,
+        dom_mutations: mutationCount,
+        maximum_pending_images: maximumPendingImages,
+        final_pending_images: finalImageState.pending,
+        failed_images_at_end: finalImageState.failed,
+        fonts_ready_at_end: !document.fonts || document.fonts.status === "loaded",
         termination_reason: terminationReason,
       };
     })()
@@ -2375,9 +2577,9 @@ window.addEventListener("unhandledrejection", (event) => {
     const container = document.createElement("div");
     container.innerHTML = String(template || "");
     const replacements = {
-      url: values["%best_url%"] || values["%final_url%"] || values["%requested_url%"] || "",
-      date: values["%capture_timestamp_local%"] || values["%capture_utc%"] || "",
-      title: values["%page_title%"] || "",
+      url: values["%url%"] || values["%best_url%"] || values["%final_url%"] || values["%requested_url%"] || "",
+      date: values["%datetime%"] || values["%capture_timestamp_local%"] || values["%capture_utc%"] || "",
+      title: values["%title%"] || values["%page_title%"] || "",
       pageNumber: values["%page_number%"] || "",
       totalPages: values["%page_count%"] || "",
     };
@@ -2624,10 +2826,11 @@ window.addEventListener("unhandledrejection", (event) => {
       margin_application: "custom_html_content_only",
       header_footer_delivery: Boolean(config.pdf_display_header_footer) ? "inline_page_html" : "disabled",
       template_tags_supported: [
-        "%requested_url%", "%final_url%", "%best_url%", "%page_title%", "%capture_utc%",
-        "%capture_timestamp_utc%", "%capture_date_utc%", "%capture_time_utc%",
-        "%capture_local%", "%capture_timestamp_local%", "%capture_date_local%", "%capture_time_local%",
+        "%url%", "%requested_url%", "%final_url%", "%domain%", "%title%",
+        "%date%", "%time%", "%datetime%", "%utcdatetime%", "%case%", "%engine%", "%version%",
         "%page_number%", "%page_count%",
+        "%best_url%", "%page_title%", "%capture_utc%", "%capture_timestamp_utc%", "%capture_date_utc%",
+        "%capture_time_utc%", "%capture_local%", "%capture_timestamp_local%", "%capture_date_local%", "%capture_time_local%",
       ],
       image_delivery: "ephemeral_loopback_http",
       source_artifacts: sourceArtifacts.map((artifact) => ({
@@ -3470,6 +3673,8 @@ async function performReadinessCycle(client, config, networkState, warnings, com
   networkState.inflight.clear();
   networkState.lastActivity = Date.now();
   networkState.maximumInflight = 0;
+  networkState.ignoredBackgroundRequests = 0;
+  networkState.ignoredBackgroundRequestTypes = {};
   client.clearEventBacklog(readinessMethod);
   const readinessEventStartedMs = Date.now();
   const readinessPromise = client.waitForEvent(readinessMethod, loadTimeoutMs);
@@ -3522,6 +3727,14 @@ async function performReadinessCycle(client, config, networkState, warnings, com
 
   const additionalWaitMs = Math.max(0, Math.min(60000, Number(config.additional_wait_seconds || 2) * 1000));
   if (additionalWaitMs) await delay(additionalWaitMs);
+
+  const visualStability = await waitForVisualStability(client, config, "post_readiness");
+  if (!visualStability.settled) {
+    await applyReadinessTimeoutAction(
+      client, config.readiness_timeout_action, "Visual stability", visualStability.reason,
+      warnings, readinessTimeouts,
+    );
+  }
   return {
     command_kind: commandKind,
     command_elapsed_ms: commandElapsedMs,
@@ -3530,6 +3743,7 @@ async function performReadinessCycle(client, config, networkState, warnings, com
     maximum_navigation_seconds: loadTimeoutMs / 1000,
     network_quiet: networkQuiet,
     page_conditions: pageConditions,
+    visual_stability: visualStability,
     timeout_action: normalizeReadinessTimeoutAction(config.readiness_timeout_action),
     timeout_action_label: readinessTimeoutActionLabel(config.readiness_timeout_action),
     timeouts: readinessTimeouts,
@@ -4554,7 +4768,7 @@ function renderInteractiveItemBaseName(config, fileNamingContext, itemNumber, me
   const template = String(config?.interactive_capture?.filename_template || "%datetime%_%domain%_%title%_interactive-%overlayindex%");
   const resolvedMetadata = metadata || { profile: "", contentId: "" };
   return renderFilenameTemplate(template, {
-    date: new Date(),
+    date: fileNamingContext?.date instanceof Date ? fileNamingContext.date : new Date(),
     domain: fileNamingContext?.domain || "unknown-domain",
     title: fileNamingContext?.title || "untitled",
     index: Number(fileNamingContext?.index) || 1,
@@ -5171,6 +5385,8 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     inflight: new Set(),
     lastActivity: Date.now(),
     maximumInflight: 0,
+    ignoredBackgroundRequests: 0,
+    ignoredBackgroundRequestTypes: {},
     documentResponses: [],
     redirects: [],
     requests: new Map(),
@@ -5219,12 +5435,14 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         appendNetworkRecord(previous);
       }
       const request = params.request || {};
+      const resourceType = String(params.type || "");
+      const readinessIgnored = ["WebSocket", "EventSource", "Ping"].includes(resourceType);
       networkState.requests.set(params.requestId, {
         request_id: params.requestId,
         url: request.url || "",
         document_url: params.documentURL || "",
         method: request.method || "",
-        resource_type: params.type || "",
+        resource_type: resourceType,
         frame_id: params.frameId || "",
         timestamp: params.timestamp || null,
         wall_time: params.wallTime || null,
@@ -5234,10 +5452,17 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         response: null,
         completed: false,
         failed: false,
+        readiness_ignored: readinessIgnored,
       });
-      networkState.inflight.add(params.requestId);
-      networkState.maximumInflight = Math.max(networkState.maximumInflight, networkState.inflight.size);
-      networkState.lastActivity = Date.now();
+      if (readinessIgnored) {
+        networkState.ignoredBackgroundRequests += 1;
+        networkState.ignoredBackgroundRequestTypes[resourceType] =
+          Number(networkState.ignoredBackgroundRequestTypes[resourceType] || 0) + 1;
+      } else {
+        networkState.inflight.add(params.requestId);
+        networkState.maximumInflight = Math.max(networkState.maximumInflight, networkState.inflight.size);
+        networkState.lastActivity = Date.now();
+      }
       if (params.type === "Document" && params.redirectResponse && (!mainFrameId || params.frameId === mainFrameId)) {
         networkState.redirects.push({
           from_url: params.redirectResponse.url || "",
@@ -5256,11 +5481,11 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
           response: params.response || {},
         });
       }
-      networkState.lastActivity = Date.now();
+      if (!record?.readiness_ignored) networkState.lastActivity = Date.now();
     } else if (method === "Network.loadingFinished") {
       networkState.inflight.delete(params.requestId);
-      networkState.lastActivity = Date.now();
       const record = networkState.requests.get(params.requestId);
+      if (!record?.readiness_ignored) networkState.lastActivity = Date.now();
       if (record) {
         record.completed = true;
         record.encoded_data_length = Number(params.encodedDataLength) || 0;
@@ -5269,8 +5494,8 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       }
     } else if (method === "Network.loadingFailed") {
       networkState.inflight.delete(params.requestId);
-      networkState.lastActivity = Date.now();
       const record = networkState.requests.get(params.requestId) || { request_id: params.requestId };
+      if (!record?.readiness_ignored) networkState.lastActivity = Date.now();
       record.failed = true;
       record.completed = true;
       record.canceled = Boolean(params.canceled);
@@ -5393,6 +5618,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       navigation_command_elapsed_ms: initialReadiness.command_elapsed_ms,
       network_quiet: finalReadiness.network_quiet,
       page_conditions: finalReadiness.page_conditions,
+      visual_stability: finalReadiness.visual_stability,
       timeout_action: finalReadiness.timeout_action,
       timeout_action_label: finalReadiness.timeout_action_label,
       timeouts: [
@@ -5404,6 +5630,13 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       classification: (initialReadiness.timeouts?.length || reloadReadiness?.timeouts?.length)
         ? "ready_with_warnings" : "ready",
     };
+
+    console.log(
+      `Readiness result: ${readinessInfo.classification.replaceAll("_", " ")}; ` +
+      `event ${readinessInfo.event?.fired ? "fired" : "timed out"}; ` +
+      `network ${readinessInfo.network_quiet?.settled === true ? "quiet" : (readinessInfo.network_quiet?.enabled ? "not settled" : "disabled")}; ` +
+      `visual ${readinessInfo.visual_stability?.settled ? "stable" : "not stable"}.`
+    );
 
     const captureMode = normalizeCaptureMode(config.capture_mode);
     let pageInfo = await evaluate(client, `({
@@ -5425,7 +5658,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
 
     let domain = "unknown-domain";
     try { domain = new URL(pageInfo.final_url || url).hostname || "unknown-domain"; } catch { /* keep fallback */ }
-    const captureDate = new Date();
+    const captureDate = new Date(startedAt);
     const baseName = renderFilenameTemplate(config.filename_template, {
       date: captureDate,
       domain,
@@ -5481,6 +5714,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
 
       if (captureMode === "full_page" || captureMode === "both") {
         scrollResult = await performLazyScroll(client, config);
+        console.log(
+          `Lazy-scroll result: ${String(scrollResult?.termination_reason || "unknown").replaceAll("_", " ")}; ` +
+          `${Number(scrollResult?.iterations) || 0} iteration(s); ` +
+          `${Number(scrollResult?.dom_mutations) || 0} DOM mutation(s); ` +
+          `max pending images ${Number(scrollResult?.maximum_pending_images) || 0}.`
+        );
         if (scrollResult?.timed_out) {
           const message = "Lazy-load scrolling reached its configured time limit; the result is marked partial.";
           warnings.push(message);
@@ -5493,6 +5732,16 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
           warnings.push(`${message} Action: ${growthLimitActionLabel(action)}.`);
           if (action === "capture_partial") partialReasons.push("page_growth_limit_reached");
           else warningReasons.push("page_growth_limit_reached");
+        }
+
+        const postScrollVisualStability = await waitForVisualStability(client, config, "post_scroll");
+        scrollResult.post_scroll_visual_stability = postScrollVisualStability;
+        if (!postScrollVisualStability.settled) {
+          await applyReadinessTimeoutAction(
+            client, config.readiness_timeout_action, "Post-scroll visual stability",
+            postScrollVisualStability.reason, warnings, readinessInfo.timeouts,
+          );
+          readinessInfo.classification = "ready_with_warnings";
         }
 
         pageInfo = await evaluate(client, `({
@@ -5594,6 +5843,8 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
           final_url: pageInfo.final_url || url,
           page_title: pageInfo.title || "",
           capture_utc: startedAt,
+          case_name: config.case_name || "",
+          app_version: config.app_version || "",
         }, capture);
         pdfArtifacts.push(...pdfCapture.artifacts);
         pdfBehaviorInfo = pdfCapture.behavior || pdfBehaviorInfo;
@@ -6119,6 +6370,10 @@ async function main() {
     await log(conditionLabels.length
       ? `Page conditions: ${conditionLabels.join(" + ")} with ${Math.max(1, Math.min(300, Number(config.condition_timeout_seconds) || 15))}s shared timeout.`
       : "Page conditions: disabled.");
+    const visualQuietMs = Math.max(500, Math.min(2500, Number(config.network_quiet_ms || 1000)));
+    const visualMaximumMs = Math.max(3000, Math.min(10000, Math.max(visualQuietMs * 4, 4000)));
+    await log(`Visual stability: automatic bounded check (${visualQuietMs}ms quiet, ${visualMaximumMs}ms maximum) for DOM/layout changes, pending images, and fonts; repeated after lazy scrolling.`);
+    await log("Network readiness ignores long-lived WebSocket, EventSource, and Ping requests so persistent background channels do not block settling by themselves.");
     await log(`Readiness timeout action: ${readinessTimeoutActionLabel(config.readiness_timeout_action)}.`);
     await log(`Additional readiness wait: ${Math.max(0, Math.min(60, Number(config.additional_wait_seconds) || 0))}s.`);
     await log(`Submitted URLs: ${(config.urls || []).length}`);

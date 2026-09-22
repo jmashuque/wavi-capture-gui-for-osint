@@ -2,6 +2,19 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.0922](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0922) - Evidence Stamping, Capture Readiness, and Workflow Refinements
+
+- Added optional **Evidence Stamping** for newly captured Gallery/Profile static images, creating separate stamped derivatives under `derived\evidence` while preserving and re-verifying the original file; derivatives use lossless PNG by default, can optionally match the source format, and include independent SHA-256 hashes and `.evidence.json` provenance records.
+- Added an editable Evidence Stamping text template with normalized WAVI tags, per-image pixel-measured text wrapping and footer sizing, and consistent equal padding above and below the rendered stamp text.
+- Improved **Webpage Capture readiness and long-page completeness** with bounded visual-stability checks before capture, stronger post-scroll stability detection, font/image readiness checks, mutation tracking, and exclusion of long-lived WebSocket, EventSource, and ping traffic from network-idle decisions.
+- Added **Custom Audio/Video retry behaviour** with configurable main retries, fragment retries, socket timeout, and maximum retry sleep while preserving the existing Light, Normal, and Aggressive presets.
+- Expanded **Job Queue status reporting** with persistent overall running, pending, interrupted, failed, completed, and checked counts, completed-versus-total URL progress, and live activity/error status without changing queue execution or recovery behaviour.
+- Standardized template tags and default filename templates across Audio/Video, Gallery/Profile, and Webpage Capture, including consistent `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%domain%`, `%ext%`, `%case%`, and `%engine%` semantics and compatibility aliases where existing released templates require them.
+- Improved **Gallery/Profile filename tag resolution** so common tags such as `%id%`, `%filename%`, `%title%`, `%author%`, `%username%`, `%user%`, and `%url%` fall back across equivalent extractor-specific metadata fields instead of resolving to `None` when a site uses different field names, reducing filename collisions and unintended overwrites on sources such as Instagram Reels.
+- Normalized Webpage PDF header/footer tag menus around the common WAVI tag names while retaining backwards compatibility for existing saved header/footer templates, and updated fresh defaults to use normalized URL, date/time, and page-number tags.
+- Refined the shared URL toolbar layout for improved use at common Windows display scaling levels while retaining the existing Load, Append, Save As, Clear, Undo, Redo, Copy, Show, and Advanced controls.
+- Added WAVI application branding to the Windows main window and child dialogs, including a multi-resolution application icon and About-dialog logo stored under `gui-assets`.
+
 ## [v3.2026.0917](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0917) - Firefox Browser Integration
 
 - Added the optional **WAVI Capture Helper** Firefox WebExtension for sending the active browser tab directly to WAVI as an Audio/Video, Gallery/Profile, or Webpage Capture job, with browser-submitted jobs entering the normal WAVI Job Queue as Pending.

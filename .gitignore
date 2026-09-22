@@ -14,6 +14,10 @@
 !.gitattributes
 !.gitignore
 
+!gui-assets/
+!gui-assets/wavi.ico
+!gui-assets/wavi.png
+
 !firefox-extension/
 !firefox-extension/background.js
 !firefox-extension/manifest.json

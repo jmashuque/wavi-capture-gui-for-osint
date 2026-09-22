@@ -57,10 +57,37 @@
     [string]$ProxyUrl,
 
     [Parameter(Mandatory = $false)]
-    [string]$UniversalArchiveFile
+    [string]$UniversalArchiveFile,
+
+    [switch]$CreateEvidenceDerivative,
+
+    [Parameter(Mandatory = $false)]
+    [string]$FFmpegFolder,
+
+    [Parameter(Mandatory = $false)]
+    [string]$WaviVersion = "unknown",
+
+    [switch]$MatchEvidenceSourceFormat,
+
+    [Parameter(Mandatory = $false)]
+    [string]$EvidenceStampTemplateBase64
 )
 
 $ErrorActionPreference = "Stop"
+
+$DefaultEvidenceStampTemplate = "%url%`n%utcdatetime%"
+$EvidenceStampTemplate = $DefaultEvidenceStampTemplate
+if (-not [string]::IsNullOrWhiteSpace($EvidenceStampTemplateBase64)) {
+    try {
+        $EvidenceStampTemplate = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EvidenceStampTemplateBase64))
+    }
+    catch {
+        throw "Evidence stamp template could not be decoded: $($_.Exception.Message)"
+    }
+}
+if ([string]::IsNullOrWhiteSpace($EvidenceStampTemplate)) {
+    throw "Evidence stamp template cannot be blank."
+}
 
 if ($MetadataOnly -and $MediaOnly) {
     throw "MetadataOnly and MediaOnly cannot be used together."
@@ -96,6 +123,16 @@ function New-AppTempFile {
     }
 
     throw "Could not create a unique app temp file name."
+}
+
+function Write-Utf8NoBomText {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Text, $encoding)
 }
 
 function Write-Section {
@@ -381,11 +418,476 @@ function New-DirectoryIfMissing {
     }
 }
 
+function Get-EvidenceImageState {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo]$File)
+    return ("{0}|{1}|{2}" -f $File.Length, $File.CreationTimeUtc.Ticks, $File.LastWriteTimeUtc.Ticks)
+}
+
+function Test-EvidenceImageExtension {
+    param([Parameter(Mandatory = $true)][string]$Extension)
+    return @('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff') -contains $Extension.ToLowerInvariant()
+}
+
+function Get-EvidenceImageSnapshot {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $snapshot = @{}
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        return $snapshot
+    }
+    foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -ErrorAction SilentlyContinue) {
+        if (Test-EvidenceImageExtension -Extension $file.Extension) {
+            $snapshot[[System.IO.Path]::GetFullPath($file.FullName).ToLowerInvariant()] = Get-EvidenceImageState -File $file
+        }
+    }
+    return $snapshot
+}
+
+function Get-TruncatedEvidenceText {
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $false)][int]$MaxLength = 72
+    )
+    $value = [string]$Text
+    if ($value.Length -le $MaxLength) {
+        return $value
+    }
+    if ($MaxLength -lt 4) {
+        return $value.Substring(0, $MaxLength)
+    }
+    return $value.Substring(0, $MaxLength - 3) + '...'
+}
+
+function Test-EvidenceTextFitsWidth {
+    param(
+        [Parameter(Mandatory = $true)][object]$Graphics,
+        [Parameter(Mandatory = $true)][object]$Font,
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][single]$MaxWidth
+    )
+
+    if ([string]::IsNullOrEmpty([string]$Text)) {
+        return $true
+    }
+    $measured = $Graphics.MeasureString(
+        [string]$Text,
+        $Font,
+        [int]::MaxValue,
+        [System.Drawing.StringFormat]::GenericTypographic
+    )
+    return ($measured.Width -le ($MaxWidth + 0.25))
+}
+
+function Convert-EvidenceTextToMeasuredLines {
+    param(
+        [AllowNull()][string]$Text,
+        [Parameter(Mandatory = $true)][object]$Graphics,
+        [Parameter(Mandatory = $true)][object]$Font,
+        [Parameter(Mandatory = $true)][single]$MaxWidth
+    )
+
+    $result = New-Object System.Collections.Generic.List[string]
+    $logicalLines = ([string]$Text) -split '\r?\n'
+    foreach ($logicalLine in $logicalLines) {
+        $remaining = [string]$logicalLine
+        if ($remaining.Length -eq 0) {
+            [void]$result.Add('')
+            continue
+        }
+
+        while ($remaining.Length -gt 0) {
+            if (Test-EvidenceTextFitsWidth -Graphics $Graphics -Font $Font -Text $remaining -MaxWidth $MaxWidth) {
+                [void]$result.Add($remaining)
+                break
+            }
+
+            $low = 1
+            $high = $remaining.Length
+            $best = 1
+            while ($low -le $high) {
+                $mid = [int][Math]::Floor(($low + $high) / 2)
+                $candidate = $remaining.Substring(0, $mid)
+                if (Test-EvidenceTextFitsWidth -Graphics $Graphics -Font $Font -Text $candidate -MaxWidth $MaxWidth) {
+                    $best = $mid
+                    $low = $mid + 1
+                }
+                else {
+                    $high = $mid - 1
+                }
+            }
+
+            $candidate = $remaining.Substring(0, $best)
+            $spaceAt = $candidate.LastIndexOf(' ')
+            if ($spaceAt -gt 0) {
+                $breakAt = $spaceAt
+            }
+            else {
+                $breakAt = $best
+            }
+
+            $line = $remaining.Substring(0, $breakAt).TrimEnd()
+            if ($line.Length -eq 0) {
+                $line = $remaining.Substring(0, $best)
+                $breakAt = $best
+            }
+            [void]$result.Add($line)
+            $remaining = $remaining.Substring($breakAt).TrimStart()
+        }
+    }
+    return $result.ToArray()
+}
+
+function Resolve-EvidenceStampTemplate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Template,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$CaseName,
+        [Parameter(Mandatory = $true)][datetime]$CaptureLocal,
+        [Parameter(Mandatory = $true)][datetime]$CaptureUtc,
+        [Parameter(Mandatory = $true)][string]$DomainLabel,
+        [Parameter(Mandatory = $true)][string]$SubmittedUrlLabel,
+        [Parameter(Mandatory = $true)][int]$SourceCount,
+        [Parameter(Mandatory = $true)][string]$OriginalRelativePath,
+        [Parameter(Mandatory = $true)][string]$OriginalFileName,
+        [Parameter(Mandatory = $true)][string]$OriginalExtension,
+        [Parameter(Mandatory = $true)][string]$OriginalSha256
+    )
+
+    $resolved = [string]$Template
+    $localDate = $CaptureLocal.ToString('yyyy-MM-dd')
+    $localTime = $CaptureLocal.ToString('HHmmss')
+    $localDateTime = $CaptureLocal.ToString('yyyy-MM-dd_HHmmss')
+    $utcDateTime = $CaptureUtc.ToString('yyyyMMdd_HHmmssZ')
+    $replacements = [ordered]@{
+        '%version%' = $Version
+        '%case%' = $CaseName
+        '%date%' = $localDate
+        '%time%' = $localTime
+        '%datetime%' = $localDateTime
+        '%utcdatetime%' = $utcDateTime
+        '%engine%' = 'image'
+        '%url%' = $SubmittedUrlLabel
+        '%domain%' = $DomainLabel
+        '%source_count%' = [string]$SourceCount
+        '%original%' = $OriginalRelativePath
+        '%filename%' = $OriginalFileName
+        '%ext%' = $OriginalExtension
+        '%sha256%' = $OriginalSha256
+    }
+    foreach ($entry in $replacements.GetEnumerator()) {
+        $resolved = $resolved.Replace([string]$entry.Key, [string]$entry.Value)
+    }
+    return $resolved
+}
+
+function Invoke-NativeCaptureText {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = Join-NativeArguments $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Could not start native tool: $FilePath"
+        }
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw ("Native tool failed with exit code {0}: {1}" -f $process.ExitCode, $stderr.Trim())
+        }
+        return $stdout.Trim()
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Get-EvidenceImageDimensions {
+    param(
+        [Parameter(Mandatory = $true)][string]$FFprobePath,
+        [Parameter(Mandatory = $true)][string]$ImagePath
+    )
+    $result = Invoke-NativeCaptureText -FilePath $FFprobePath -Arguments @(
+        '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', $ImagePath
+    )
+    if ($result -notmatch '^(\d+)x(\d+)$') {
+        throw "ffprobe did not return image dimensions for: $ImagePath"
+    }
+    return @([int]$Matches[1], [int]$Matches[2])
+}
+
+function New-EvidenceFooterImage {
+    param(
+        [Parameter(Mandatory = $true)][int]$Width,
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    if ($Width -lt 1) {
+        throw 'Evidence footer width is invalid.'
+    }
+
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop | Out-Null
+
+    $fontSize = 14
+    $lineSpacing = 3
+    $horizontalPadding = 12
+    $verticalPadding = 10
+    $textWidth = [single][Math]::Max(1, $Width - ($horizontalPadding * 2))
+
+    $measureBitmap = $null
+    $measureGraphics = $null
+    $font = $null
+    try {
+        $measureBitmap = New-Object System.Drawing.Bitmap(1, 1, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $measureGraphics = [System.Drawing.Graphics]::FromImage($measureBitmap)
+        $measureGraphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $font = New-Object System.Drawing.Font('Segoe UI', [single]$fontSize, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+
+        $lines = Convert-EvidenceTextToMeasuredLines -Text $Text -Graphics $measureGraphics -Font $font -MaxWidth $textWidth
+        if ($lines.Count -lt 1) {
+            $lines = @('')
+        }
+        $lineHeight = [int][Math]::Ceiling($font.GetHeight($measureGraphics))
+        $textHeight = ($lines.Count * $lineHeight) + ([Math]::Max(0, $lines.Count - 1) * $lineSpacing)
+        $footerHeight = (2 * $verticalPadding) + $textHeight
+    }
+    finally {
+        if ($font) { $font.Dispose() }
+        if ($measureGraphics) { $measureGraphics.Dispose() }
+        if ($measureBitmap) { $measureBitmap.Dispose() }
+    }
+
+    $bitmap = $null
+    $graphics = $null
+    $drawFont = $null
+    $brush = $null
+    try {
+        $bitmap = New-Object System.Drawing.Bitmap($Width, $footerHeight, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.Clear([System.Drawing.Color]::Black)
+        $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+        $drawFont = New-Object System.Drawing.Font('Segoe UI', [single]$fontSize, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+        $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+
+        $x = [single]$horizontalPadding
+        $y = [single]$verticalPadding
+        foreach ($line in $lines) {
+            $graphics.DrawString([string]$line, $drawFont, $brush, $x, $y, [System.Drawing.StringFormat]::GenericTypographic)
+            $y += [single]($lineHeight + $lineSpacing)
+        }
+
+        $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        if ($brush) { $brush.Dispose() }
+        if ($drawFont) { $drawFont.Dispose() }
+        if ($graphics) { $graphics.Dispose() }
+        if ($bitmap) { $bitmap.Dispose() }
+    }
+
+    return [pscustomobject]@{
+        height = [int]$footerHeight
+        line_count = [int]$lines.Count
+        font_size = [int]$fontSize
+        horizontal_padding = [int]$horizontalPadding
+        vertical_padding = [int]$verticalPadding
+    }
+}
+
+function New-EvidenceDerivative {
+    param(
+        [Parameter(Mandatory = $true)][System.IO.FileInfo]$OriginalFile,
+        [Parameter(Mandatory = $true)][string]$MediaRoot,
+        [Parameter(Mandatory = $true)][string]$CaseRoot,
+        [Parameter(Mandatory = $true)][string]$FFmpegPath,
+        [Parameter(Mandatory = $true)][string]$FFprobePath,
+        [Parameter(Mandatory = $true)][datetime]$CaptureLocal,
+        [Parameter(Mandatory = $true)][datetime]$CaptureUtc,
+        [Parameter(Mandatory = $true)][string[]]$SubmittedUrls,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [Parameter(Mandatory = $true)][string]$StampTemplate,
+        [switch]$MatchSourceFormat
+    )
+
+    $originalFullPath = [System.IO.Path]::GetFullPath($OriginalFile.FullName)
+    $originalRelativeToCase = $originalFullPath.Substring($CaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+    $relativeToMedia = $originalFullPath.Substring($MediaRoot.Length).TrimStart('\', '/')
+    $relativeDirectory = Split-Path -Parent $relativeToMedia
+    $derivedRoot = Join-Path $CaseRoot 'derived\evidence'
+    $destinationDirectory = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) { $derivedRoot } else { Join-Path $derivedRoot $relativeDirectory }
+    New-DirectoryIfMissing -Path $destinationDirectory
+
+    $sourceExtension = $OriginalFile.Extension.ToLowerInvariant()
+    $outputExtension = if ($MatchSourceFormat) { $sourceExtension } else { '.png' }
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($OriginalFile.Name)
+    $sourceSuffix = if ((-not $MatchSourceFormat) -and $sourceExtension -ne '.png') { '_' + $sourceExtension.TrimStart('.') } else { '' }
+    $derivativeStem = $baseName + $sourceSuffix + '_evidence_' + $RunStamp
+    $derivativePath = Join-Path $destinationDirectory ($derivativeStem + $outputExtension)
+    $sidecarPath = Join-Path $destinationDirectory ($derivativeStem + '.evidence.json')
+    $tempDerivative = Join-Path $destinationDirectory ('.wavi-evidence-' + [guid]::NewGuid().ToString('N') + $outputExtension)
+    $tempSidecar = Join-Path $destinationDirectory ('.wavi-evidence-' + [guid]::NewGuid().ToString('N') + '.json')
+    $footerImage = New-AppTempFile -Prefix 'wavi-evidence-footer-' -Suffix '.png'
+
+    $originalHashBefore = Get-Sha256HashCompat -Path $originalFullPath
+    $dimensions = Get-EvidenceImageDimensions -FFprobePath $FFprobePath -ImagePath $originalFullPath
+    $width = [int]$dimensions[0]
+
+    $domainLabel = if ($SubmittedUrls.Count -eq 1) {
+        try {
+            $uri = [Uri]$SubmittedUrls[0]
+            if ($uri.Host) { $uri.Host } else { 'unknown-domain' }
+        }
+        catch { 'unknown-domain' }
+    }
+    elseif ($SubmittedUrls.Count -gt 1) {
+        'multiple-domains'
+    }
+    else {
+        'unknown-domain'
+    }
+    $submittedUrlLabel = if ($SubmittedUrls.Count -eq 1) {
+        [string]$SubmittedUrls[0]
+    }
+    else {
+        ("Multiple submitted URLs ({0})" -f $SubmittedUrls.Count)
+    }
+
+    $resolvedStampText = Resolve-EvidenceStampTemplate `
+        -Template $StampTemplate `
+        -Version $Version `
+        -CaseName $SafeCaseName `
+        -CaptureLocal $CaptureLocal `
+        -CaptureUtc $CaptureUtc `
+        -DomainLabel $domainLabel `
+        -SubmittedUrlLabel $submittedUrlLabel `
+        -SourceCount $SubmittedUrls.Count `
+        -OriginalRelativePath $originalRelativeToCase `
+        -OriginalFileName $OriginalFile.Name `
+        -OriginalExtension $sourceExtension.TrimStart('.') `
+        -OriginalSha256 $originalHashBefore
+
+    $footerLayout = New-EvidenceFooterImage `
+        -Width $width `
+        -Text $resolvedStampText `
+        -OutputPath $footerImage
+
+    $filter = '[0:v]format=rgba[base];[1:v]format=rgba[footer];[base][footer]vstack=inputs=2[v]'
+    $ffmpegArgs = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $originalFullPath, '-i', $footerImage, '-filter_complex', $filter, '-map', '[v]', '-frames:v', '1', '-map_metadata', '-1')
+    switch ($outputExtension) {
+        '.jpg'  { $ffmpegArgs += @('-q:v', '2') }
+        '.jpeg' { $ffmpegArgs += @('-q:v', '2') }
+        '.png'  { $ffmpegArgs += @('-compression_level', '6') }
+        '.webp' { $ffmpegArgs += @('-lossless', '1') }
+    }
+    $ffmpegArgs += $tempDerivative
+
+    try {
+        [void](Invoke-NativeCaptureText -FilePath $FFmpegPath -Arguments $ffmpegArgs)
+        if (-not (Test-Path -LiteralPath $tempDerivative -PathType Leaf)) {
+            throw "FFmpeg did not create the evidence derivative."
+        }
+
+        $originalHashAfter = Get-Sha256HashCompat -Path $originalFullPath
+        if (-not [string]::Equals($originalHashBefore, $originalHashAfter, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Original image hash changed while creating the evidence derivative."
+        }
+
+        $tempDerivativeItem = Get-Item -LiteralPath $tempDerivative -ErrorAction Stop
+        $derivativeHash = Get-Sha256HashCompat -Path $tempDerivativeItem.FullName
+        $derivativeRelativeToCase = $derivativePath.Substring($CaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
+
+        $payload = [ordered]@{
+            schema_version = 3
+            artifact_type = 'wavi-evidence-derivative'
+            created_utc = $CaptureUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            generator = [ordered]@{
+                name = 'WAVI Capture GUI for OSINT'
+                version = $Version
+                method = 'Windows/.NET-rendered evidence footer stacked by FFmpeg'
+            }
+            stamp = [ordered]@{
+                template = $StampTemplate
+                rendered_text = $resolvedStampText
+            }
+            original = [ordered]@{
+                relative_path = $originalRelativeToCase
+                format = $sourceExtension.TrimStart('.')
+                sha256 = $originalHashBefore
+                size_bytes = [int64]$OriginalFile.Length
+                unchanged_after_derivative_verified = $true
+            }
+            derivative = [ordered]@{
+                relative_path = $derivativeRelativeToCase
+                format = $outputExtension.TrimStart('.')
+                format_policy = $(if ($MatchSourceFormat) { 'match-source-format' } else { 'lossless-png-default' })
+                encoding = $(switch ($outputExtension) { '.jpg' { 'jpeg-q2' } '.jpeg' { 'jpeg-q2' } '.png' { 'png-lossless' } '.webp' { 'webp-lossless' } '.bmp' { 'bmp' } '.tif' { 'tiff' } '.tiff' { 'tiff' } default { 'ffmpeg-default' } })
+                sha256 = $derivativeHash
+                size_bytes = [int64]$tempDerivativeItem.Length
+            }
+            source = [ordered]@{
+                submitted_url_count = [int]$SubmittedUrls.Count
+                submitted_urls = @($SubmittedUrls)
+                note = $(if ($SubmittedUrls.Count -eq 1) { 'Single submitted source URL for this capture run.' } else { 'Multiple source URLs were submitted in this capture run; WAVI does not claim per-item URL attribution in the overlay.' })
+            }
+        }
+        Write-Utf8NoBomText -Path $tempSidecar -Text (($payload | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
+
+        $derivativeCommitted = $false
+        $sidecarCommitted = $false
+        try {
+            Move-Item -LiteralPath $tempDerivative -Destination $derivativePath -Force
+            $derivativeCommitted = $true
+            Move-Item -LiteralPath $tempSidecar -Destination $sidecarPath -Force
+            $sidecarCommitted = $true
+        }
+        catch {
+            if ($derivativeCommitted -and -not $sidecarCommitted) {
+                Remove-Item -LiteralPath $derivativePath -Force -ErrorAction SilentlyContinue
+            }
+            if ($sidecarCommitted -and -not $derivativeCommitted) {
+                Remove-Item -LiteralPath $sidecarPath -Force -ErrorAction SilentlyContinue
+            }
+            throw
+        }
+
+        return [ordered]@{
+            original = $originalRelativeToCase
+            derivative = $derivativeRelativeToCase
+            original_hash = $originalHashBefore
+            derivative_hash = $derivativeHash
+            sidecar = ($sidecarPath.Substring($CaseRoot.Length).TrimStart('\', '/') -replace '\\', '/')
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $tempDerivative -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempSidecar -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $footerImage -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
     throw "InputFile was not found: $InputFile"
 }
 
 $GalleryDlPath = Resolve-ToolPath -PathOrCommand $GalleryDlPath -ToolName "gallery-dl"
+$FFmpegPath = $null
+$FFprobePath = $null
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    $ffmpegCandidate = if ([string]::IsNullOrWhiteSpace($FFmpegFolder)) { 'ffmpeg.exe' } else { Join-Path $FFmpegFolder 'ffmpeg.exe' }
+    $ffprobeCandidate = if ([string]::IsNullOrWhiteSpace($FFmpegFolder)) { 'ffprobe.exe' } else { Join-Path $FFmpegFolder 'ffprobe.exe' }
+    $FFmpegPath = Resolve-ToolPath -PathOrCommand $ffmpegCandidate -ToolName 'ffmpeg'
+    $FFprobePath = Resolve-ToolPath -PathOrCommand $ffprobeCandidate -ToolName 'ffprobe'
+}
 $SafeCaseName = New-SafeCaseName -Name $CaseName
 if ([string]::IsNullOrWhiteSpace($SafeCaseName)) {
     throw "CaseName is blank after sanitizing."
@@ -408,6 +910,8 @@ New-DirectoryIfMissing -Path $MediaFolder
 New-DirectoryIfMissing -Path $LogsFolder
 New-DirectoryIfMissing -Path $ManifestsFolder
 
+$RunStartedLocal = Get-Date
+$RunStartedUtc = $RunStartedLocal.ToUniversalTime()
 $RunStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $RunLog = Join-Path $LogsFolder "gallery-dl-run_$RunStamp.log"
 $ArchiveFile = Join-Path $ManifestsFolder "gallery-dl-archive.sqlite3"
@@ -482,6 +986,11 @@ if (-not $Urls.Count) {
     throw "No URLs were found in InputFile."
 }
 
+$PreCaptureEvidenceImageState = @{}
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    $PreCaptureEvidenceImageState = Get-EvidenceImageSnapshot -Root $MediaFolder
+}
+
 Write-Section "Gallery/Profile Capture Setup"
 Write-RunLog "gallery-dl path: $GalleryDlPath"
 Write-RunLog "Input file: $InputFile"
@@ -505,6 +1014,10 @@ else {
 Write-RunLog "Rate limit: $RateLimit"
 Write-RunLog ("Include keywords: {0}" -f ($(if ([string]::IsNullOrWhiteSpace($IncludeKeywords)) { "(default extractor scope)" } else { $IncludeKeywords })))
 Write-RunLog "URL count: $($Urls.Count)"
+Write-RunLog ("Evidence stamping: {0}" -f ($(if ($CreateEvidenceDerivative -and -not $MetadataOnly) { "enabled" } elseif ($CreateEvidenceDerivative) { "enabled but inactive in metadata-only mode" } else { "disabled" })))
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    Write-RunLog ("Evidence stamp output: {0}" -f ($(if ($MatchEvidenceSourceFormat) { "match source format" } else { "lossless PNG (default)" })))
+}
 
 $BaseArgs = @(
     "--config-ignore",
@@ -781,6 +1294,59 @@ else {
 
 Flush-GuiUrlRecords
 
+$EvidenceDerivativeGenerated = 0
+$EvidenceDerivativeFailures = 0
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    Write-Section "Gallery/Profile Evidence Stamping"
+    $captureUtcText = $RunStartedUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $captureLocalTime = $RunStartedLocal
+    $candidateImages = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($file in Get-ChildItem -LiteralPath $MediaFolder -File -Recurse -ErrorAction SilentlyContinue) {
+        if (-not (Test-EvidenceImageExtension -Extension $file.Extension)) {
+            continue
+        }
+        $key = [System.IO.Path]::GetFullPath($file.FullName).ToLowerInvariant()
+        $currentState = Get-EvidenceImageState -File $file
+        if (-not $PreCaptureEvidenceImageState.ContainsKey($key) -or $PreCaptureEvidenceImageState[$key] -ne $currentState) {
+            [void]$candidateImages.Add($file)
+        }
+    }
+
+    if ($candidateImages.Count -eq 0) {
+        Write-RunLog 'Evidence stamping: no newly created or changed supported static images were found in this run.'
+    }
+    else {
+        Write-RunLog ("Evidence stamping candidates: {0}" -f $candidateImages.Count)
+
+        foreach ($imageFile in $candidateImages) {
+            try {
+                $result = New-EvidenceDerivative `
+                    -OriginalFile $imageFile `
+                    -MediaRoot $MediaFolder `
+                    -CaseRoot $CaseFolder `
+                    -FFmpegPath $FFmpegPath `
+                    -FFprobePath $FFprobePath `
+                    -CaptureLocal $captureLocalTime `
+                    -CaptureUtc $RunStartedUtc `
+                    -SubmittedUrls $Urls `
+                    -Version $WaviVersion `
+                    -StampTemplate $EvidenceStampTemplate `
+                    -MatchSourceFormat:$MatchEvidenceSourceFormat
+                $EvidenceDerivativeGenerated++
+                Write-RunLog ("Evidence-stamped derivative created: {0} -> {1}" -f $result.original, $result.derivative)
+                Write-RunLog ("Evidence original SHA-256: {0}" -f $result.original_hash)
+                Write-RunLog ("Evidence-stamped derivative SHA-256: {0}" -f $result.derivative_hash)
+                Write-RunLog ("Evidence provenance: {0}" -f $result.sidecar)
+            }
+            catch {
+                $EvidenceDerivativeFailures++
+                Write-RunLog ("WARNING: Evidence stamping failed for {0}: {1}" -f $imageFile.FullName, $_.Exception.Message)
+            }
+        }
+        Write-RunLog ("Evidence-stamped derivatives generated: {0}; failed: {1}" -f $EvidenceDerivativeGenerated, $EvidenceDerivativeFailures)
+    }
+}
+
 Write-Section "Gallery/Profile Capture Manifest"
 $CaseFiles = Get-ChildItem -LiteralPath $CaseFolder -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
     $_.FullName -notlike "*\.gui-cache\*" -and $_.FullName -notlike "*\manifests\*"
@@ -811,6 +1377,10 @@ try {
     Write-RunLog "Submitted URLs: $($Urls.Count)"
     Write-RunLog "Completed URLs: $Completed"
     Write-RunLog "Failed URLs: $Failed"
+    if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+        Write-RunLog "Evidence-stamped derivatives generated: $EvidenceDerivativeGenerated"
+        Write-RunLog "Evidence stamping failures: $EvidenceDerivativeFailures"
+    }
     Write-RunLog "Case folder: $CaseFolder"
     Write-RunLog "Manifest: $ManifestFile"
     Close-RunLogWriter

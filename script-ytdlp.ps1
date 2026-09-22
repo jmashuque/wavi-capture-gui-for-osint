@@ -100,8 +100,24 @@
     [string]$DownloadSpeedLimit = "Disabled",
 
     [Parameter(Mandatory = $false)]
-    [ValidateSet("Light", "Normal", "Aggressive")]
+    [ValidateSet("Light", "Normal", "Aggressive", "Custom")]
     [string]$RetryBehavior = "Normal",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 100)]
+    [int]$CustomRetryCount = 5,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 100)]
+    [int]$CustomFragmentRetryCount = 5,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 900)]
+    [int]$CustomSocketTimeoutSeconds = 30,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 3600)]
+    [int]$CustomRetrySleepMaxSeconds = 120,
 
     [Parameter(Mandatory = $false)]
     [string]$ThrottledRate = "Disabled",
@@ -1201,6 +1217,8 @@ Write-Host "Found $($Urls.Count) URL(s)."
 Write-Section "Starting capture"
 Write-RunLog ("Output template: {0}" -f $OutputTemplateForYtDlp)
 
+$SocketTimeout = $null
+
 switch ($RetryBehavior) {
     "Light" {
         $RetryCount = "3"
@@ -1212,11 +1230,25 @@ switch ($RetryBehavior) {
         $FragmentRetryCount = "10"
         $RetrySleep = "exp=10:300"
     }
+    "Custom" {
+        $RetryCount = "$CustomRetryCount"
+        $FragmentRetryCount = "$CustomFragmentRetryCount"
+        $RetrySleepStart = [Math]::Min(10, [Math]::Max(1, $CustomRetrySleepMaxSeconds))
+        $RetrySleep = "exp=$RetrySleepStart`:$CustomRetrySleepMaxSeconds"
+        $SocketTimeout = "$CustomSocketTimeoutSeconds"
+    }
     default {
         $RetryCount = "5"
         $FragmentRetryCount = "5"
         $RetrySleep = "exp=10:120"
     }
+}
+
+if ($RetryBehavior -eq "Custom") {
+    Write-RunLog ("Custom retries:         {0}" -f $RetryCount)
+    Write-RunLog ("Custom fragment retries: {0}" -f $FragmentRetryCount)
+    Write-RunLog ("Custom socket timeout:  {0} sec" -f $SocketTimeout)
+    Write-RunLog ("Custom retry sleep max: {0} sec" -f $CustomRetrySleepMaxSeconds)
 }
 
 $CommonArgs = @(
@@ -1237,6 +1269,10 @@ $CommonArgs = @(
 
     "--verbose"
 )
+
+if ($RetryBehavior -eq "Custom" -and $SocketTimeout) {
+    $CommonArgs += @("--socket-timeout", $SocketTimeout)
+}
 
 if ($SleepRequestSeconds -gt 0) {
     $CommonArgs += @("--sleep-requests", "$SleepRequestSeconds")
