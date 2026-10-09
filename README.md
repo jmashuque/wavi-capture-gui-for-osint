@@ -748,6 +748,8 @@ Large Live Page PDFs can use:
 
 Custom PDF headers and footers accept HTML. The **Insert Tag** menu beside each editor uses the normalized WAVI tag names and shows only the tags themselves: `%url%`, `%requested_url%`, `%final_url%`, `%domain%`, `%title%`, `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%case%`, `%engine%`, `%version%`, `%page_number%`, and `%page_count%`. `%url%` uses the final URL when available and otherwise the requested URL. Existing saved templates remain compatible with the long-standing PDF placeholders `%best_url%`, `%page_title%`, `%capture_utc%`, `%capture_timestamp_utc%`, `%capture_date_utc%`, `%capture_time_utc%`, `%capture_local%`, `%capture_timestamp_local%`, `%capture_date_local%`, and `%capture_time_local%`; those compatibility names are no longer promoted in the Insert Tag menu. For **Live Page** PDFs, Chromium's standard `date`, `title`, `url`, `pageNumber`, and `totalPages` template classes remain available. For **Captured PNG** PDFs, use WAVI placeholders when you want the original capture URL or WAVI page counts rather than the temporary document URL used internally to build the PDF. Keep header/footer content compact so it does not consume excessive page area.
 
+For **Captured PNG** PDFs, enable **Header on first page and footer on last page only** in **PDF Options > Header & Footer** to limit the header and footer to the document ends. Single-page PDFs show both. This setting is off by default, is saved with profiles and queued jobs, and is unavailable for Live Page PDFs.
+
 **Filename templates and output records**
 
 The default Webpage filename template is:
@@ -897,6 +899,7 @@ The app also has user-triggered update helpers for staged local tools:
 - **Check/Update yt-dlp** can update to the latest stable build, latest nightly, or a specifically selected nightly release from the queried list. Very recent nightlies can be blocked by ASR/endpoint protection because they are low-prevalence executables.
 - **Check/Update gallery-dl** can update to latest stable, latest development, or a specifically selected stable release from the queried list.
 - **Tools > Update Deno** runs the detected local `deno.exe upgrade`. The newest Deno may not always be the desired version for a controlled environment.
+- **Tools > Clear yt-dlp Cache** clears the extractor cache; **Tools > Clear Deno Cache** clears the Deno runtime cache. Wait for relevant captures, previews, and other tool operations to finish before clearing. WAVI uses `.ytdlp-cache` and `.deno-cache` in the application folder for these caches; folders are created when needed and are not automatically cleared when WAVI closes. These actions do not clear browser cookies, capture archives, or captured media. Existing user-profile caches are left untouched.
 
 The app does not auto-update tools on launch. Review and approve update targets according to the environment before replacing staged binaries.
 

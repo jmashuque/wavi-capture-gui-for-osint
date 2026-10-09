@@ -9,7 +9,7 @@ explicitly enabled, it may read a user-selected Netscape cookies.txt file and
 inject either site-applicable cookies or the entire file into the isolated browser session.
 */
 
-const SCRIPT_SCHEMA_VERSION = 11;
+const SCRIPT_SCHEMA_VERSION = 12;
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
@@ -222,7 +222,19 @@ async function sha256Bytes(bytes) {
 }
 
 async function sha256File(path) {
-  return sha256Bytes(await Deno.readFile(path));
+  const file = await Deno.open(path, { read: true });
+  try {
+    const hasher = new IncrementalSha256();
+    const buffer = new Uint8Array(1024 * 1024);
+    while (true) {
+      const count = await file.read(buffer);
+      if (count === null) break;
+      if (count > 0) hasher.update(buffer.subarray(0, count));
+    }
+    return hasher.digestHex();
+  } finally {
+    file.close();
+  }
 }
 
 async function pathExists(path) {
@@ -848,19 +860,40 @@ function safeConsoleArgument(arg) {
   return boundedText(arg.description || arg.className || arg.type || "");
 }
 
+async function writeArtifactFile(path, content) {
+  // Stage beside the destination so commit stays on the same filesystem.
+  // A unique partial also keeps report updates from sharing a staging file.
+  const partialPath = `${path}.${crypto.randomUUID()}.partial`;
+  const bytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+  let file = null;
+  let created = false;
+  try {
+    file = await Deno.open(partialPath, { write: true, createNew: true });
+    created = true;
+    await writeAll(file, bytes);
+    await file.sync();
+    file.close();
+    file = null;
+    const sha256 = await sha256Bytes(bytes);
+    await Deno.rename(partialPath, path);
+    return { bytes: bytes.length, sha256 };
+  } finally {
+    if (file) { try { file.close(); } catch { /* best effort */ } }
+    if (created) { try { await Deno.remove(partialPath); } catch { /* committed or best effort */ } }
+  }
+}
+
 async function addTextArtifact(artifacts, kind, folder, baseName, suffix, extension, content) {
   const path = await uniqueOutputPath(folder, `${baseName}${suffix}`, extension);
-  await Deno.writeTextFile(path, String(content ?? ""));
-  const info = await Deno.stat(path);
-  artifacts.push({ kind, path, sha256: await sha256File(path), size_bytes: info.size });
+  const record = await writeArtifactFile(path, String(content ?? ""));
+  artifacts.push({ kind, path, sha256: record.sha256, size_bytes: record.bytes });
   return path;
 }
 
 async function addBytesArtifact(artifacts, kind, folder, baseName, suffix, extension, bytes) {
   const path = await uniqueOutputPath(folder, `${baseName}${suffix}`, extension);
-  await Deno.writeFile(path, bytes);
-  const info = await Deno.stat(path);
-  artifacts.push({ kind, path, sha256: await sha256File(path), size_bytes: info.size });
+  const record = await writeArtifactFile(path, bytes);
+  artifacts.push({ kind, path, sha256: record.sha256, size_bytes: record.bytes });
   return path;
 }
 
@@ -1565,7 +1598,13 @@ class CdpClient {
         reject(new Error(`Timed out waiting for CDP command: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.webSocket.send(JSON.stringify({ id, method, params }));
+      try {
+        this.webSocket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -1607,18 +1646,26 @@ class CdpClient {
 async function connectWebSocket(url, timeoutMs = 15000) {
   return await new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
-    const timer = setTimeout(() => {
+    let settled = false;
+    const fail = (message) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       try { socket.close(); } catch { /* ignore */ }
-      reject(new Error("Timed out connecting to the browser DevTools WebSocket."));
-    }, timeoutMs);
+      reject(new Error(message));
+    };
+    const timer = setTimeout(() => fail("Timed out connecting to the browser DevTools WebSocket."), timeoutMs);
     socket.onopen = () => {
+      if (settled) {
+        try { socket.close(); } catch { /* ignore */ }
+        return;
+      }
+      settled = true;
       clearTimeout(timer);
       resolve(new CdpClient(socket));
     };
-    socket.onerror = () => {
-      clearTimeout(timer);
-      reject(new Error("Could not connect to the browser DevTools WebSocket."));
-    };
+    socket.onerror = () => fail("Could not connect to the browser DevTools WebSocket.");
+    socket.onclose = () => fail("Browser DevTools WebSocket closed before connecting.");
   });
 }
 
@@ -1735,7 +1782,7 @@ async function getPageTarget(port) {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${base}/json/list`);
+      const response = await fetch(`${base}/json/list`, { signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())) });
       if (response.ok) {
         const targets = await response.json();
         const page = Array.isArray(targets)
@@ -1750,7 +1797,7 @@ async function getPageTarget(port) {
   }
 
   try {
-    const response = await fetch(`${base}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT" });
+    const response = await fetch(`${base}/json/new?${encodeURIComponent("about:blank")}`, { method: "PUT", signal: AbortSignal.timeout(5000) });
     if (response.ok) {
       const page = await response.json();
       if (page?.webSocketDebuggerUrl) return page;
@@ -1764,7 +1811,7 @@ async function getPageTarget(port) {
 
 async function getBrowserVersion(port) {
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5000) });
     if (!response.ok) return {};
     return await response.json();
   } catch {
@@ -2344,11 +2391,12 @@ async function streamPdfToAtomicFile(client, outputPath, params) {
     } finally {
       handle = "";
     }
+    const sha256 = hasher.digestHex();
     await Deno.rename(partialPath, outputPath);
     streamState.total_elapsed_ms = Date.now() - started;
     return {
       bytes: streamState.bytes_written,
-      sha256: hasher.digestHex(),
+      sha256,
       transport: {
         ...streamState,
         partial_filename: "",
@@ -2460,6 +2508,7 @@ function buildPaginatedPngPdfHtml(config, capture, sourceArtifacts, sourceUrlFor
     marginLeftIn,
     marginRightIn,
     displayHeaderFooter: Boolean(config.pdf_display_header_footer),
+    firstLastOnly: Boolean(config.pdf_first_last_only),
     headerTemplate: String(config.pdf_header_template || ""),
     footerTemplate: String(config.pdf_footer_template || ""),
     templateValues,
@@ -2598,22 +2647,26 @@ window.addEventListener("unhandledrejection", (event) => {
     return replaceLegacyChromiumPlaceholders(replaceTemplateTags(template, values), values);
   }
 
-  function buildPages(pageCount, loadImages) {
+  function buildPages(pageCount, loadImages, pageSliceHeights = null) {
     const container = document.getElementById("pages");
     container.innerHTML = "";
     const imagePromises = [];
     const sliceHeightCssPx = meta.totalHeightCssPx / pageCount;
     const sliceHeightIn = (sliceHeightCssPx * meta.pointsPerCssPx) / 72;
     let totalImages = 0;
+    let nextSliceStart = 0;
 
     for (let pageIndex = 0; pageIndex < pageCount; pageIndex += 1) {
-      const sliceStart = pageIndex * sliceHeightCssPx;
-      const sliceEnd = Math.min(meta.totalHeightCssPx, sliceStart + sliceHeightCssPx);
+      const sliceStart = nextSliceStart;
+      const pageSliceHeight = pageSliceHeights ? pageSliceHeights[pageIndex] : sliceHeightCssPx;
+      const sliceEnd = pageIndex === pageCount - 1
+        ? meta.totalHeightCssPx : Math.min(meta.totalHeightCssPx, sliceStart + pageSliceHeight);
+      nextSliceStart = sliceEnd;
       const page = document.createElement("div");
       page.className = "page";
       page.dataset.page = String(pageIndex + 1);
 
-      if (meta.displayHeaderFooter && meta.headerTemplate) {
+      if (meta.displayHeaderFooter && meta.headerTemplate && (!meta.firstLastOnly || pageIndex === 0)) {
         const header = document.createElement("div");
         header.className = "page-header";
         header.innerHTML = renderHeaderFooterTemplate(meta.headerTemplate, pageIndex + 1, pageCount);
@@ -2624,7 +2677,7 @@ window.addEventListener("unhandledrejection", (event) => {
       contentShell.className = "page-content-shell";
       const contentViewport = document.createElement("div");
       contentViewport.className = "page-content-viewport";
-      contentViewport.style.height = sliceHeightIn + "in";
+      contentViewport.style.height = ((sliceEnd - sliceStart) * meta.pointsPerCssPx / 72) + "in";
 
       if (loadImages) {
         for (const source of meta.sources) {
@@ -2669,7 +2722,7 @@ window.addEventListener("unhandledrejection", (event) => {
       contentShell.appendChild(contentViewport);
       page.appendChild(contentShell);
 
-      if (meta.displayHeaderFooter && meta.footerTemplate) {
+      if (meta.displayHeaderFooter && meta.footerTemplate && (!meta.firstLastOnly || pageIndex === pageCount - 1)) {
         const footer = document.createElement("div");
         footer.className = "page-footer";
         footer.innerHTML = renderHeaderFooterTemplate(meta.footerTemplate, pageIndex + 1, pageCount);
@@ -2698,6 +2751,7 @@ window.addEventListener("unhandledrejection", (event) => {
         maxFooterHeightPx: 0,
       };
     }
+    const fixedExtraPxByPage = [];
     let maxPageWidthPx = 0;
     let maxPageHeightPx = 0;
     let maxFixedExtraPx = 0;
@@ -2710,11 +2764,13 @@ window.addEventListener("unhandledrejection", (event) => {
       const footerRect = page.querySelector(".page-footer")?.getBoundingClientRect();
       maxPageWidthPx = Math.max(maxPageWidthPx, pageRect.width || 0);
       maxPageHeightPx = Math.max(maxPageHeightPx, pageRect.height || 0);
-      maxFixedExtraPx = Math.max(maxFixedExtraPx, Math.max(0, (pageRect.height || 0) - (viewportRect?.height || 0)));
+      const fixedExtraPx = Math.max(0, (pageRect.height || 0) - (viewportRect?.height || 0));
+      fixedExtraPxByPage.push(fixedExtraPx);
+      maxFixedExtraPx = Math.max(maxFixedExtraPx, fixedExtraPx);
       maxHeaderHeightPx = Math.max(maxHeaderHeightPx, headerRect?.height || 0);
       maxFooterHeightPx = Math.max(maxFooterHeightPx, footerRect?.height || 0);
     }
-    return { maxPageWidthPx, maxPageHeightPx, maxFixedExtraPx, maxHeaderHeightPx, maxFooterHeightPx };
+    return { maxPageWidthPx, maxPageHeightPx, maxFixedExtraPx, maxHeaderHeightPx, maxFooterHeightPx, fixedExtraPxByPage };
   }
 
   try {
@@ -2735,7 +2791,22 @@ window.addEventListener("unhandledrejection", (event) => {
       pageCount = requiredPageCount;
     }
 
-    structure = buildPages(pageCount, true);
+    // Equal image slices leave blank paper wherever the first/last-only
+    // decorations are absent. Distribute content using each page's actual
+    // decoration height so the complete pages, rather than the slices, match.
+    structure = buildPages(pageCount, false);
+    await settleLayout();
+    const layout = measurePages();
+    let pageSliceHeights = null;
+    if (meta.firstLastOnly && meta.displayHeaderFooter && pageCount > 1) {
+      const extras = layout.fixedExtraPxByPage.map((px) => px * 72 / 96);
+      const commonHeightPoints = (meta.totalContentHeightPoints + extras.reduce((a, b) => a + b, 0)) / pageCount;
+      const heights = extras.map((extra) => (commonHeightPoints - extra) / meta.pointsPerCssPx);
+      // Extremely tall decorations can exceed a balanced page's entire height.
+      // Keep the existing safe layout in that case instead of losing content.
+      if (heights.every((height) => height > 0)) pageSliceHeights = heights;
+    }
+    structure = buildPages(pageCount, true, pageSliceHeights);
     await settleLayout();
     const measured = measurePages();
     const paperWidthIn = Math.max(0.01, measured.maxPageWidthPx / 96);
@@ -2755,7 +2826,8 @@ window.addEventListener("unhandledrejection", (event) => {
 
     window.__waviPdfInfo = {
       page_count: pageCount,
-      slice_height_css_px: structure.sliceHeightCssPx,
+      slice_height_css_px: pageSliceHeights ? null : structure.sliceHeightCssPx,
+      slice_heights_css_px: pageSliceHeights || Array(pageCount).fill(structure.sliceHeightCssPx),
       page_width_css_px: meta.pageWidthCssPx,
       total_height_css_px: meta.totalHeightCssPx,
       source_image_count: meta.sources.length,
@@ -2763,7 +2835,7 @@ window.addEventListener("unhandledrejection", (event) => {
       paper_width_in: paperWidthIn,
       paper_height_in: paperHeightIn,
       content_width_in: meta.contentWidthIn,
-      content_height_in: structure.sliceHeightIn,
+      content_height_in: pageSliceHeights ? null : structure.sliceHeightIn,
       margin_top_in: 0,
       margin_bottom_in: 0,
       margin_left_in: 0,
@@ -2777,6 +2849,7 @@ window.addEventListener("unhandledrejection", (event) => {
       margin_application: "custom_html_content_only",
       header_footer_delivery: meta.displayHeaderFooter ? "inline_page_html" : "disabled",
       display_header_footer: Boolean(meta.displayHeaderFooter),
+      first_last_only: Boolean(meta.firstLastOnly),
       requested_page_height_ratio: meta.requestedPageHeightRatio,
       use_maximum_page_height_ratio: Boolean(meta.useMaximumPageHeightRatio),
       effective_page_height_ratio: meta.effectivePageHeightRatio,
@@ -3045,17 +3118,7 @@ async function uniquePdfSetPaths(folder, baseName) {
 }
 
 async function writePdfSetDescriptor(path, payload) {
-  const partialPath = `${path}.partial`;
-  try { await Deno.remove(partialPath); } catch { /* no stale partial */ }
-  try {
-    await Deno.writeTextFile(partialPath, JSON.stringify(payload, null, 2) + "\n");
-    await Deno.rename(partialPath, path);
-    const info = await Deno.stat(path);
-    return { bytes: info.size, sha256: await sha256File(path) };
-  } catch (error) {
-    try { await Deno.remove(partialPath); } catch { /* best effort */ }
-    throw error;
-  }
+  return await writeArtifactFile(path, JSON.stringify(payload, null, 2) + "\n");
 }
 
 function livePdfPartArtifact(path, record, config, pageRange, partNumber) {
@@ -3379,8 +3442,7 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
 
 async function writeCaptureImage(path, base64Data) {
   const bytes = bytesFromBase64(base64Data);
-  await Deno.writeFile(path, bytes);
-  return { bytes: bytes.length, sha256: await sha256Bytes(bytes) };
+  return await writeArtifactFile(path, bytes);
 }
 
 async function removeCaptureArtifacts(artifacts) {
@@ -4938,7 +5000,7 @@ function buildInteractiveCaptureReport(settings, state) {
 
 async function persistInteractiveCaptureReport(reportPath, settings, state) {
   const report = buildInteractiveCaptureReport(settings, state);
-  await Deno.writeTextFile(reportPath, JSON.stringify(report, null, 2) + "\n");
+  await writeArtifactFile(reportPath, JSON.stringify(report, null, 2) + "\n");
   return report;
 }
 
@@ -6070,6 +6132,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         margin_right_in: Number(config.pdf_margin_right_in) || 0,
         page_ranges: String(config.pdf_page_ranges || ""),
         prefer_css_page_size: Boolean(config.pdf_prefer_css_page_size),
+        first_last_only: pdfCaptureMode === "paginated_png" && Boolean(config.pdf_first_last_only),
         header_template: String(config.pdf_header_template || ""),
         footer_template: String(config.pdf_footer_template || ""),
         png_page_height_ratio: Math.max(0.1, Math.min(40.0, Number(config.pdf_png_page_height_ratio) || 1.0)),
@@ -6112,13 +6175,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     };
 
     const sidecarPath = await uniqueOutputPath(runContext.webMediaFolder, baseName, ".webcapture.json");
-    await Deno.writeTextFile(sidecarPath, JSON.stringify(sidecar, null, 2) + "\n");
-    const sidecarInfo = await Deno.stat(sidecarPath);
+    const sidecarRecord = await writeArtifactFile(sidecarPath, JSON.stringify(sidecar, null, 2) + "\n");
     allArtifacts.push({
       kind: "capture_metadata_json",
       path: sidecarPath,
-      sha256: await sha256File(sidecarPath),
-      size_bytes: sidecarInfo.size,
+      sha256: sidecarRecord.sha256,
+      size_bytes: sidecarRecord.bytes,
     });
 
     return {
@@ -6183,22 +6245,32 @@ async function launchBrowser(config) {
     return status;
   });
   diagnostics.statusPromise = statusPromise;
-  const port = await waitForDevTools(config.profile_root, statusPromise, Number(config.browser_start_timeout_seconds || 20) * 1000);
-  const pageTarget = await getPageTarget(port);
-  const client = await connectWebSocket(pageTarget.webSocketDebuggerUrl, 15000);
-  client.setBrowserDiagnostics(diagnostics);
-  const version = await getBrowserVersion(port);
-  return { child, statusPromise, port, client, version, diagnostics };
+  let client = null;
+  try {
+    const port = await waitForDevTools(config.profile_root, statusPromise, Number(config.browser_start_timeout_seconds || 20) * 1000);
+    const pageTarget = await getPageTarget(port);
+    client = await connectWebSocket(pageTarget.webSocketDebuggerUrl, 15000);
+    client.setBrowserDiagnostics(diagnostics);
+    const version = await getBrowserVersion(port);
+    return { child, statusPromise, port, client, version, diagnostics };
+  } catch (error) {
+    // main() cannot own this child until launchBrowser returns successfully.
+    await closeBrowser({ child, statusPromise, client, diagnostics });
+    throw error;
+  }
 }
 
 async function closeBrowser(browser) {
   if (!browser) return;
+  if (!browser.client) {
+    try { browser.child.kill("SIGTERM"); } catch { /* already exited */ }
+  }
   try {
-    await browser.client.send("Browser.close", {}, 5000);
+    await browser.client?.send("Browser.close", {}, 5000);
   } catch {
     // Browser.close is best effort; process termination follows if needed.
   }
-  try { browser.client.close(); } catch { /* ignore */ }
+  try { browser.client?.close(); } catch { /* ignore */ }
 
   let exited = false;
   await Promise.race([
@@ -6531,7 +6603,7 @@ async function main() {
     if (universalArchiveSkipRecords.length > 0) {
       const skipJsonPath = joinPath(manifestsFolder, `universal-webcapture-archive-skips_${runStamp}.json`);
       const skipCsvPath = joinPath(manifestsFolder, `universal-webcapture-archive-skips_${runStamp}.csv`);
-      await Deno.writeTextFile(
+      await writeArtifactFile(
         skipJsonPath,
         JSON.stringify({
           type: "wavi-webpage-universal-archive-skips",
@@ -6561,7 +6633,7 @@ async function main() {
           record.previous_case_name,
         ].map(csvQuote).join(","));
       }
-      await Deno.writeTextFile(skipCsvPath, skipCsvRows.join("\n") + "\n");
+      await writeArtifactFile(skipCsvPath, skipCsvRows.join("\n") + "\n");
       console.log(
         `GUI_UNIVERSAL_ARCHIVE_SKIP_SUMMARY\t${universalArchiveSkipRecords.length}\t${skipJsonPath}\t${skipCsvPath}`,
       );
@@ -6580,7 +6652,7 @@ async function main() {
       const hash = record.sha256 || await sha256File(record.path);
       rows.push([csvQuote("SHA256"), csvQuote(hash), csvQuote(relativePath)].join(","));
     }
-    await Deno.writeTextFile(manifestPath, rows.join("\n") + "\n");
+    await writeArtifactFile(manifestPath, rows.join("\n") + "\n");
     console.log(`WEB_CAPTURE_MANIFEST\t${manifestPath}`);
     console.log(`WEB_CAPTURE_SUMMARY\tcaptured=${completed}\tskipped=${skipped}\tfailed=${failed}`);
     return failed > 0 ? 1 : 0;

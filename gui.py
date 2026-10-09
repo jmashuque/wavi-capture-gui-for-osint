@@ -36,7 +36,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.0922"
+APP_VERSION = "v3.2026.1008"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -58,7 +58,7 @@ OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_UPDATE_DIR_NAME = "gui-update"
 APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-SETTINGS_SCHEMA_VERSION = 53
+SETTINGS_SCHEMA_VERSION = 54
 WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382
 BROWSER_INTAKE_HOST = "127.0.0.1"
 BROWSER_INTAKE_DEFAULT_PORT = 17654
@@ -89,6 +89,11 @@ BROWSER_INTAKE_LOG_ENGINES = {
 CAPTURE_DATE_MIN = datetime(2000, 1, 1)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+YTDLP_CACHE_DIR = os.path.join(ROOT, ".ytdlp-cache")
+DENO_CACHE_DIR = os.path.join(ROOT, ".deno-cache")
+# Process-local override, inherited by Deno and by yt-dlp/PowerShell children.
+# Do not change the user's persistent environment or depend on executable location.
+os.environ["DENO_DIR"] = DENO_CACHE_DIR
 APP_LOGO_PNG_PATH = os.path.join(ROOT, "gui-assets", "wavi.png")
 APP_ICON_ICO_PATH = os.path.join(ROOT, "gui-assets", "wavi.ico")
 GUI_UPDATE_DIR = os.path.join(ROOT, APP_UPDATE_DIR_NAME)
@@ -305,6 +310,7 @@ DEFAULTS = {
     "web_pdf_landscape": False,
     "web_pdf_print_background": True,
     "web_pdf_display_header_footer": True,
+    "web_pdf_first_last_only": False,
     "web_pdf_scale": "1.0",
     "web_pdf_paper_width_in": "8.5",
     "web_pdf_paper_height_in": "11",
@@ -635,6 +641,7 @@ url_preview_pending_playlist_name = ""
 url_box_autoload_ready = False
 APP_CLOSING = False
 SHUTDOWN_STARTED = False
+CAPTURE_PROCESS_LOCK = threading.RLock()
 STARTUP_INTERRUPTED_PROMPT_SHOWN = False
 DEBUG_LOG_LOCK = threading.Lock()
 BROWSER_INTAKE_SERVER_LOCK = threading.Lock()
@@ -983,6 +990,11 @@ URL_PREVIEW_FIRST_SAMPLE_COUNT = 25
 SETTINGS_AUTOSAVE_DELAY_MS = 800
 JOB_QUEUE_SAVE_DELAY_MS = 600
 JOB_QUEUE_FILTER_OPTIONS = ["All", "Running", "Pending", "Interrupted", "Failed", "Completed", "Cancelled", "Checked", "Incomplete"]
+GUI_THREAD_ID = threading.get_ident()
+GUI_WORKER_EVENT_INTERVAL_MS = 25
+GUI_WORKER_EVENT_MAX_ITEMS = 100
+gui_worker_events = queue.Queue()
+gui_worker_event_after_id = None
 main_log_queue = queue.Queue()
 image_log_queue = queue.Queue()
 web_log_queue = queue.Queue()
@@ -1025,6 +1037,15 @@ output_log_selected_engine = "Audio/Video"
 output_log_follow_output = True
 
 
+def redact_log_url_credentials(text):
+    """Mask URL userinfo only in log copies, including native diagnostics."""
+    return re.sub(
+        r"(?i)\b((?:https?|socks4a?|socks5h?)://)[^\s/\\'\"<>?#]+@",
+        r"\1***@",
+        str(text or ""),
+    )
+
+
 def log_debug_exception(context, exc=None):
     """Write suppressed GUI/thread errors to an app-local debug log."""
     try:
@@ -1038,8 +1059,8 @@ def log_debug_exception(context, exc=None):
         os.makedirs(ROOT, exist_ok=True)
         with DEBUG_LOG_LOCK:
             with open(DEBUG_LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(f"[{timestamp}] {context_text}\n")
-                f.write(detail.rstrip() + "\n\n")
+                f.write(redact_log_url_credentials(f"[{timestamp}] {context_text}\n"))
+                f.write(redact_log_url_credentials(detail.rstrip()) + "\n\n")
     except Exception:
         # Debug logging must never become a new crash source.
         pass
@@ -2109,13 +2130,51 @@ def widget_exists(widget):
         return False
 
 
+def poll_gui_worker_events():
+    """Only the GUI thread translates worker events into Tk callbacks."""
+    global gui_worker_event_after_id
+    gui_worker_event_after_id = None
+    if APP_CLOSING:
+        return
+    deadline = time.monotonic() + 0.008
+    for _ in range(GUI_WORKER_EVENT_MAX_ITEMS):
+        try:
+            due, callback, args = gui_worker_events.get_nowait()
+        except queue.Empty:
+            break
+        remaining = max(0, math.ceil((due - time.monotonic()) * 1000))
+        if remaining:
+            safe_after(remaining, callback, *args)
+        else:
+            run_safe_ui_callback(callback, args)
+        if APP_CLOSING or time.monotonic() >= deadline:
+            break
+    if APP_CLOSING:
+        return
+    # Log producers only enqueue text. Timer ownership stays on this thread.
+    for log_queue, flush, get_id, set_id in (
+        (main_log_queue, flush_main_log_queue, lambda: main_log_flush_after_id, set_main_log_flush_after_id),
+        (image_log_queue, flush_image_log_queue, lambda: image_log_flush_after_id, set_image_log_flush_after_id),
+        (web_log_queue, flush_web_log_queue, lambda: web_log_flush_after_id, set_web_log_flush_after_id),
+    ):
+        if not log_queue.empty() and get_id() is None:
+            set_id(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush))
+    gui_worker_event_after_id = safe_after(GUI_WORKER_EVENT_INTERVAL_MS, poll_gui_worker_events)
+
+
 def safe_after(delay_ms, callback=None, *args):
     """Schedule a Tk callback only while the main window is alive.
 
-    Worker threads can still finish while the app is closing. Centralizing Tk
-    scheduling prevents late callbacks from touching a destroyed interpreter.
+    Workers enqueue requests without touching Tk and receive no timer ID.
+    The GUI dispatcher schedules them; GUI callers retain cancellable Tk IDs.
+    Closing the app rejects requests and suppresses already scheduled callbacks.
     """
     if APP_CLOSING:
+        return None
+
+    if threading.get_ident() != GUI_THREAD_ID:
+        if callback is not None:
+            gui_worker_events.put((time.monotonic() + max(0, delay_ms) / 1000, callback, args))
         return None
 
     try:
@@ -2225,6 +2284,12 @@ def handle_bound_mousewheel(event):
 
 
 def bind_widget_scroll_events(widget):
+    # Tkinter returns a Tcl pathname string for internal widgets that have no
+    # Python wrapper (for example, ttk combobox popdown children). Leave those
+    # controls to their native bindings instead of treating the path as a widget.
+    if not isinstance(widget, tk.Misc):
+        return
+
     try:
         if getattr(widget, "_avi_scroll_events_bound", False):
             return
@@ -2235,6 +2300,8 @@ def bind_widget_scroll_events(widget):
         widget._avi_scroll_events_bound = True
     except Exception as exc:
         log_debug_exception(f"Binding scroll events on {type(widget).__name__}", exc)
+
+
 def bind_widget_tree_scroll_events(widget):
     bind_widget_scroll_events(widget)
     try:
@@ -2508,7 +2575,7 @@ def trim_log_record_buffer(buffer, current_chars, max_chars, max_records):
 def record_engine_log(engine, text):
     global engine_log_sequence, all_engine_log_chars
     key = normalize_output_log_engine_key(engine)
-    text = str(text or "")
+    text = redact_log_url_credentials(text)
     if not text:
         return None
 
@@ -2768,17 +2835,10 @@ def flush_named_log_queue(log_queue, append_func, reschedule_func):
 
 
 def schedule_named_log_flush(log_queue, flush_func, after_id_getter, after_id_setter, text, fallback_append_func, debug_label):
+    # Worker-safe: the GUI poller owns all flush timers.
     text = str(text or "")
-    if not text:
-        return
-
-    try:
+    if text:
         log_queue.put(text)
-        if after_id_getter() is None:
-            after_id_setter(safe_after(GUI_LOG_FLUSH_INTERVAL_MS, flush_func))
-    except Exception as e:
-        log_debug_exception(f"{debug_label} failed", e)
-        safe_after(0, fallback_append_func, text)
 
 
 def flush_main_log_queue():
@@ -4242,7 +4302,46 @@ def confirm_case_folder_collision(case_folder=None):
     return True
 
 
+tool_version_cache = {}
+tool_version_cache_lock = threading.Lock()
+
+
+def tool_version_cache_key(command, cwd=None):
+    """Include every file argument so browser metadata probes invalidate too."""
+    base = os.path.abspath(cwd or ROOT)
+    identities = []
+    for index, arg in enumerate(command):
+        value = str(arg)
+        candidate = value if os.path.isabs(value) else os.path.join(base, value)
+        if index == 0 and not os.path.isfile(candidate):
+            candidate = shutil.which(value) or candidate
+        try:
+            stat = os.stat(candidate)
+            identities.append((os.path.normcase(os.path.abspath(candidate)), stat.st_size,
+                               stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino))
+        except OSError:
+            identities.append(None)
+    return (tuple(command), base, tuple(identities))
+
+
 def get_tool_first_line(command, cwd=None, timeout=20):
+    key = tool_version_cache_key(command, cwd)
+    with tool_version_cache_lock:
+        cached = tool_version_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+    result = probe_tool_first_line(command, cwd, timeout)
+    # Failed probes may be transient. A changed executable is never cached
+    # under the identity captured before the probe.
+    if result.get("ok") and tool_version_cache_key(command, cwd) == key:
+        with tool_version_cache_lock:
+            if len(tool_version_cache) >= 128:
+                tool_version_cache.clear()
+            tool_version_cache[key] = dict(result)
+    return result
+
+
+def probe_tool_first_line(command, cwd=None, timeout=20):
     try:
         result = subprocess.run(
             command,
@@ -4291,8 +4390,9 @@ def resolve_deno_executable_for_gui(yt_dlp_path=None):
     return shutil.which("deno.exe") or shutil.which("deno") or "deno"
 
 
-def resolve_ffmpeg_executable_for_gui(tool_name):
-    ffmpeg_folder = ffmpeg_folder_var.get().strip()
+def resolve_ffmpeg_executable_for_gui(tool_name, ffmpeg_folder=None):
+    if ffmpeg_folder is None:
+        ffmpeg_folder = ffmpeg_folder_var.get().strip()
 
     if ffmpeg_folder:
         candidate = os.path.join(ffmpeg_folder, tool_name)
@@ -4329,7 +4429,7 @@ def query_capture_tool_versions_for_job(settings):
     if engine == "web-capture":
         script_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
         helper_path = resolve_web_helper_script_path(script_path)
-        deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+        deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""), settings.get("yt_dlp_path", ""))
         browser_path = resolve_web_browser_path(settings.get("web_browser_path", ""))
         return {
             "app": APP_VERSION,
@@ -4346,8 +4446,8 @@ def query_capture_tool_versions_for_job(settings):
         script_path = settings.get("image_script_path", "")
         gallery_path = settings.get("gallery_dl_path", "")
         ffmpeg_folder = str(settings.get("ffmpeg_folder", "") or "").strip()
-        ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
-        ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+        ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe", "")
+        ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe", "")
         return {
             "app": APP_VERSION,
             "engine": "gallery-dl",
@@ -4368,8 +4468,8 @@ def query_capture_tool_versions_for_job(settings):
     ffmpeg_folder = settings.get("ffmpeg_folder", "")
 
     deno_exe = resolve_deno_executable_for_gui(yt_dlp_path)
-    ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
-    ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
+    ffmpeg_exe = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe", "")
+    ffprobe_exe = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe", "")
 
     versions = {
         "app": APP_VERSION,
@@ -4573,6 +4673,14 @@ def resolve_case_manifest_record_path(case_root, raw_path):
                 return relocated
 
     return ""
+
+
+def count_case_files_for_summary(case_folder):
+    try:
+        return count_case_files(case_folder)
+    except Exception as error:
+        log_debug_exception("Could not count case files for summary", error)
+        return {}
 
 
 def count_case_files(case_folder):
@@ -5299,9 +5407,11 @@ def cleanup_gui_temp_file(path):
     try:
         if os.path.isfile(normalized):
             os.remove(normalized)
-    except Exception:
-        pass
-    finally:
+    except Exception as error:
+        # Keep failed deletions tracked so shutdown can retry them.
+        created_temp_files.add(normalized)
+        log_debug_exception(f"Could not remove GUI temp file: {normalized}", error)
+    else:
         created_temp_files.discard(normalized)
 
 
@@ -5540,6 +5650,7 @@ def load_url_box_persistence_file(path, set_func, log_func, label):
         set_func(content)
         return True
     except Exception as e:
+        log_debug_exception(f"Could not load {label} Persistence file: {path}", e)
         try:
             log_func(f"\nWARNING: Could not load {label} Persistence file:\n{path}\n{e}\n")
         except Exception:
@@ -5553,8 +5664,9 @@ def save_url_box_persistence_file(path, widget, log_func, label):
 
     try:
         content = widget.get("1.0", "end-1c").replace("\r\n", "\n").replace("\r", "\n")
-        Path(path).write_text(content, encoding="utf-8")
+        atomic_write_json_text(os.path.abspath(path), content)
     except Exception as e:
+        log_debug_exception(f"Could not save {label} Persistence file: {path}", e)
         try:
             log_func(f"\nWARNING: Could not save {label} Persistence file:\n{path}\n{e}\n")
         except Exception:
@@ -5678,8 +5790,8 @@ def load_web_url_box_persistence_if_enabled():
 def save_web_url_box_persistence_if_enabled():
     try:
         save_url_box_persistence_file(WEB_URL_BOX_PERSISTENCE_FILE, web_urls_text, web_append_log, "Webpage URL Box")
-    except Exception:
-        pass
+    except Exception as error:
+        log_debug_exception("Could not save Webpage URL Box persistence", error)
 
 
 def read_valid_web_input_files_for_url_box_silent():
@@ -7594,6 +7706,9 @@ def build_powershell_command_for_job(job):
 
 
 
+av_preflight_running = False
+
+
 def preflight_check(show_success_popup=True):
     append_log("\n========== Preflight Check ==========")
     append_log("\nRunning preflight check...\n\n")
@@ -7671,67 +7786,92 @@ def preflight_check(show_success_popup=True):
     except Exception as e:
         add_check("Output root exists and is writable", False, str(e))
 
-    if os.path.isfile(yt_dlp_path):
-        version_info = get_tool_first_line(
-            [yt_dlp_path, "--version"],
-            cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
-            timeout=20,
-        )
-        add_check("yt-dlp can run", version_info["ok"], version_info["version"])
+    def finish(results):
+        global av_preflight_running
+        av_preflight_running = False
+        def lookup_version(command, **kwargs):
+            return results.get(tuple(command), {"ok": False, "version": "Tool changed during preflight; run the check again."})
 
-        if version_info["ok"]:
-            yt_dlp_version_status_var.set(f"yt-dlp: {version_info['version']}")
-        else:
-            yt_dlp_version_status_var.set("yt-dlp: version check failed")
-    else:
-        yt_dlp_version_status_var.set("yt-dlp: not found")
-        add_check("yt-dlp can run", False, "yt-dlp path is invalid")
+        def evaluate():
+            if os.path.isfile(yt_dlp_path):
+                version_info = lookup_version(
+                    [yt_dlp_path, "--version"],
+                    cwd=os.path.dirname(os.path.abspath(yt_dlp_path)) or ROOT,
+                    timeout=20,
+                )
+                add_check("yt-dlp can run", version_info["ok"], version_info["version"])
 
-    if os.path.isfile(ffmpeg_path):
-        version_info = get_tool_first_line([ffmpeg_path, "-version"], timeout=20)
-        add_check("ffmpeg can run", version_info["ok"], version_info["version"])
-    else:
-        add_check("ffmpeg can run", False, "ffmpeg path is invalid")
+                if version_info["ok"]:
+                    yt_dlp_version_status_var.set(f"yt-dlp: {version_info['version']}")
+                else:
+                    yt_dlp_version_status_var.set("yt-dlp: version check failed")
+            else:
+                yt_dlp_version_status_var.set("yt-dlp: not found")
+                add_check("yt-dlp can run", False, "yt-dlp path is invalid")
 
-    if os.path.isfile(ffprobe_path):
-        version_info = get_tool_first_line([ffprobe_path, "-version"], timeout=20)
-        add_check("ffprobe can run", version_info["ok"], version_info["version"])
-    else:
-        add_check("ffprobe can run", False, "ffprobe path is invalid")
+            if os.path.isfile(ffmpeg_path):
+                version_info = lookup_version([ffmpeg_path, "-version"], timeout=20)
+                add_check("ffmpeg can run", version_info["ok"], version_info["version"])
+            else:
+                add_check("ffmpeg can run", False, "ffmpeg path is invalid")
 
-    if os.path.isfile(deno_path):
-        version_info = get_tool_first_line([deno_path, "--version"], timeout=20)
-        add_check("deno can run", version_info["ok"], version_info["version"])
-    else:
-        add_check("deno can run", False, "deno path is invalid")
+            if os.path.isfile(ffprobe_path):
+                version_info = lookup_version([ffprobe_path, "-version"], timeout=20)
+                add_check("ffprobe can run", version_info["ok"], version_info["version"])
+            else:
+                add_check("ffprobe can run", False, "ffprobe path is invalid")
 
-    failed = [item for item in checks if not item[1]]
+            if os.path.isfile(deno_path):
+                version_info = lookup_version([deno_path, "--version"], timeout=20)
+                add_check("deno can run", version_info["ok"], version_info["version"])
+            else:
+                add_check("deno can run", False, "deno path is invalid")
 
-    append_log("\nPreflight complete.\n")
-    append_log(f"Passed: {len(checks) - len(failed)} / {len(checks)}\n")
-    append_log("=====================================\n")
+            failed = [item for item in checks if not item[1]]
 
-    if failed:
-        set_status("Preflight failed")
-        if show_success_popup:
-            messagebox.showwarning(
-                "Preflight failed",
-                f"{len(failed)} check(s) failed. Review the output log before starting capture.",
-            )
-        return False
+            append_log("\nPreflight complete.\n")
+            append_log(f"Passed: {len(checks) - len(failed)} / {len(checks)}\n")
+            append_log("=====================================\n")
 
-    set_status("Preflight passed")
-    if show_success_popup:
-        messagebox.showinfo("Preflight passed", "All preflight checks passed.")
-    return True
+            if failed:
+                set_status("Preflight failed")
+                if show_success_popup:
+                    messagebox.showwarning(
+                        "Preflight failed",
+                        f"{len(failed)} check(s) failed. Review the output log before starting capture.",
+                    )
+                return False
+
+            set_status("Preflight passed")
+            if show_success_popup:
+                messagebox.showinfo("Preflight passed", "All preflight checks passed.")
+            return True
+        preflight_done_var.set(evaluate() is True)
+
+    def probe_worker():
+        results = {}
+        for executable, flag in [(yt_dlp_path, "--version"), (ffmpeg_path, "-version"), (ffprobe_path, "-version"), (deno_path, "--version")]:
+            if executable and os.path.isfile(executable):
+                command = [executable, flag]
+                results[tuple(command)] = get_tool_first_line(command, cwd=os.path.dirname(os.path.abspath(executable)) or ROOT)
+        safe_after(0, finish, results)
+
+    if start_daemon_thread("preflight-versions", probe_worker) is None:
+        raise RuntimeError("Could not start the preflight version worker.")
+    return None
 
 
 def run_preflight_check():
+    global av_preflight_running
+    if av_preflight_running or APP_CLOSING:
+        return
+    av_preflight_running = True
     preflight_done_var.set(False)
 
     try:
         passed = preflight_check(show_success_popup=True)
     except Exception as e:
+        av_preflight_running = False
         set_status("Preflight failed")
         append_log(f"\nPreflight error: {e}\n")
         messagebox.showerror("Preflight failed", str(e))
@@ -7942,6 +8082,7 @@ def get_settings_dict():
         "web_pdf_landscape": bool(web_pdf_landscape_var.get()),
         "web_pdf_print_background": bool(web_pdf_print_background_var.get()),
         "web_pdf_display_header_footer": bool(web_pdf_display_header_footer_var.get()),
+        "web_pdf_first_last_only": bool(web_pdf_first_last_only_var.get()),
         "web_pdf_scale": normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS["web_pdf_scale"]),
         "web_pdf_paper_width_in": normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS["web_pdf_paper_width_in"]),
         "web_pdf_paper_height_in": normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS["web_pdf_paper_height_in"]),
@@ -8261,6 +8402,7 @@ def apply_settings_dict(settings):
     web_pdf_landscape_var.set(bool(settings.get("web_pdf_landscape", DEFAULTS["web_pdf_landscape"])))
     web_pdf_print_background_var.set(bool(settings.get("web_pdf_print_background", DEFAULTS["web_pdf_print_background"])))
     web_pdf_display_header_footer_var.set(bool(settings.get("web_pdf_display_header_footer", DEFAULTS["web_pdf_display_header_footer"])))
+    web_pdf_first_last_only_var.set(bool(settings.get("web_pdf_first_last_only", DEFAULTS["web_pdf_first_last_only"])))
     web_pdf_scale_var.set(normalize_positive_float_string(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"]), DEFAULTS["web_pdf_scale"]))
     web_pdf_paper_width_in_var.set(normalize_positive_float_string(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"]), DEFAULTS["web_pdf_paper_width_in"]))
     web_pdf_paper_height_in_var.set(normalize_positive_float_string(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"]), DEFAULTS["web_pdf_paper_height_in"]))
@@ -8411,6 +8553,8 @@ def mask_proxy_url(value):
             return "[proxy configured]"
 
         host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
         port = f":{parts.port}" if parts.port else ""
         credential_marker = "***@" if (parts.username or parts.password) else ""
         return urlunsplit((parts.scheme, f"{credential_marker}{host}{port}", parts.path or "/", "", ""))
@@ -8427,13 +8571,18 @@ def format_command_for_log(cmd):
             skip_next_proxy = False
             continue
 
-        if part in {"-ProxyUrl", "--proxy"} and index + 1 < len(cmd):
+        if str(part).lower() in {"-proxyurl", "--proxy"} and index + 1 < len(cmd):
             safe_parts.append(part)
             safe_parts.append(mask_proxy_url(cmd[index + 1]))
             skip_next_proxy = True
             continue
 
-        safe_parts.append(part)
+        if str(part).lower().startswith(("--proxy=", "-proxyurl=")):
+            flag, value = str(part).split("=", 1)
+            safe_parts.append(f"{flag}={mask_proxy_url(value)}")
+            continue
+
+        safe_parts.append(redact_log_url_credentials(part))
 
     return " ".join(f'"{part}"' if " " in str(part) else str(part) for part in safe_parts)
 
@@ -11392,39 +11541,106 @@ def read_json_for_compare(path):
         return None
 
 
-def atomic_write_json(path, payload, indent=2, ensure_ascii=False, newline=False):
-    """Write JSON state files with same-folder temp + atomic replace.
+class SerializedJsonWriter:
+    """One disk writer; pending autosaves for a path retain only the newest snapshot."""
+    def __init__(self, write_text, on_error=None):
+        self.write_text = write_text
+        self.on_error = on_error
+        self.condition = threading.Condition()
+        self.pending = deque()
+        self.coalescible = {}
+        self.errors = {}
+        self.thread = None
 
-    This avoids leaving a partially written settings/jobs/recovery file if the
-    app or system stops in the middle of a write.
-    """
-    target = os.path.abspath(path)
+    def submit(self, path, text, wait=True):
+        target = os.path.abspath(path) if path is not None else None
+        with self.condition:
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self.run, name="json-persistence", daemon=True)
+                self.thread.start()
+            if not wait and target in self.coalescible:
+                self.coalescible[target][1] = text
+                return True
+            request = [target, text, threading.Event(), None]
+            self.pending.append(request)
+            if wait:
+                # Do not let a later autosave replace a snapshot before a barrier.
+                self.coalescible.clear()
+            else:
+                self.coalescible[target] = request
+            self.condition.notify()
+        if wait:
+            request[2].wait()
+            if request[3] is not None:
+                raise request[3]
+        return True
+
+    def flush(self):
+        return self.submit(None, None, wait=True)
+
+    def run(self):
+        while True:
+            with self.condition:
+                while not self.pending:
+                    self.condition.wait()
+                request = self.pending.popleft()
+                target, text = request[:2]
+                if self.coalescible.get(target) is request:
+                    del self.coalescible[target]
+            try:
+                if target is None:
+                    if self.errors:
+                        raise OSError("Pending JSON save failed: " + "; ".join(self.errors))
+                else:
+                    self.write_text(target, text)
+                    self.errors.pop(target, None)
+            except Exception as error:
+                request[3] = error
+                if target is not None:
+                    self.errors[target] = str(error)
+                    try:
+                        if self.on_error is not None:
+                            self.on_error(target, error)
+                    except Exception:
+                        pass
+            finally:
+                request[2].set()
+
+
+def atomic_write_json_text(target, text):
     target_dir = os.path.dirname(target) or "."
     os.makedirs(target_dir, exist_ok=True)
-    tmp_path = os.path.join(
-        target_dir,
-        f".{os.path.basename(target)}.{os.getpid()}.{threading.get_ident()}.tmp",
-    )
-
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=target_dir)
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=indent, ensure_ascii=ensure_ascii)
-            if newline:
-                f.write("\n")
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp_path, target)
         return True
     finally:
         try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
+            os.remove(tmp_path)
+        except FileNotFoundError:
             pass
+
+
+def report_json_persistence_error(target, error):
+    """Adapt disk-worker failures to WAVI's thread-safe logging entry points."""
+    log_debug_exception(f"JSON persistence failed: {target}", error)
+    queue_append_log(f"\nWARNING: Could not save {target}: {error}\n")
+
+
+json_persistence_writer = SerializedJsonWriter(atomic_write_json_text, report_json_persistence_error)
+
+
+def atomic_write_json(path, payload, indent=2, ensure_ascii=False, newline=False, wait=True):
+    # Serialization happens before returning, so workers never read mutable jobs
+    # or Tk variables. Disk operations are ordered even for explicit saves.
+    snapshot = json.dumps(payload, indent=indent, ensure_ascii=ensure_ascii)
+    if newline:
+        snapshot += "\n"
+    return json_persistence_writer.submit(path, snapshot, wait=wait)
 
 
 def settings_payload_has_changed(path, new_payload):
@@ -11436,7 +11652,7 @@ def settings_payload_has_changed(path, new_payload):
     return canonicalize_settings_for_compare(existing_payload) != canonicalize_settings_for_compare(new_payload)
 
 
-def save_settings(show_popup=True, path=None, log_saved=True):
+def save_settings(show_popup=True, path=None, log_saved=True, wait=True):
     global settings_store
 
     try:
@@ -11452,14 +11668,20 @@ def save_settings(show_popup=True, path=None, log_saved=True):
         store["app_settings"] = get_app_settings_dict()
         store["version"] = SETTINGS_SCHEMA_VERSION
 
-        changed = settings_payload_has_changed(settings_path, store)
+        previous_save_failed = False
+        if wait:
+            try:
+                json_persistence_writer.flush()
+            except OSError:
+                previous_save_failed = True
+        changed = not wait or previous_save_failed or settings_payload_has_changed(settings_path, store)
 
         if not changed:
             if show_popup:
                 messagebox.showinfo("Settings unchanged", f"No settings changes detected.\n\n{settings_path}")
             return True
 
-        atomic_write_json(settings_path, store, indent=2)
+        atomic_write_json(settings_path, store, indent=2, wait=wait)
 
         if log_saved or show_popup:
             append_log(f"\nSettings saved to: {settings_path}\n")
@@ -11487,7 +11709,7 @@ def schedule_settings_autosave(delay_ms=SETTINGS_AUTOSAVE_DELAY_MS):
     def do_autosave():
         global settings_autosave_after_id
         settings_autosave_after_id = None
-        save_settings(show_popup=False, log_saved=False)
+        save_settings(show_popup=False, log_saved=False, wait=False)
 
     try:
         settings_autosave_after_id = safe_after(delay_ms, do_autosave)
@@ -11510,7 +11732,7 @@ def flush_settings_autosave():
     settings_autosave_after_id = None
     if pending:
         return save_settings(show_popup=False, log_saved=False)
-    return True
+    return json_persistence_writer.flush()
 
 
 def save_settings_dialog():
@@ -11861,49 +12083,6 @@ def reset_defaults():
 def start_capture():
     global running_process, av_direct_stop_requested, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name, active_av_direct_universal_archive
 
-    effective_concurrency_limit = get_concurrent_capture_limit()
-
-    try:
-        preset_decision_urls = get_current_url_lines_for_queue()
-        preset_decision_settings, _ = apply_checked_domain_presets_to_settings(
-            get_settings_dict(),
-            preset_decision_urls,
-        )
-        effective_concurrency_limit = get_concurrent_capture_limit(preset_decision_settings)
-    except Exception:
-        pass
-
-    queue_has_active_or_pending_jobs = False
-    try:
-        queue_has_active_or_pending_jobs = (
-            job_queue_running
-            or bool(get_pending_queue_jobs())
-            or bool(get_running_queue_jobs())
-        )
-    except Exception:
-        queue_has_active_or_pending_jobs = bool(job_queue_running)
-
-    if queue_has_active_or_pending_jobs:
-        if not job_queue_window_is_open():
-            open_job_queue()
-
-        added = add_current_as_job()
-        if added:
-            append_log("\nStart Capture added the current capture to the existing queue.\n")
-            if job_queue_running:
-                run_next_queue_job()
-            else:
-                start_job_queue()
-        return
-
-    if effective_concurrency_limit >= 2:
-        if not job_queue_window_is_open():
-            open_job_queue()
-        added = add_current_as_job()
-        if added:
-            start_job_queue()
-        return
-
     if running_process is not None and running_process.poll() is None:
         messagebox.showwarning("Already running", "A capture process is already running.")
         return
@@ -12015,8 +12194,7 @@ def start_capture():
             append_log(f"Active domain preset(s): {', '.join(active_presets) if active_presets else 'none'}\n")
     append_log("\n")
 
-    tool_versions = query_capture_tool_versions_for_log()
-    log_capture_tool_versions(tool_versions)
+    tool_versions = {}
 
     global last_capture_context
     last_capture_context = {
@@ -12059,46 +12237,31 @@ def start_capture():
     elif not job_persistence_is_enabled():
         append_log("Job Persistence is disabled; this direct capture will not be recoverable from the Job Queue.\n")
 
+    capture_context = last_capture_context
+    capture_case_folder = capture_context.get("paths", {}).get("case_folder", "")
+
     def worker():
         global running_process, av_direct_stop_requested, active_av_direct_recovery_job_id, active_av_direct_domains, active_av_direct_case_name, active_av_direct_universal_archive
 
         exit_code = 1
-        universal_skip_records = []
-        universal_skip_summary = {}
+        process = None
+
+        output = CaptureOutputRouter(
+            queue_append_log,
+            (lambda line: safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)) if direct_recovery_job_id else None,
+        )
 
         try:
-            running_process = subprocess.Popen(
-                cmd,
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
+            tool_versions.update(query_capture_tool_versions_for_job(command_settings))
+            log_capture_tool_versions(tool_versions, log_callback=queue_append_log)
+            process = launch_capture_process(cmd, "yt-dlp")
             safe_after(0, lambda: stop_button.config(state="normal"))
             safe_after(0, set_status, "Running...")
 
-            if running_process.stdout:
-                for line in running_process.stdout:
-                    skip_record = parse_universal_archive_skip_output_line(line)
-                    if skip_record:
-                        universal_skip_records.append(skip_record)
-                        queue_append_log(format_universal_archive_skip_record_for_log(skip_record) + "\n")
-                        continue
+            exit_code = output.read(process)
 
-                    skip_summary = parse_universal_archive_skip_summary_line(line)
-                    if skip_summary:
-                        universal_skip_summary = skip_summary
-                        continue
-
-                    queue_append_log(line)
-                    if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
-                        safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
-
-            exit_code = running_process.wait()
-
-            safe_after(0, show_run_summary, exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
+            safe_after(0, show_run_summary, exit_code, submitted_url_count, output.skip_records, output.skip_summary,
+                       count_case_files_for_summary(capture_case_folder), capture_context)
 
             if exit_code == 0:
                 safe_after(0, set_status, "Done")
@@ -12112,6 +12275,7 @@ def start_capture():
             queue_append_log(f"\nERROR: {e}\n")
 
         finally:
+            cleanup_capture_process(process, "direct Audio/Video capture")
             safe_after(0, finish_direct_recovery_job, direct_recovery_job_id, exit_code)
             cleanup_command_input_file_if_temp(cmd)
             running_process = None
@@ -12130,11 +12294,12 @@ def start_capture():
     start_daemon_thread("worker", worker)
 
 
-def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
+def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, counts=None, capture_context=None):
     global last_successful_case_summary
+    context = capture_context if capture_context is not None else last_capture_context
 
     try:
-        paths = last_capture_context.get("paths") or get_expected_run_paths()
+        paths = context.get("paths") or get_expected_run_paths()
     except Exception:
         paths = {}
 
@@ -12142,7 +12307,7 @@ def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None
     append_log(f"Exit code: {exit_code}\n")
     append_log(f"Submitted URLs: {submitted_url_count}\n")
 
-    counts = {}
+    counts = counts or {}
 
     if paths:
         append_log(f"Case folder: {paths['case_folder']}\n")
@@ -12152,7 +12317,6 @@ def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None
         append_log(f"Download archive: {paths['download_archive']}\n")
         append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary)
 
-        counts = count_case_files(paths["case_folder"])
         append_log(f"Total files found: {counts.get('files', 0)}\n")
         append_log(f"Media files found: {counts.get('media', 0)}\n")
         append_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
@@ -12165,12 +12329,12 @@ def show_run_summary(exit_code, submitted_url_count, universal_skip_records=None
         set_case_summary_url_context(
             "yt-dlp",
             paths=paths,
-            settings=last_capture_context.get("settings", {}),
+            settings=context.get("settings", {}),
         )
 
     if exit_code == 0 and paths:
-        versions = last_capture_context.get("tool_versions", {})
-        summary_settings = last_capture_context.get("settings", {})
+        versions = context.get("tool_versions", {})
+        summary_settings = context.get("settings", {})
         last_successful_case_summary = build_case_summary_text(
             exit_code,
             submitted_url_count,
@@ -12879,12 +13043,12 @@ def build_job_queue_state_payload():
     }
 
 
-def write_job_queue_state_now():
+def write_job_queue_state_now(wait=True):
     if job_queue_state_loading or not job_persistence_is_enabled():
         return False
 
     try:
-        atomic_write_json(JOBS_FILE, build_job_queue_state_payload(), indent=2)
+        atomic_write_json(JOBS_FILE, build_job_queue_state_payload(), indent=2, wait=wait)
         return True
     except Exception as e:
         log_debug_exception("Could not save Job Queue state", e)
@@ -12901,16 +13065,13 @@ def schedule_job_queue_state_save(delay_ms=JOB_QUEUE_SAVE_DELAY_MS):
     if job_queue_state_loading or not job_persistence_is_enabled():
         return False
 
-    try:
-        if job_queue_save_after_id:
-            root.after_cancel(job_queue_save_after_id)
-    except Exception:
-        pass
+    if job_queue_save_after_id is not None:
+        return True
 
     def do_save():
         global job_queue_save_after_id
         job_queue_save_after_id = None
-        write_job_queue_state_now()
+        write_job_queue_state_now(wait=False)
 
     try:
         job_queue_save_after_id = safe_after(delay_ms, do_save)
@@ -12933,11 +13094,18 @@ def flush_job_queue_state_save():
     job_queue_save_after_id = None
     if pending:
         return write_job_queue_state_now()
-    return True
+    return json_persistence_writer.flush()
 
 
 def save_job_queue_state(immediate=False):
+    global job_queue_save_after_id
     if immediate or APP_CLOSING:
+        if job_queue_save_after_id is not None:
+            try:
+                root.after_cancel(job_queue_save_after_id)
+            except Exception:
+                pass
+            job_queue_save_after_id = None
         return write_job_queue_state_now()
     return schedule_job_queue_state_save()
 
@@ -12960,6 +13128,9 @@ def load_job_queue_state(startup=False):
 
         with open(JOBS_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+            raise ValueError("Invalid Job Queue file: expected an object containing a jobs list.")
 
         try:
             jobs_file_version = int(payload.get("version", 0) or 0) if isinstance(payload, dict) else 0
@@ -13009,10 +13180,13 @@ def load_job_queue_state(startup=False):
 
         if interrupted_count or migrate_jobs_file:
             job_queue_state_loading = False
-            save_job_queue_state(immediate=True)
+            saved = save_job_queue_state(immediate=True)
             job_queue_state_loading = True
             if startup and migrate_jobs_file:
-                append_log(f"Job Queue file migration to schema {JOBS_FILE_VERSION} completed.\n")
+                if saved:
+                    append_log(f"Job Queue file migration to schema {JOBS_FILE_VERSION} completed.\n")
+                else:
+                    append_log("WARNING: Migrated jobs are loaded in memory, but the updated Job Queue file could not be saved.\n")
             if startup and interrupted_count:
                 safe_after(600, show_startup_interrupted_jobs_prompt, interrupted_count)
 
@@ -13316,7 +13490,6 @@ def refresh_job_queue_window():
 
     if not job_queue_tree_is_available():
         update_job_queue_progress()
-        update_job_queue_summary_label()
         return
 
     try:
@@ -13384,7 +13557,6 @@ def refresh_job_queue_window():
 
     update_job_queue_selection_marks()
     update_job_queue_progress()
-    update_job_queue_summary_label()
 
 
 def update_job_queue_progress():
@@ -14413,7 +14585,34 @@ def duplicate_selected_queue_job():
         messagebox.showerror("Duplicate job failed", str(e))
 
 
+def queue_job_is_active_for_removal(job):
+    return bool(
+        job.get("status") == "running"
+        or job.get("_queue_execution_active")
+        or job.get("job_id") in job_queue_running_processes
+        or (job_queue_running and job.get("job_id") == job_queue_current_job_id)
+    )
+
+
 def remove_selected_queue_job():
+    """Toolbar Selected actions target checkmarks, independently of highlighting."""
+    global job_queue
+    checked = [job for job in job_queue if bool(job.get("checked", False))]
+    if not checked:
+        messagebox.showinfo("No selected jobs", "Checkmark one or more non-running jobs first.")
+        return
+
+    removable_ids = {job.get("job_id") for job in checked if not queue_job_is_active_for_removal(job)}
+    skipped = len(checked) - sum(job.get("job_id") in removable_ids for job in checked)
+    if removable_ids:
+        job_queue = [job for job in job_queue if job.get("job_id") not in removable_ids]
+        save_job_queue_state()
+        refresh_job_queue_window()
+    if skipped:
+        messagebox.showinfo("Active jobs retained", f"{skipped} checked active job(s) could not be removed.")
+
+
+def remove_highlighted_queue_job():
     global job_queue
 
     job = get_selected_queue_job()
@@ -14421,12 +14620,8 @@ def remove_selected_queue_job():
         messagebox.showinfo("No job selected", "Select a queue job first.")
         return
 
-    if job.get("job_id") == job_queue_current_job_id and job_queue_running:
-        messagebox.showwarning("Job is running", "The currently running job cannot be removed.")
-        return
-
-    if job.get("status") == "running":
-        messagebox.showwarning("Job is running", "A running job cannot be removed.")
+    if queue_job_is_active_for_removal(job):
+        messagebox.showwarning("Job is running", "An active job cannot be removed.")
         return
 
     job_queue = [item for item in job_queue if item.get("job_id") != job.get("job_id")]
@@ -14931,7 +15126,6 @@ def write_job_recovery_manifest(job, event="state"):
     if not path:
         return False
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         job["recovery_manifest"] = path
         payload = {
             "type": "avi-capture-gui-job-recovery",
@@ -14965,7 +15159,7 @@ def write_job_recovery_manifest(job, event="state"):
             )
             payload["web_capture_classifications"] = classification_records
             payload["web_capture_classification_summary"] = summarize_web_capture_classifications(classification_records)
-        atomic_write_json(path, payload, indent=2)
+        atomic_write_json(path, payload, indent=2, wait=event not in {"url_complete", "url_incomplete", "web_capture_classification"})
         return True
     except Exception as e:
         log_debug_exception("Could not write Job Queue recovery manifest", e)
@@ -15214,7 +15408,8 @@ def run_queue_job(job):
             job_engine == "yt-dlp" and "-UniversalArchiveFile" in cmd
         )
         submitted_url_count = len(run_urls)
-        tool_versions = query_capture_tool_versions_for_job(job.get("settings", {}))
+        tool_versions = {}
+        version_settings = dict(job.get("settings", {}))
 
         job_paths = get_case_summary_paths_for_job(job)
         job["paths"] = job_paths
@@ -15266,7 +15461,6 @@ def run_queue_job(job):
             job_log(f"Applied active domain presets: {', '.join(job.get('applied_domain_presets', []))}\n")
         job_log(format_universal_archive_status_line(get_job_engine(job), job.get("settings", {})) + "\n")
         job_log("\n")
-        log_capture_tool_versions(tool_versions, log_callback=job_log)
         job_log("Command:\n")
         job_log(format_command_for_log(cmd))
         job_log("\n\n")
@@ -15293,74 +15487,52 @@ def run_queue_job(job):
 
     def worker():
         exit_code = 1
+        process = None
+
+        def handle_classification(record, line):
+            queue_engine_append_log(job_engine, format_web_capture_classification_for_log(record) + "\n")
+            safe_after(0, handle_queue_output_line, job["job_id"], line)
+
+        output = CaptureOutputRouter(
+            lambda text: queue_engine_append_log(job_engine, text),
+            lambda line: safe_after(0, handle_queue_output_line, job["job_id"], line),
+            archive_writer=record_web_universal_archive_capture,
+            on_classification=handle_classification,
+        )
 
         try:
-            process = subprocess.Popen(
-                cmd,
-                cwd=ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
-            )
-
-            job_queue_running_processes[job["job_id"]] = process
+            tool_versions.update(query_capture_tool_versions_for_job(version_settings))
+            log_capture_tool_versions(tool_versions, log_callback=lambda text: queue_engine_append_log(job_engine, text))
+            process = launch_capture_process(cmd, job_engine, job=job)
             if job.get("_interruption_requested"):
                 terminate_process_tree(process, label=f"queue job {job['job_id']}")
 
-            universal_skip_records = []
-            universal_skip_summary = {}
-
-            if process.stdout:
-                for line in process.stdout:
-                    archive_payload = parse_web_universal_archive_record_output_line(line)
-                    if archive_payload:
-                        try:
-                            archive_id = record_web_universal_archive_capture(archive_payload)
-                            queue_engine_append_log(job_engine, 
-                                f"Webpage universal archive updated: {archive_id} | "
-                                f"{archive_payload.get('requested_url', '')}\n"
-                            )
-                        except Exception as archive_error:
-                            queue_engine_append_log(job_engine, f"WARNING: Webpage universal archive update failed: {archive_error}\n")
-                        continue
-
-                    skip_record = parse_universal_archive_skip_output_line(line)
-                    if skip_record:
-                        universal_skip_records.append(skip_record)
-                        queue_engine_append_log(job_engine, format_universal_archive_skip_record_for_log(skip_record) + "\n")
-                        continue
-
-                    skip_summary = parse_universal_archive_skip_summary_line(line)
-                    if skip_summary:
-                        universal_skip_summary = skip_summary
-                        continue
-
-                    classification_record = parse_web_capture_classification_output_line(line)
-                    if classification_record:
-                        queue_engine_append_log(job_engine, format_web_capture_classification_for_log(classification_record) + "\n")
-                        safe_after(0, handle_queue_output_line, job["job_id"], line)
-                        continue
-
-                    queue_engine_append_log(job_engine, line)
-                    if line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t"):
-                        safe_after(0, handle_queue_output_line, job["job_id"], line)
-
-            exit_code = process.wait()
+            exit_code = output.read(process)
 
         except Exception as e:
-            queue_engine_append_log(job_engine, f"\nERROR: {e}\n")
             exit_code = 1
+            log_debug_exception(f"Queue worker failed: {job['job_id']}", e)
+            queue_engine_append_log(job_engine, f"\nERROR: {e}\n")
         finally:
+            cleanup_capture_process(process, f"queue job {job['job_id']}")
+            try:
+                cleanup_command_input_file_if_temp(cmd)
+            except Exception as e:
+                log_debug_exception(f"Queue input cleanup failed: {job['job_id']}", e)
+            finally:
+                safe_after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count, output.skip_records, output.skip_summary,
+                           count_case_files_for_summary(job_paths.get("case_folder", "")))
+
+    if start_daemon_thread("worker", worker) is None:
+        try:
             cleanup_command_input_file_if_temp(cmd)
+        except Exception as e:
+            log_debug_exception(f"Queue input cleanup failed: {job['job_id']}", e)
+        finally:
+            finish_queue_job(job["job_id"], 1, submitted_url_count, [], {})
 
-        safe_after(0, finish_queue_job, job["job_id"], exit_code, submitted_url_count, universal_skip_records, universal_skip_summary)
 
-    start_daemon_thread("worker", worker)
-
-
-def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None):
+def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, counts=None):
     global job_queue_running, job_queue_current_job_id, job_queue_running_processes, last_successful_case_summary, last_successful_image_case_summary, last_successful_web_case_summary, job_queue_run_filter_ids
 
     job = None
@@ -15379,91 +15551,105 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     job["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     job["exit_code"] = exit_code
 
-    web_terminal_issue = False
-    web_terminal_issue_text = ""
-    if engine == "web-capture":
-        web_records = normalize_web_capture_classification_records(
-            job.get("web_capture_classifications", {}),
-            len(job.get("urls", []) or []),
-        )
-        web_counts = summarize_web_capture_classifications(web_records)
-        if int(web_counts.get("failed", 0) or 0) > 0:
-            web_terminal_issue = True
-            web_terminal_issue_text = "one or more Webpage URLs remain Failed"
-        elif int(web_counts.get("partial", 0) or 0) > 0:
-            web_terminal_issue = True
-            web_terminal_issue_text = "one or more Webpage URLs remain Partial"
+    # Establish a terminal fallback before optional reporting touches the UI.
+    # A reporting error must not leave a process-less job occupying an engine slot.
+    job["status"] = "interrupted" if job.get("_interruption_requested") else "failed"
+    try:
+        web_terminal_issue = False
+        web_terminal_issue_text = ""
+        if engine == "web-capture":
+            web_records = normalize_web_capture_classification_records(
+                job.get("web_capture_classifications", {}),
+                len(job.get("urls", []) or []),
+            )
+            web_counts = summarize_web_capture_classifications(web_records)
+            if int(web_counts.get("failed", 0) or 0) > 0:
+                web_terminal_issue = True
+                web_terminal_issue_text = "one or more Webpage URLs remain Failed"
+            elif int(web_counts.get("partial", 0) or 0) > 0:
+                web_terminal_issue = True
+                web_terminal_issue_text = "one or more Webpage URLs remain Partial"
 
-    if job.get("_interruption_requested"):
-        job["status"] = "interrupted"
-        job["exit_code"] = "interrupted"
-        job["interrupted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        job["interrupted_reason"] = job.get("interrupted_reason") or "Stopped by user."
-        job_log(f"\nQueue job interrupted: {job.get('resolved_case_name', '')}\n")
-        set_status("Queue job interrupted")
-    elif exit_code == 0 and not web_terminal_issue:
-        job["status"] = "completed"
-        job_log(f"\nQueue job completed successfully: {job.get('resolved_case_name', '')}\n")
-        set_status("Queue job completed")
-    elif exit_code == 0 and web_terminal_issue:
-        job["status"] = "failed"
-        job_log(
-            f"\nQueue job remains failed after recovery because {web_terminal_issue_text}: "
-            f"{job.get('resolved_case_name', '')}\n"
-        )
-        set_status("Queue job remains incomplete")
-    else:
-        job["status"] = "failed"
-        job_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
-        set_status(f"Queue job failed: {exit_code}")
-
-    paths = get_case_summary_paths_for_job(job)
-    job["paths"] = paths
-    counts = count_case_files(paths.get("case_folder", ""))
-    versions = job.get("tool_versions", {})
-    summary_settings = job.get("settings", {})
-    engine = get_job_engine(job)
-    set_case_summary_url_context(engine, paths=paths, settings=summary_settings, job=job)
-
-    job_log("\n========== Queue Job Summary ==========")
-    job_log(f"\nExit code: {exit_code}\n")
-    job_log(f"Submitted URLs: {submitted_url_count}\n")
-    classification_summary = job.get("web_capture_classification_summary", {})
-    if isinstance(classification_summary, dict) and any(classification_summary.values()):
-        job_log(
-            "Webpage classifications: "
-            f"complete {int(classification_summary.get('complete', 0) or 0)}, "
-            f"warnings {int(classification_summary.get('complete_with_warnings', 0) or 0)}, "
-            f"partial {int(classification_summary.get('partial', 0) or 0)}, "
-            f"failed {int(classification_summary.get('failed', 0) or 0)}\n"
-        )
-    job_log(f"Case folder: {paths.get('case_folder', '')}\n")
-    append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary, log_callback=job_log)
-    job_log(f"Total files found: {counts.get('files', 0)}\n")
-    job_log(f"Media files found: {counts.get('media', 0)}\n")
-    job_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
-    job_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
-    job_log("=====================================\n")
-
-    if job.get("status") == "completed":
-        job["summary"] = build_case_summary_for_job(
-            job,
-            exit_code,
-            submitted_url_count,
-            paths,
-            versions,
-            counts,
-            universal_skip_records=universal_skip_records,
-            universal_skip_summary=universal_skip_summary,
-        )
-        if engine == "gallery-dl":
-            last_successful_image_case_summary = job["summary"]
-        elif engine == "web-capture":
-            last_successful_web_case_summary = job["summary"]
+        if job.get("_interruption_requested"):
+            job["status"] = "interrupted"
+            job["exit_code"] = "interrupted"
+            job["interrupted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            job["interrupted_reason"] = job.get("interrupted_reason") or "Stopped by user."
+            job_log(f"\nQueue job interrupted: {job.get('resolved_case_name', '')}\n")
+            set_status("Queue job interrupted")
+        elif exit_code == 0 and not web_terminal_issue:
+            job["status"] = "completed"
+            job_log(f"\nQueue job completed successfully: {job.get('resolved_case_name', '')}\n")
+            set_status("Queue job completed")
+        elif exit_code == 0 and web_terminal_issue:
+            job["status"] = "failed"
+            job_log(
+                f"\nQueue job remains failed after recovery because {web_terminal_issue_text}: "
+                f"{job.get('resolved_case_name', '')}\n"
+            )
+            set_status("Queue job remains incomplete")
         else:
-            last_successful_case_summary = job["summary"]
-        update_case_summary_action_states(engine)
-    else:
+            job["status"] = "failed"
+            job_log(f"\nQueue job failed with exit code {exit_code}: {job.get('resolved_case_name', '')}\n")
+            set_status(f"Queue job failed: {exit_code}")
+
+        paths = get_case_summary_paths_for_job(job)
+        job["paths"] = paths
+        counts = counts or {}
+        versions = job.get("tool_versions", {})
+        summary_settings = job.get("settings", {})
+        engine = get_job_engine(job)
+        set_case_summary_url_context(engine, paths=paths, settings=summary_settings, job=job)
+
+        job_log("\n========== Queue Job Summary ==========")
+        job_log(f"\nExit code: {exit_code}\n")
+        job_log(f"Submitted URLs: {submitted_url_count}\n")
+        classification_summary = job.get("web_capture_classification_summary", {})
+        if isinstance(classification_summary, dict) and any(classification_summary.values()):
+            job_log(
+                "Webpage classifications: "
+                f"complete {int(classification_summary.get('complete', 0) or 0)}, "
+                f"warnings {int(classification_summary.get('complete_with_warnings', 0) or 0)}, "
+                f"partial {int(classification_summary.get('partial', 0) or 0)}, "
+                f"failed {int(classification_summary.get('failed', 0) or 0)}\n"
+            )
+        job_log(f"Case folder: {paths.get('case_folder', '')}\n")
+        append_universal_archive_skip_summary(universal_skip_records, universal_skip_summary, log_callback=job_log)
+        job_log(f"Total files found: {counts.get('files', 0)}\n")
+        job_log(f"Media files found: {counts.get('media', 0)}\n")
+        job_log(f"Metadata JSON files found: {counts.get('metadata', 0)}\n")
+        job_log(f"Manifest files found: {counts.get('manifests', 0)}\n")
+        job_log("=====================================\n")
+
+        if job.get("status") == "completed":
+            job["summary"] = build_case_summary_for_job(
+                job,
+                exit_code,
+                submitted_url_count,
+                paths,
+                versions,
+                counts,
+                universal_skip_records=universal_skip_records,
+                universal_skip_summary=universal_skip_summary,
+            )
+            if engine == "gallery-dl":
+                last_successful_image_case_summary = job["summary"]
+            elif engine == "web-capture":
+                last_successful_web_case_summary = job["summary"]
+            else:
+                last_successful_case_summary = job["summary"]
+            update_case_summary_action_states(engine)
+        else:
+            job["summary"] = ""
+            if engine == "gallery-dl":
+                last_successful_image_case_summary = ""
+            elif engine == "web-capture":
+                last_successful_web_case_summary = ""
+            else:
+                last_successful_case_summary = ""
+            update_case_summary_action_states(engine)
+
+    except Exception as e:
         job["summary"] = ""
         if engine == "gallery-dl":
             last_successful_image_case_summary = ""
@@ -15471,9 +15657,13 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
             last_successful_web_case_summary = ""
         else:
             last_successful_case_summary = ""
-        update_case_summary_action_states(engine)
+        log_debug_exception(f"Queue completion reporting failed: {job_id}", e)
+        queue_engine_append_log(engine, f"\nWARNING: Queue completion reporting failed: {e}\n")
 
-    write_job_recovery_manifest(job, "queue_finished")
+    try:
+        write_job_recovery_manifest(job, "queue_finished")
+    except Exception as e:
+        log_debug_exception(f"Queue recovery write failed: {job_id}", e)
 
     job.pop("pending_url_indexes", None)
     job.pop("_run_mode", None)
@@ -15483,13 +15673,19 @@ def finish_queue_job(job_id, exit_code, submitted_url_count, universal_skip_reco
     job.pop("_queue_execution_active", None)
     job.pop("_av_universal_archive_active", None)
     job.pop("_runtime_summary_settings", None)
-    save_job_queue_state(immediate=True)
+    try:
+        save_job_queue_state(immediate=True)
+    except Exception as e:
+        log_debug_exception(f"Queue state save failed: {job_id}", e)
 
-    refresh_job_queue_window()
-    schedule_case_browser_autoload(
-        delay_ms=250,
-        output_root=get_job_output_root_for_recovery(job),
-    )
+    try:
+        refresh_job_queue_window()
+        schedule_case_browser_autoload(
+            delay_ms=250,
+            output_root=get_job_output_root_for_recovery(job),
+        )
+    except Exception as e:
+        log_debug_exception(f"Queue completion UI refresh failed: {job_id}", e)
 
     if job_queue_pause_after_current and not get_running_queue_jobs():
         job_queue_running = False
@@ -15757,7 +15953,7 @@ def open_job_queue(select_tab=True):
             if job_running:
                 menu.entryconfig("Duplicate Highlighted as Pending", state="disabled")
 
-            menu.add_command(label="Remove Highlighted", command=remove_selected_queue_job)
+            menu.add_command(label="Remove Highlighted", command=remove_highlighted_queue_job)
             if job_running:
                 menu.entryconfig("Remove Highlighted", state="disabled")
         else:
@@ -15852,6 +16048,108 @@ def open_job_queue(select_tab=True):
     refresh_job_queue_window()
 
 
+class CaptureOutputRouter:
+    """Worker-owned output state; callbacks own persistence and GUI dispatch.
+
+    Keep raw progress lines intact so sparse queue indexes and recovery records
+    continue to use the wrapper protocol. This class never accesses Tk or jobs.
+    """
+    def __init__(self, log, on_progress=None, *, parse_skips=True,
+                 archive_writer=None, on_classification=None):
+        self.log = log
+        self.on_progress = on_progress
+        self.parse_skips = parse_skips
+        self.archive_writer = archive_writer
+        self.on_classification = on_classification
+        self.skip_records = []
+        self.skip_summary = {}
+
+    def handle_line(self, line):
+        if self.archive_writer is not None:
+            payload = parse_web_universal_archive_record_output_line(line)
+            if payload:
+                try:
+                    archive_id = self.archive_writer(payload)
+                    self.log(
+                        f"Webpage universal archive updated: {archive_id} | "
+                        f"{payload.get('requested_url', '')}\n"
+                    )
+                except Exception as error:
+                    self.log(f"WARNING: Webpage universal archive update failed: {error}\n")
+                return
+
+        if self.parse_skips:
+            record = parse_universal_archive_skip_output_line(line)
+            if record:
+                self.skip_records.append(record)
+                self.log(format_universal_archive_skip_record_for_log(record) + "\n")
+                return
+            summary = parse_universal_archive_skip_summary_line(line)
+            if summary:
+                self.skip_summary = summary
+                return
+
+        if self.on_classification is not None:
+            record = parse_web_capture_classification_output_line(line)
+            if record:
+                self.on_classification(record, line)
+                return
+
+        self.log(line)
+        if self.on_progress is not None and line.startswith(("GUI_QUEUE_URL_COMPLETE\t", "GUI_QUEUE_URL_INCOMPLETE\t")):
+            self.on_progress(line)
+
+    def read(self, process):
+        """Drain output before waiting; caller retains launch/stop/cleanup ownership."""
+        if process.stdout:
+            for line in process.stdout:
+                self.handle_line(line)
+        return process.wait()
+
+
+def launch_capture_process(cmd, engine, job=None):
+    """Register a capture atomically with the shutdown launch gate."""
+    global running_process, image_running_process, web_running_process
+    with CAPTURE_PROCESS_LOCK:
+        if APP_CLOSING or SHUTDOWN_STARTED:
+            raise RuntimeError("Capture launch cancelled because WAVI is closing.")
+        if job is not None and job.get("_interruption_requested"):
+            raise RuntimeError("Queue capture launch cancelled by Stop.")
+        if engine not in {"yt-dlp", "gallery-dl", "web-capture"}:
+            raise ValueError(f"Unknown capture engine: {engine}")
+        process = subprocess.Popen(
+            cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, universal_newlines=True,
+        )
+        if job is not None:
+            job_queue_running_processes[job["job_id"]] = process
+        elif engine == "yt-dlp":
+            running_process = process
+        elif engine == "gallery-dl":
+            image_running_process = process
+        else:
+            web_running_process = process
+        return process
+
+
+def cleanup_capture_process(process, label):
+    """Close capture pipes and stop a child left running after a reader error."""
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            if not terminate_process_tree(process, label=label):
+                log_debug_exception(f"Capture process did not terminate: {label}")
+    except Exception as exc:
+        log_debug_exception(f"Capture process cleanup failed: {label}", exc)
+    finally:
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except Exception as exc:
+            log_debug_exception(f"Capture output close failed: {label}", exc)
+
+
 def terminate_process_tree(process, label="process", timeout_seconds=3):
     """Terminate a subprocess and its child process tree when possible."""
     if process is None:
@@ -15905,30 +16203,25 @@ def terminate_process_tree(process, label="process", timeout_seconds=3):
 
 
 def flush_log_queues_now():
-    """Flush pending queued log text before shutdown destroys the widgets."""
+    """Drain every pending batch before shutdown destroys the widgets."""
     global main_log_flush_after_id, image_log_flush_after_id, web_log_flush_after_id
-
-    try:
-        main_text = collect_log_queue_text(main_log_queue)
-        if main_text:
-            append_log(main_text)
-    except Exception as e:
-        log_debug_exception("Final main log flush failed", e)
-
-    try:
-        image_text = collect_log_queue_text(image_log_queue)
-        if image_text:
-            image_append_log(image_text)
-    except Exception as e:
-        log_debug_exception("Final image log flush failed", e)
-
-    try:
-        web_text = collect_log_queue_text(web_log_queue)
-        if web_text:
-            web_append_log(web_text)
-    except Exception as e:
-        log_debug_exception("Final Webpage log flush failed", e)
-
+    for log_queue, append_func, label, after_id in (
+        (main_log_queue, append_log, "main", main_log_flush_after_id),
+        (image_log_queue, image_append_log, "image", image_log_flush_after_id),
+        (web_log_queue, web_append_log, "Webpage", web_log_flush_after_id),
+    ):
+        if after_id is not None:
+            try:
+                root.after_cancel(after_id)
+            except Exception:
+                pass
+        try:
+            while not log_queue.empty():
+                text = collect_log_queue_text(log_queue)
+                if text:
+                    append_func(text)
+        except Exception as e:
+            log_debug_exception(f"Final {label} log flush failed", e)
     main_log_flush_after_id = None
     image_log_flush_after_id = None
     web_log_flush_after_id = None
@@ -16258,11 +16551,41 @@ def fetch_latest_app_release():
     }
 
 
+APP_UPDATE_REQUIRED_FILES = (
+    'CHANGELOG.md',
+    'LICENSE',
+    'PRIVACY.md',
+    'README.md',
+    'firefox-extension/background.js',
+    'firefox-extension/icons/wavi.svg',
+    'firefox-extension/manifest.json',
+    'firefox-extension/popup.css',
+    'firefox-extension/popup.html',
+    'firefox-extension/popup.js',
+    'gui-assets/wavi.ico',
+    'gui-assets/wavi.png',
+    'gui.py',
+    'interactive-blacklist.txt',
+    'interactive-whitelist.txt',
+    'script-gallerydl.ps1',
+    'script-webcapture.ps1',
+    'script-webcapture.ts',
+    'script-ytdlp.ps1',
+)
+APP_UPDATE_MAX_EXTRACTED_BYTES = 250 * 1024 * 1024
+APP_UPDATE_MAX_ARCHIVE_ENTRIES = 10000
+app_update_stage_lock = threading.Lock()
+
+
 def validate_app_update_archive(archive_path):
     with zipfile.ZipFile(archive_path, "r") as archive:
         infos = archive.infolist()
         if not infos:
             raise ValueError("Update archive does not contain any entries.")
+        if len(infos) > APP_UPDATE_MAX_ARCHIVE_ENTRIES:
+            raise ValueError("Update archive contains too many entries.")
+        if sum(info.file_size for info in infos) > APP_UPDATE_MAX_EXTRACTED_BYTES:
+            raise ValueError("Update archive exceeds the extracted-size limit.")
 
         seen_paths = set()
         validated_entries = []
@@ -16273,6 +16596,16 @@ def validate_app_update_archive(archive_path):
             if "\\" in raw_name:
                 raise ValueError(f"Update archive contains an invalid path: {raw_name}")
 
+            raw_parts = (raw_name[:-1] if info.is_dir() else raw_name).split("/")
+            reserved_names = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+            if any(
+                part in ("", ".", "..")
+                or part.endswith((".", " "))
+                or any(ord(char) < 32 or char in '<>:"|?*' for char in part)
+                or part.split(".")[0].upper() in reserved_names
+                for part in raw_parts
+            ):
+                raise ValueError(f"Update archive contains an unsafe Windows path: {raw_name}")
             path = PurePosixPath(raw_name)
             if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
                 raise ValueError(f"Update archive contains an unsafe path: {raw_name}")
@@ -16287,6 +16620,10 @@ def validate_app_update_archive(archive_path):
             if mode == 0o120000:
                 raise ValueError(f"Update archive contains an unsupported symbolic link: {raw_name}")
 
+            if not info.is_dir() and mode not in (0, 0o100000):
+                raise ValueError(f"Update archive contains an unsupported file type: {raw_name}")
+            if info.flag_bits & 1:
+                raise ValueError(f"Update archive contains an encrypted entry: {raw_name}")
             validated_entries.append((raw_name, path, info.is_dir()))
             if not info.is_dir():
                 file_paths.append(path)
@@ -16319,8 +16656,17 @@ def validate_app_update_archive(archive_path):
             staged_paths.add(relative_key)
             staged_entries.append((raw_name, relative_path, is_dir))
 
-        if "gui.py".casefold() not in staged_paths:
-            raise ValueError("GitHub source archive is missing gui.py at the repository root.")
+        files = {relative.as_posix(): raw for raw, relative, is_dir in staged_entries if not is_dir}
+        missing = sorted(set(APP_UPDATE_REQUIRED_FILES) - set(files))
+        if missing:
+            raise ValueError("Update archive is missing required app files: " + ", ".join(missing))
+        for required in APP_UPDATE_REQUIRED_FILES:
+            if archive.getinfo(files[required]).file_size == 0:
+                raise ValueError(f"Update archive contains an empty required app file: {required}")
+        file_keys = {name.casefold() for name in files}
+        for _, relative, _ in staged_entries:
+            if any(parent.as_posix().casefold() in file_keys for parent in relative.parents):
+                raise ValueError(f"Update archive has a file/directory conflict: {relative}")
 
     return repository_root, staged_entries
 
@@ -16357,6 +16703,37 @@ def validate_staged_app_version(staging_dir, tag):
         )
 
     return staged_version
+
+
+def commit_staged_app_update(staging_dir, destination):
+    """Replace a validated staging folder, restoring the previous one on failure."""
+    with app_update_stage_lock:
+        backup = None
+        if os.path.lexists(destination):
+            if os.path.islink(destination) or not os.path.isdir(destination):
+                raise ValueError(f"Update staging destination is not a regular folder: {destination}")
+            backup = tempfile.mkdtemp(prefix=".wavi-update-backup-", dir=os.path.dirname(destination))
+            os.rmdir(backup)
+            os.replace(destination, backup)
+        try:
+            os.replace(staging_dir, destination)
+        except Exception as install_error:
+            if backup is not None:
+                try:
+                    os.replace(backup, destination)
+                except Exception as rollback_error:
+                    raise RuntimeError(
+                        f"Update staging failed and the previous folder could not be restored. "
+                        f"Its backup remains at {backup}. Replacement error: {install_error}; "
+                        f"restore error: {rollback_error}"
+                    ) from rollback_error
+            raise
+        if backup is not None:
+            try:
+                shutil.rmtree(backup)
+            except Exception as error:
+                log_debug_exception(f"Update staged, but old staging backup cleanup failed: {backup}", error)
+                queue_append_log(f"\nWARNING: Update staged; the old staging backup remains at {backup}.\n")
 
 
 def download_and_stage_app_release(release):
@@ -16416,12 +16793,7 @@ def download_and_stage_app_release(release):
 
         staged_version = validate_staged_app_version(staging_dir, tag)
 
-        if os.path.isdir(GUI_UPDATE_DIR):
-            shutil.rmtree(GUI_UPDATE_DIR)
-        elif os.path.exists(GUI_UPDATE_DIR):
-            raise ValueError(f"Cannot stage the update because {GUI_UPDATE_DIR} exists and is not a folder.")
-
-        os.replace(staging_dir, GUI_UPDATE_DIR)
+        commit_staged_app_update(staging_dir, GUI_UPDATE_DIR)
         staging_dir = ""
 
         return {
@@ -17035,6 +17407,91 @@ def open_ytdlp_update_dialog():
 
 
 
+def clear_ytdlp_cache():
+    """Clear yt-dlp's extractor cache using the configured capture executable."""
+    if APP_CLOSING:
+        return
+    if (start_button.cget("state") == "disabled"
+            or any(get_job_engine(job) == "yt-dlp" for job in get_running_queue_jobs())
+            or any(thread.is_alive() and thread.name in {
+                "audio_video_preview_scan", "clear-ytdlp-cache"
+            } for thread in threading.enumerate())):
+        messagebox.showinfo("yt-dlp is busy", "Wait for Audio/Video capture, preview extraction, or cache clearing to finish before clearing the cache.")
+        return
+
+    executable = yt_dlp_path_var.get().strip()
+    if not executable or not os.path.isfile(executable):
+        messagebox.showerror("yt-dlp not found", "yt-dlp path is missing or invalid.")
+        return
+
+    # Match the app-local cache used by capture and preview extraction.
+    command = [executable, "--ignore-config", "--cache-dir", YTDLP_CACHE_DIR, "--rm-cache-dir"]
+    append_log("\nClearing yt-dlp cache...\n")
+    tools_menu.entryconfig("Clear yt-dlp Cache", state="disabled")
+
+    def worker():
+        try:
+            result = subprocess.run(
+                command, cwd=ROOT, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+            for output in (result.stdout, result.stderr):
+                if output:
+                    queue_append_log(output + ("" if output.endswith("\n") else "\n"))
+            if result.returncode == 0:
+                queue_append_log("yt-dlp cache clearing completed successfully.\n")
+            else:
+                queue_append_log(f"WARNING: yt-dlp cache clearing failed. Exit code: {result.returncode}\n")
+        except Exception as error:
+            log_debug_exception("Could not clear yt-dlp cache", error)
+            queue_append_log(f"WARNING: Could not clear yt-dlp cache: {error}\n")
+        finally:
+            safe_after(0, tools_menu.entryconfig, "Clear yt-dlp Cache", {"state": "normal"})
+
+    if start_daemon_thread("clear-ytdlp-cache", worker) is None:
+        tools_menu.entryconfig("Clear yt-dlp Cache", state="normal")
+        append_log("WARNING: Could not start yt-dlp cache clearing.\n")
+
+
+def clear_deno_cache():
+    """Remove only WAVI's Deno runtime cache, leaving other Deno users alone."""
+    if APP_CLOSING:
+        return
+    if (start_button.cget("state") == "disabled"
+            or web_start_button.cget("state") == "disabled"
+            or web_preflight_running
+            or any(get_job_engine(job) in {"yt-dlp", "web-capture"}
+                   for job in get_running_queue_jobs())
+            or any(thread.is_alive() and thread.name in {
+                "audio_video_preview_scan", "audio_video_preview_thumbnail",
+                "deno-update", "clear-deno-cache"
+            } for thread in threading.enumerate())):
+        messagebox.showinfo("Deno is busy", "Wait for Audio/Video or Webpage capture, previews, preflight, Deno updates, or cache clearing to finish before clearing the Deno cache.")
+        return
+
+    append_log(f"\nClearing Deno cache: {DENO_CACHE_DIR}\n")
+    tools_menu.entryconfig("Clear Deno Cache", state="disabled")
+
+    def worker():
+        try:
+            # rmtree refuses directory symlinks and does not traverse Windows junctions.
+            # No Deno executable is needed, including when the cache does not exist.
+            if os.path.lexists(DENO_CACHE_DIR):
+                shutil.rmtree(DENO_CACHE_DIR)
+                queue_append_log("Deno cache clearing completed successfully.\n")
+            else:
+                queue_append_log("Deno cache is already empty (folder does not exist).\n")
+        except Exception as error:
+            log_debug_exception("Could not clear Deno cache", error)
+            queue_append_log(f"WARNING: Could not clear Deno cache: {error}\n")
+        finally:
+            safe_after(0, tools_menu.entryconfig, "Clear Deno Cache", {"state": "normal"})
+
+    if start_daemon_thread("clear-deno-cache", worker) is None:
+        tools_menu.entryconfig("Clear Deno Cache", state="normal")
+        append_log("WARNING: Could not start Deno cache clearing.\n")
+
+
 def update_ytdlp_direct(update_target):
     yt_dlp_path = yt_dlp_path_var.get().strip()
 
@@ -17508,7 +17965,7 @@ def update_deno_direct():
             log_debug_exception("Deno update error", e)
             queue_append_log("Deno update error. Details were written to gui-debug.log.\n")
 
-    start_daemon_thread("worker", worker)
+    start_daemon_thread("deno-update", worker)
 
 
 
@@ -18462,6 +18919,7 @@ def open_playlist_preview_dialog(silent=False, force_reload=False):
         cmd = [
             yt_dlp_path,
             "--ignore-config",
+            "--cache-dir", YTDLP_CACHE_DIR,
             "--dump-single-json",
             "--skip-download",
             "--ignore-no-formats-error",
@@ -20673,6 +21131,7 @@ def export_firefox_cookies(output_cookie_file, update_main_cookie_path=True):
     def worker():
         cmd = [
             yt_dlp_path,
+            "--cache-dir", YTDLP_CACHE_DIR,
             "--cookies-from-browser",
             browser,
             "--cookies",
@@ -24426,8 +24885,15 @@ def on_close():
         ):
             return
 
-    SHUTDOWN_STARTED = True
-    APP_CLOSING = True
+    # Close the launch gate and include any process registered while the close
+    # confirmation was open. No capture can spawn after this snapshot.
+    with CAPTURE_PROCESS_LOCK:
+        SHUTDOWN_STARTED = True
+        APP_CLOSING = True
+        queue_active = queue_active or bool(job_queue_running_processes)
+        direct_av_active = direct_av_active or running_process is not None
+        direct_image_active = direct_image_active or image_running_process is not None
+        direct_web_active = direct_web_active or web_running_process is not None
 
     try:
         stop_browser_intake_handoff_poller()
@@ -24480,21 +24946,32 @@ def on_close():
                 log_debug_exception("Could not mark Webpage direct recovery job interrupted during shutdown", e)
             terminate_process_tree(web_running_process, label="direct Webpage Capture")
 
+    terminate_process_tree(web_preflight_process, label="Webpage Capture preflight")
+
     try:
         flush_log_queues_now()
     except Exception as e:
         log_debug_exception("Could not flush log queues during shutdown", e)
 
+    for save_action in (
+        save_url_box_persistence_if_enabled,
+        save_image_url_box_persistence_if_enabled,
+        save_web_url_box_persistence_if_enabled,
+        flush_settings_autosave,
+        lambda: save_settings(show_popup=False, log_saved=False),
+        lambda: save_job_queue_state(immediate=True),
+    ):
+        try:
+            save_action()
+        except Exception as e:
+            log_debug_exception("Final state save during shutdown failed", e)
+
     try:
-        save_url_box_persistence_if_enabled()
-        save_image_url_box_persistence_if_enabled()
-        save_web_url_box_persistence_if_enabled()
-        flush_settings_autosave()
-        flush_job_queue_state_save()
-        save_settings(show_popup=False, log_saved=False)
-        save_job_queue_state(immediate=True)
+        json_persistence_writer.flush()
     except Exception as e:
-        log_debug_exception("Final state save during shutdown failed", e)
+        log_debug_exception("Final persistence flush failed", e)
+        queue_append_log(f"\nWARNING: Final persistence flush failed: {e}\n")
+    flush_log_queues_now()
 
     try:
         cleanup_tracked_gui_temp_files()
@@ -24948,11 +25425,11 @@ def resolve_web_browser_path(configured_path=None):
     return detect_web_browser_path()
 
 
-def resolve_web_deno_path(configured_path=None):
+def resolve_web_deno_path(configured_path=None, yt_dlp_path=None):
     value = str(configured_path or "").strip()
     if value and os.path.isfile(value):
         return os.path.abspath(value)
-    detected = resolve_deno_executable_for_gui()
+    detected = resolve_deno_executable_for_gui(yt_dlp_path)
     return detected if detected and os.path.isfile(detected) else value or detected
 
 
@@ -25500,6 +25977,7 @@ def get_web_settings_dict():
         "web_pdf_landscape": bool(web_pdf_landscape_var.get()),
         "web_pdf_print_background": bool(web_pdf_print_background_var.get()),
         "web_pdf_display_header_footer": bool(web_pdf_display_header_footer_var.get()),
+        "web_pdf_first_last_only": bool(web_pdf_first_last_only_var.get()),
         "web_pdf_scale": normalize_positive_float_string(web_pdf_scale_var.get(), DEFAULTS["web_pdf_scale"]),
         "web_pdf_paper_width_in": normalize_positive_float_string(web_pdf_paper_width_in_var.get(), DEFAULTS["web_pdf_paper_width_in"]),
         "web_pdf_paper_height_in": normalize_positive_float_string(web_pdf_paper_height_in_var.get(), DEFAULTS["web_pdf_paper_height_in"]),
@@ -26052,6 +26530,11 @@ def update_web_pdf_options_state(*_args):
             widget.configure(state=header_footer_state)
         except Exception:
             pass
+    first_last_check = globals().get("web_pdf_first_last_check")
+    if first_last_check is not None:
+        first_last_check.configure(state=(
+            "normal" if header_footer_state == "normal" and png_capture_mode else "disabled"
+        ))
     update_web_options_summary()
 
 
@@ -26269,7 +26752,7 @@ def inspect_netscape_cookie_file(cookie_path):
 def validate_web_settings_and_urls(settings, urls, resolved_case_name="", preflight_only=False):
     script_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
     helper_path = resolve_web_helper_script_path(script_path)
-    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""), settings.get("yt_dlp_path", ""))
     browser_path = resolve_web_browser_path(settings.get("web_browser_path", ""))
     output_root = str(settings.get("web_output_root") or settings.get("output_root") or "").strip()
 
@@ -26650,6 +27133,7 @@ def make_web_capture_config(job, preflight_only=False):
         "pdf_landscape": bool(settings.get("web_pdf_landscape", DEFAULTS["web_pdf_landscape"])),
         "pdf_print_background": bool(settings.get("web_pdf_print_background", DEFAULTS["web_pdf_print_background"])),
         "pdf_display_header_footer": bool(settings.get("web_pdf_display_header_footer", DEFAULTS["web_pdf_display_header_footer"])),
+        "pdf_first_last_only": bool(settings.get("web_pdf_first_last_only", DEFAULTS["web_pdf_first_last_only"])),
         "pdf_scale": float(settings.get("web_pdf_scale", DEFAULTS["web_pdf_scale"])),
         "pdf_paper_width_in": float(settings.get("web_pdf_paper_width_in", DEFAULTS["web_pdf_paper_width_in"])),
         "pdf_paper_height_in": float(settings.get("web_pdf_paper_height_in", DEFAULTS["web_pdf_paper_height_in"])),
@@ -26682,7 +27166,7 @@ def make_web_capture_config(job, preflight_only=False):
 def build_web_capture_command_for_job(job, preflight_only=False):
     config_path, _config = make_web_capture_config(job, preflight_only=preflight_only)
     settings = job.get("settings", {})
-    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""))
+    deno_path = resolve_web_deno_path(settings.get("web_deno_path", ""), settings.get("yt_dlp_path", ""))
     wrapper_path = resolve_web_wrapper_script_path(settings.get("web_script_path", ""))
     helper_path = resolve_web_helper_script_path(wrapper_path)
 
@@ -26702,7 +27186,14 @@ def build_web_capture_command_for_job(job, preflight_only=False):
     ]
 
 
+web_preflight_running = False
+web_preflight_process = None
+
+
 def run_web_preflight_check():
+    global web_preflight_running
+    if web_preflight_running or APP_CLOSING:
+        return False
     web_preflight_done_var.set(False)
     web_set_status("Running preflight...")
     web_append_log("\n========== Webpage Capture Preflight ==========\n")
@@ -26717,11 +27208,8 @@ def run_web_preflight_check():
             "resolved_case_name": "",
         }
         validate_web_settings_and_urls(settings, [], "", preflight_only=True)
-        versions = query_capture_tool_versions_for_job(settings)
         web_append_log(f"PowerShell script: {settings.get('web_script_path', '')}\n")
         web_append_log(f"TypeScript helper: {resolve_web_helper_script_path(settings.get('web_script_path', ''))}\n")
-        web_append_log(f"Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
-        web_append_log(f"Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n")
         web_append_log(f"Browser path: {settings.get('web_browser_path', '')}\n")
         if settings.get("web_use_cookies_file"):
             cookie_stats = inspect_netscape_cookie_file(settings.get("web_cookies_file", ""))
@@ -26754,49 +27242,75 @@ def run_web_preflight_check():
         web_append_log("Normal browser profile access: disabled by design\n")
         web_append_log("Testing isolated profile launch and loopback DevTools connection...\n")
         cmd = build_web_capture_command_for_job(job, preflight_only=True)
-        process = subprocess.Popen(
-            cmd,
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        try:
-            output, _ = process.communicate(timeout=45)
-        except subprocess.TimeoutExpired:
-            terminate_process_tree(process, label="Webpage Capture preflight")
-            try:
-                output, _ = process.communicate(timeout=5)
-            except Exception:
-                output = ""
-            if output:
-                web_append_log(output)
-            raise
-        if output:
-            web_append_log(output)
-        if process.returncode != 0 or "WEB_CAPTURE_PREFLIGHT_OK" not in output:
-            raise ValueError(
-                "The isolated Chromium DevTools test failed. Browser remote debugging, Deno child-process execution, "
-                "or local profile creation may be blocked by policy."
-            )
-        web_preflight_done_var.set(True)
-        web_set_status("Preflight passed")
-        web_append_log("Webpage Capture preflight passed.\n")
-        messagebox.showinfo("Webpage Capture preflight", "Preflight passed. The browser launched with an isolated app-owned profile and accepted a loopback DevTools connection.")
-        schedule_settings_autosave()
-        return True
-    except subprocess.TimeoutExpired:
-        web_set_status("Preflight timed out")
-        web_append_log("ERROR: Webpage Capture preflight timed out.\n")
-        messagebox.showerror("Webpage Capture preflight failed", "The browser/Deno compatibility test timed out. Review endpoint policy and the Webpage Capture log.")
-        return False
-    except Exception as e:
-        web_set_status("Preflight failed")
-        web_append_log(f"ERROR: {e}\n")
-        messagebox.showerror("Webpage Capture preflight failed", str(e))
-        return False
-    finally:
+
+    except Exception as error:
         cleanup_command_input_file_if_temp(cmd)
+        web_set_status("Preflight failed")
+        web_append_log(f"ERROR: {error}\n")
+        messagebox.showerror("Webpage Capture preflight failed", str(error))
+        return False
+
+    web_preflight_running = True
+
+    def finish(success, message):
+        global web_preflight_running
+        web_preflight_running = False
+        flush_log_queues_now()
+        web_preflight_done_var.set(success)
+        web_set_status("Preflight passed" if success else "Preflight failed")
+        if success:
+            web_append_log("Webpage Capture preflight passed.\n")
+            messagebox.showinfo("Webpage Capture preflight", message)
+            schedule_settings_autosave()
+        else:
+            web_append_log(f"ERROR: {message}\n")
+            messagebox.showerror("Webpage Capture preflight failed", message)
+
+    def worker():
+        global web_preflight_process
+        process = None
+        success = False
+        message = "The browser launched with an isolated app-owned profile and accepted a loopback DevTools connection."
+        try:
+            versions = query_capture_tool_versions_for_job(settings)
+            queue_web_append_log(f"Deno: {versions.get('deno', {}).get('version', 'unavailable')}\n")
+            queue_web_append_log(f"Browser: {versions.get('browser', {}).get('version', 'unavailable')}\n")
+            with CAPTURE_PROCESS_LOCK:
+                if APP_CLOSING or SHUTDOWN_STARTED:
+                    return
+                process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                web_preflight_process = process
+            try:
+                output, _ = process.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                terminate_process_tree(process, label="Webpage Capture preflight")
+                try:
+                    output, _ = process.communicate(timeout=5)
+                    if output:
+                        queue_web_append_log(output)
+                except Exception:
+                    pass
+                raise
+            if output:
+                queue_web_append_log(output)
+            if process.returncode != 0 or "WEB_CAPTURE_PREFLIGHT_OK" not in output:
+                raise ValueError("The isolated Chromium DevTools test failed. Browser remote debugging, Deno child-process execution, or local profile creation may be blocked by policy.")
+            success = True
+        except subprocess.TimeoutExpired:
+            message = "The browser/Deno compatibility test timed out. Review endpoint policy and the Webpage Capture log."
+        except Exception as error:
+            message = str(error)
+        finally:
+            cleanup_capture_process(process, "Webpage Capture preflight")
+            web_preflight_process = None
+            cleanup_command_input_file_if_temp(cmd)
+            safe_after(0, finish, success, message)
+
+    if start_daemon_thread("web-preflight", worker) is None:
+        cleanup_command_input_file_if_temp(cmd)
+        finish(False, "Could not start the preflight worker.")
+        return False
+    return True
 
 
 def add_web_urls_to_queue_as_job(urls=None):
@@ -26896,11 +27410,11 @@ def _increment_web_classification_count(counts, record):
         counts[classification] += 1
 
 
-def show_web_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, classification_summary=None):
+def show_web_run_summary(exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, classification_summary=None, counts=None):
     global last_successful_web_case_summary
     context = last_web_capture_context if isinstance(last_web_capture_context, dict) else {}
     paths = context.get("paths", {})
-    counts = count_case_files(paths.get("case_folder", "")) if paths else {}
+    counts = counts or {}
     classifications = classification_summary if isinstance(classification_summary, dict) else {}
     web_append_log("\n========== Webpage Run Summary ==========\n")
     web_append_log(f"Exit code: {exit_code}\n")
@@ -26949,27 +27463,21 @@ def show_web_run_summary(exit_code, submitted_url_count, universal_skip_records=
     return last_successful_web_case_summary
 
 
-def finish_web_direct_capture_summary(recovery_job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, classification_summary=None):
+def finish_web_direct_capture_summary(recovery_job_id, exit_code, submitted_url_count, universal_skip_records=None, universal_skip_summary=None, classification_summary=None, counts=None):
+    flush_log_queues_now()
     summary = show_web_run_summary(
         exit_code,
         submitted_url_count,
         universal_skip_records=universal_skip_records,
         universal_skip_summary=universal_skip_summary,
         classification_summary=classification_summary,
+        counts=counts,
     )
     finish_direct_recovery_job(recovery_job_id, exit_code, summary)
 
 
 def start_web_capture():
     global web_running_process, web_direct_stop_requested, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name, last_web_capture_context
-
-    queue_has_work = bool(job_queue_running or get_pending_queue_jobs() or get_running_queue_jobs())
-    if queue_has_work or get_web_concurrent_capture_limit() >= 2:
-        if not job_queue_window_is_open():
-            open_job_queue()
-        if add_web_urls_to_queue_as_job():
-            start_job_queue()
-        return
 
     if web_running_process is not None and web_running_process.poll() is None:
         messagebox.showwarning("Already running", "A Webpage Capture process is already running.")
@@ -27042,7 +27550,7 @@ def start_web_capture():
     active_web_direct_domains = list(domains)
     active_web_direct_case_name = resolved_case_name
 
-    versions = query_capture_tool_versions_for_job(settings)
+    versions = {}
     last_web_capture_context = {
         "tool_versions": versions,
         "submitted_url_count": len(urls),
@@ -27122,65 +27630,39 @@ def start_web_capture():
     def worker():
         global web_running_process, web_direct_stop_requested, active_web_direct_recovery_job_id, active_web_direct_domains, active_web_direct_case_name
         exit_code = 1
-        universal_skip_records = []
-        universal_skip_summary = {}
+        process = None
         classification_summary = {"complete": 0, "complete_with_warnings": 0, "partial": 0, "failed": 0}
+        def handle_classification(record, line):
+            _increment_web_classification_count(classification_summary, record)
+            queue_web_append_log(format_web_capture_classification_for_log(record) + "\n")
+            if recovery_job_id:
+                safe_after(0, handle_queue_output_line, recovery_job_id, line)
+            else:
+                safe_after(
+                    0, record_web_capture_url_history, record,
+                    settings.get("web_output_root", settings.get("output_root", "")),
+                    resolved_case_name, queue_web_append_log,
+                )
+
+        output = CaptureOutputRouter(
+            queue_web_append_log,
+            (lambda line: safe_after(0, handle_queue_output_line, recovery_job_id, line)) if recovery_job_id else None,
+            archive_writer=record_web_universal_archive_capture,
+            on_classification=handle_classification,
+        )
+
         try:
-            process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
-            web_running_process = process
+            versions.update(query_capture_tool_versions_for_job(settings))
+            log_capture_tool_versions(versions, log_callback=queue_web_append_log)
+            process = launch_capture_process(cmd, "web-capture")
             safe_after(0, lambda: web_stop_button.config(state="normal"))
             safe_after(0, web_set_status, "Running...")
-            if process.stdout:
-                for line in process.stdout:
-                    archive_payload = parse_web_universal_archive_record_output_line(line)
-                    if archive_payload:
-                        try:
-                            archive_id = record_web_universal_archive_capture(archive_payload)
-                            safe_after(
-                                0,
-                                web_append_log,
-                                f"Webpage universal archive updated: {archive_id} | {archive_payload.get('requested_url', '')}\n",
-                            )
-                        except Exception as archive_error:
-                            safe_after(0, web_append_log, f"WARNING: Webpage universal archive update failed: {archive_error}\n")
-                        continue
-
-                    skip_record = parse_universal_archive_skip_output_line(line)
-                    if skip_record:
-                        universal_skip_records.append(skip_record)
-                        safe_after(0, web_append_log, format_universal_archive_skip_record_for_log(skip_record) + "\n")
-                        continue
-
-                    skip_summary = parse_universal_archive_skip_summary_line(line)
-                    if skip_summary:
-                        universal_skip_summary = skip_summary
-                        continue
-
-                    classification_record = parse_web_capture_classification_output_line(line)
-                    if classification_record:
-                        _increment_web_classification_count(classification_summary, classification_record)
-                        safe_after(0, web_append_log, format_web_capture_classification_for_log(classification_record) + "\n")
-                        if recovery_job_id:
-                            safe_after(0, handle_queue_output_line, recovery_job_id, line)
-                        else:
-                            safe_after(
-                                0,
-                                record_web_capture_url_history,
-                                classification_record,
-                                settings.get("web_output_root", settings.get("output_root", "")),
-                                resolved_case_name,
-                                web_append_log,
-                            )
-                        continue
-
-                    safe_after(0, web_append_log, line)
-                    if recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE\t") or line.startswith("GUI_QUEUE_URL_INCOMPLETE\t")):
-                        safe_after(0, handle_queue_output_line, recovery_job_id, line)
-            exit_code = process.wait()
+            exit_code = output.read(process)
         except Exception as e:
-            safe_after(0, web_append_log, f"\nERROR: {e}\n")
+            queue_web_append_log(f"\nERROR: {e}\n")
             exit_code = 1
         finally:
+            cleanup_capture_process(process, "direct web-capture capture")
             cleanup_command_input_file_if_temp(cmd)
             safe_after(
                 0,
@@ -27188,9 +27670,10 @@ def start_web_capture():
                 recovery_job_id,
                 exit_code,
                 len(urls),
-                list(universal_skip_records),
-                dict(universal_skip_summary),
+                list(output.skip_records),
+                dict(output.skip_summary),
                 dict(classification_summary),
+                count_case_files_for_summary(last_web_capture_context.get("paths", {}).get("case_folder", "")),
             )
 
         def finish():
@@ -27598,6 +28081,7 @@ web_create_pdf_var = tk.BooleanVar(value=DEFAULTS["web_create_pdf"])
 web_pdf_landscape_var = tk.BooleanVar(value=DEFAULTS["web_pdf_landscape"])
 web_pdf_print_background_var = tk.BooleanVar(value=DEFAULTS["web_pdf_print_background"])
 web_pdf_display_header_footer_var = tk.BooleanVar(value=DEFAULTS["web_pdf_display_header_footer"])
+web_pdf_first_last_only_var = tk.BooleanVar(value=DEFAULTS["web_pdf_first_last_only"])
 web_pdf_scale_var = tk.StringVar(value=DEFAULTS["web_pdf_scale"])
 web_pdf_paper_width_in_var = tk.StringVar(value=DEFAULTS["web_pdf_paper_width_in"])
 web_pdf_paper_height_in_var = tk.StringVar(value=DEFAULTS["web_pdf_paper_height_in"])
@@ -28126,6 +28610,8 @@ tools_menu = tk.Menu(menu_bar, tearoff=0)
 menu_bar.add_cascade(label="Tools", menu=tools_menu)
 tools_menu.add_command(label="Proxy Options", command=open_proxy_options_dialog)
 tools_menu.add_command(label="Update Deno", command=update_deno_direct)
+tools_menu.add_command(label="Clear yt-dlp Cache", command=clear_ytdlp_cache)
+tools_menu.add_command(label="Clear Deno Cache", command=clear_deno_cache)
 tools_menu.add_command(label="Domain Presets", command=open_domain_presets_window)
 tools_menu.add_separator()
 tools_menu.add_command(label="Browser Integration...", command=open_browser_integration_dialog)
@@ -29200,6 +29686,9 @@ def build_gallery_powershell_command_for_job(job):
     return cmd
 
 
+image_preflight_running = False
+
+
 def image_preflight_check(show_success_popup=True):
     checks = []
 
@@ -29256,48 +29745,73 @@ def image_preflight_check(show_success_popup=True):
     except Exception as e:
         add_check("Output root exists and is writable", False, str(e))
 
-    if os.path.isfile(gallery_path):
-        version_info = get_tool_first_line(
-            [gallery_path, "--version"],
-            cwd=os.path.dirname(os.path.abspath(gallery_path)) or ROOT,
-            timeout=20,
-        )
-        add_check("gallery-dl can run", version_info["ok"], version_info["version"])
-        if version_info["ok"]:
-            gallery_dl_version_status_var.set(f"gallery-dl: {version_info['version']}")
-        else:
-            gallery_dl_version_status_var.set("gallery-dl: version check failed")
-    else:
-        gallery_dl_version_status_var.set("gallery-dl: not found")
-        add_check("gallery-dl can run", False, "gallery-dl path is invalid")
+    def finish(results):
+        global image_preflight_running
+        image_preflight_running = False
+        def lookup_version(command, **kwargs):
+            return results.get(tuple(command), {"ok": False, "version": "Tool changed during preflight; run the check again."})
 
-    failed = [item for item in checks if not item[1]]
+        def evaluate():
+            if os.path.isfile(gallery_path):
+                version_info = lookup_version(
+                    [gallery_path, "--version"],
+                    cwd=os.path.dirname(os.path.abspath(gallery_path)) or ROOT,
+                    timeout=20,
+                )
+                add_check("gallery-dl can run", version_info["ok"], version_info["version"])
+                if version_info["ok"]:
+                    gallery_dl_version_status_var.set(f"gallery-dl: {version_info['version']}")
+                else:
+                    gallery_dl_version_status_var.set("gallery-dl: version check failed")
+            else:
+                gallery_dl_version_status_var.set("gallery-dl: not found")
+                add_check("gallery-dl can run", False, "gallery-dl path is invalid")
 
-    image_append_log("\nGallery/Profile Capture preflight complete.\n")
-    image_append_log(f"Passed: {len(checks) - len(failed)} / {len(checks)}\n")
-    image_append_log("=====================================" "\n")
+            failed = [item for item in checks if not item[1]]
 
-    if failed:
-        image_set_status("Preflight failed")
-        if show_success_popup:
-            messagebox.showwarning(
-                "Gallery/Profile Capture preflight failed",
-                f"{len(failed)} check(s) failed. Review the Gallery/Profile Capture output log before starting capture.",
-            )
-        return False
+            image_append_log("\nGallery/Profile Capture preflight complete.\n")
+            image_append_log(f"Passed: {len(checks) - len(failed)} / {len(checks)}\n")
+            image_append_log("=====================================" "\n")
 
-    image_set_status("Preflight passed")
-    if show_success_popup:
-        messagebox.showinfo("Gallery/Profile Capture preflight passed", "All Gallery/Profile Capture preflight checks passed.")
-    return True
+            if failed:
+                image_set_status("Preflight failed")
+                if show_success_popup:
+                    messagebox.showwarning(
+                        "Gallery/Profile Capture preflight failed",
+                        f"{len(failed)} check(s) failed. Review the Gallery/Profile Capture output log before starting capture.",
+                    )
+                return False
+
+            image_set_status("Preflight passed")
+            if show_success_popup:
+                messagebox.showinfo("Gallery/Profile Capture preflight passed", "All Gallery/Profile Capture preflight checks passed.")
+            return True
+        image_preflight_done_var.set(evaluate() is True)
+
+    def probe_worker():
+        results = {}
+        for executable, flag in [(gallery_path, "--version")]:
+            if executable and os.path.isfile(executable):
+                command = [executable, flag]
+                results[tuple(command)] = get_tool_first_line(command, cwd=os.path.dirname(os.path.abspath(executable)) or ROOT)
+        safe_after(0, finish, results)
+
+    if start_daemon_thread("preflight-versions", probe_worker) is None:
+        raise RuntimeError("Could not start the preflight version worker.")
+    return None
 
 
 def run_image_preflight_check():
+    global image_preflight_running
+    if image_preflight_running or APP_CLOSING:
+        return
+    image_preflight_running = True
     image_preflight_done_var.set(False)
 
     try:
         passed = image_preflight_check(show_success_popup=True)
     except Exception as e:
+        image_preflight_running = False
         image_set_status("Preflight failed")
         image_append_log(f"\nGallery/Profile Capture preflight error: {e}\n")
         messagebox.showerror("Gallery/Profile Capture preflight failed", str(e))
@@ -29409,11 +29923,11 @@ def add_image_job_to_queue_and_start():
         start_job_queue()
 
 
-def show_image_run_summary(exit_code, submitted_url_count):
+def show_image_run_summary(exit_code, submitted_url_count, counts=None):
     global last_successful_image_case_summary
     context = last_image_capture_context if isinstance(last_image_capture_context, dict) else {}
     paths = context.get("paths", {})
-    counts = count_case_files(paths.get("case_folder", "")) if paths else {}
+    counts = counts or {}
     image_append_log("\n========== Gallery/Profile Run Summary ==========\n")
     image_append_log(f"Exit code: {exit_code}\n")
     image_append_log(f"Submitted URLs: {submitted_url_count}\n")
@@ -29451,55 +29965,13 @@ def show_image_run_summary(exit_code, submitted_url_count):
     return last_successful_image_case_summary
 
 
-def finish_image_direct_capture_summary(recovery_job_id, exit_code, submitted_url_count):
-    summary = show_image_run_summary(exit_code, submitted_url_count)
+def finish_image_direct_capture_summary(recovery_job_id, exit_code, submitted_url_count, counts=None):
+    summary = show_image_run_summary(exit_code, submitted_url_count, counts=counts)
     finish_direct_recovery_job(recovery_job_id, exit_code, summary)
 
 
 def start_image_capture():
     global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name, last_image_capture_context
-
-    effective_concurrency_limit = get_image_concurrent_capture_limit()
-
-    try:
-        preset_decision_urls = get_image_url_list()
-        preset_decision_settings, _ = apply_checked_domain_presets_to_settings(
-            get_image_settings_dict(),
-            preset_decision_urls,
-        )
-        effective_concurrency_limit = get_image_concurrent_capture_limit(preset_decision_settings)
-    except Exception:
-        pass
-
-    queue_has_active_or_pending_jobs = False
-    try:
-        queue_has_active_or_pending_jobs = (
-            job_queue_running
-            or bool(get_pending_queue_jobs())
-            or bool(get_running_queue_jobs())
-        )
-    except Exception:
-        queue_has_active_or_pending_jobs = bool(job_queue_running)
-
-    if queue_has_active_or_pending_jobs:
-        if not job_queue_window_is_open():
-            open_job_queue()
-
-        added = add_image_urls_to_queue_as_job()
-        if added:
-            image_append_log("\nStart Capture added the current Gallery/Profile Capture to the existing queue.\n")
-            if job_queue_running:
-                run_next_queue_job()
-            else:
-                start_job_queue()
-        return
-
-    if effective_concurrency_limit >= 2:
-        if not job_queue_window_is_open():
-            open_job_queue()
-        if add_image_urls_to_queue_as_job():
-            start_job_queue()
-        return
 
     if image_running_process is not None and image_running_process.poll() is None:
         messagebox.showwarning("Already running", "A Gallery/Profile Capture process is already running.")
@@ -29594,7 +30066,7 @@ def start_image_capture():
     active_image_direct_domains = list(domains)
     active_image_direct_case_name = resolved_case_name
 
-    versions = query_capture_tool_versions_for_job(settings)
+    versions = {}
     last_image_capture_context = {
         "tool_versions": versions,
         "submitted_url_count": len(urls),
@@ -29618,11 +30090,6 @@ def start_image_capture():
             image_append_log(f"Active domain preset(s): {', '.join(active_presets) if active_presets else 'none'}\n")
     image_append_log(f"Filename template: {settings.get('image_filename_template', DEFAULTS['image_filename_template'])}\n")
     image_append_log(format_universal_archive_status_line("gallery-dl", settings) + "\n")
-    image_append_log("Tool and script versions:\n")
-    image_append_log(f"  App: {APP_VERSION}\n")
-    image_append_log(f"  PowerShell script: {versions.get('powershell_script', '')}\n")
-    image_append_log(f"  gallery-dl path: {versions.get('gallery_dl_path', '')}\n")
-    image_append_log(f"  gallery-dl: {versions.get('gallery_dl', {}).get('version', 'unavailable')}\n\n")
     image_append_log("Command:\n")
     image_append_log(format_command_for_log(cmd) + "\n\n")
     image_start_button.config(state="disabled")
@@ -29633,23 +30100,28 @@ def start_image_capture():
     def worker():
         global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
         exit_code = 1
+        process = None
+        output = CaptureOutputRouter(
+            queue_image_append_log,
+            (lambda line: safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)) if direct_recovery_job_id else None,
+            parse_skips=False,
+        )
+
         try:
-            process = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
-            image_running_process = process
+            versions.update(query_capture_tool_versions_for_job(settings))
+            log_capture_tool_versions(versions, log_callback=queue_image_append_log)
+            process = launch_capture_process(cmd, "gallery-dl")
             safe_after(0, lambda: image_stop_button.config(state="normal"))
             safe_after(0, image_set_status, "Running...")
-            if process.stdout:
-                for line in process.stdout:
-                    queue_image_append_log(line)
-                    if direct_recovery_job_id and (line.startswith("GUI_QUEUE_URL_COMPLETE	") or line.startswith("GUI_QUEUE_URL_INCOMPLETE	")):
-                        safe_after(0, handle_queue_output_line, direct_recovery_job_id, line)
-            exit_code = process.wait()
+            exit_code = output.read(process)
         except Exception as e:
             queue_image_append_log(f"\nERROR: {e}\n")
             exit_code = 1
         finally:
+            cleanup_capture_process(process, "direct gallery-dl capture")
             cleanup_command_input_file_if_temp(cmd)
-            safe_after(0, finish_image_direct_capture_summary, direct_recovery_job_id, exit_code, len(urls))
+            safe_after(0, finish_image_direct_capture_summary, direct_recovery_job_id, exit_code, len(urls),
+                       count_case_files_for_summary(last_image_capture_context.get("paths", {}).get("case_folder", "")))
         def finish():
             global image_running_process, image_direct_stop_requested, active_image_direct_recovery_job_id, active_image_direct_domains, active_image_direct_case_name
             image_running_process = None
@@ -29898,9 +30370,17 @@ def check_gallery_dl_version():
         gallery_dl_version_status_var.set("gallery-dl: not found")
         image_append_log("\ngallery-dl version check failed: path is missing or invalid.\n")
         return
-    version = get_tool_first_line([path, "--version"], cwd=os.path.dirname(os.path.abspath(path)) or ROOT, timeout=20)
-    gallery_dl_version_status_var.set(f"gallery-dl: {version['version']}" if version["ok"] else "gallery-dl: version check failed")
-    image_append_log(f"\ngallery-dl version: {version['version']}\n")
+    def finish(version):
+        if gallery_dl_path_var.get().strip() != path:
+            return
+        gallery_dl_version_status_var.set(f"gallery-dl: {version['version']}" if version["ok"] else "gallery-dl: version check failed")
+        image_append_log(f"\ngallery-dl version: {version['version']}\n")
+
+    def worker():
+        version = get_tool_first_line([path, "--version"], cwd=os.path.dirname(os.path.abspath(path)) or ROOT, timeout=20)
+        safe_after(0, finish, version)
+
+    start_daemon_thread("gallery-version", worker)
 
 
 def add_image_file_row(parent, row, label, var):
@@ -31406,6 +31886,14 @@ web_pdf_templates_tab.columnconfigure(1, weight=1)
 web_pdf_templates_tab.rowconfigure(1, weight=1)
 web_pdf_notebook.add(web_pdf_templates_tab, text="Header & Footer")
 
+web_pdf_first_last_check = ttk.Checkbutton(
+    web_pdf_templates_tab,
+    text="Header on first page and footer on last page only (Captured PNG)",
+    variable=web_pdf_first_last_only_var,
+    command=update_web_options_summary,
+)
+web_pdf_first_last_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
 web_pdf_header_toolbar = ttk.Frame(web_pdf_templates_tab)
 web_pdf_header_toolbar.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 web_pdf_header_toolbar.columnconfigure(0, weight=1)
@@ -31464,7 +31952,7 @@ ttk.Label(
     ),
     wraplength=920,
     justify="left",
-).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 0))
 
 def on_web_pdf_template_edit(_event=None):
     sync_web_pdf_templates_from_widgets(schedule_autosave=True)
@@ -31556,6 +32044,7 @@ for web_option_var in (
     web_pdf_landscape_var,
     web_pdf_print_background_var,
     web_pdf_display_header_footer_var,
+    web_pdf_first_last_only_var,
     web_pdf_scale_var,
     web_pdf_paper_width_in_var,
     web_pdf_paper_height_in_var,
@@ -32692,5 +33181,6 @@ else:
     vpn_status_var.set("VPN: Check disabled")
 
 safe_after(150, deferred_job_queue_startup)
+poll_gui_worker_events()
 
 root.mainloop()

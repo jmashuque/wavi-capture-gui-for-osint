@@ -2,6 +2,21 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.1008](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.1008) - Capture Reliability, Cache Controls, and PDF Refinements
+
+- Added **Clear yt-dlp Cache** and **Clear Deno Cache** to the Tools menu, with checks for active capture and related operations before clearing.
+- Moved WAVI-managed yt-dlp and Deno caches into `.ytdlp-cache` and `.deno-cache` within the application folder, leaving existing user-profile caches untouched.
+- Added an optional **Header on first page and footer on last page only** setting for Captured PNG PDFs, with both shown on single-page documents and the setting preserved in profiles and queued jobs.
+- Corrected direct capture starts so pending queue items do not redirect the requested capture into the Job Queue or start a different pending job.
+- Corrected **Remove Selected** in the Job Queue to act on checked jobs while retaining a separate context-menu action for the highlighted job.
+- Strengthened capture cancellation, child-process cleanup, interrupted-job handling, and shutdown coordination across capture engines.
+- Improved GUI responsiveness during capture output, tool-version checks, case-file counting, and Webpage preflight, and corrected scrolling errors involving Tkinter event widget references.
+- Strengthened evidence-stamping collision handling and failure recovery to protect existing files, and improved Webpage artifact and manifest writing so failures are reported without losing completed capture records.
+- Reduced memory use when hashing large Webpage capture files through incremental processing.
+- Improved settings, URL-box, and Job Queue persistence with ordered writes, reduced disk activity, safer malformed-file handling, and clearer failure diagnostics.
+- Strengthened application-update package validation, staging, and rollback handling before manual deployment.
+- Improved credential redaction in capture logs and diagnostics for failed temporary-file cleanup.
+
 ## [v3.2026.0922](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.0922) - Evidence Stamping, Capture Readiness, and Workflow Refinements
 
 - Added optional **Evidence Stamping** for newly captured Gallery/Profile static images, creating separate stamped derivatives under `derived\evidence` while preserving and re-verifying the original file; derivatives use lossless PNG by default, can optionally match the source format, and include independent SHA-256 hashes and `.evidence.json` provenance records.

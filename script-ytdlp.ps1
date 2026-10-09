@@ -218,6 +218,15 @@ if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
 $script:RunLog = ""
 $script:RunLogWriter = $null
 
+function ConvertTo-SafeLogText {
+    param([AllowNull()][AllowEmptyString()][string]$Message)
+
+    # Mask URL userinfo in wrapper messages and native-tool diagnostics alike.
+    # Keep scheme, endpoint and diagnostic text; never use this for execution args.
+    return [regex]::Replace([string]$Message,
+        '(?i)\b((?:https?|socks4a?|socks5h?)://)[^\s/\\''"<>?#]+@', '${1}***@')
+}
+
 function Initialize-RunLogWriter {
     if ([string]::IsNullOrWhiteSpace($script:RunLog)) {
         return
@@ -238,6 +247,8 @@ function Initialize-RunLogWriter {
 
 function Add-RunLogLine {
     param([AllowNull()][string]$Message)
+
+    $Message = ConvertTo-SafeLogText $Message
 
     if ([string]::IsNullOrWhiteSpace($script:RunLog)) {
         return
@@ -285,7 +296,7 @@ function Write-RunLog {
         [string]$Message
     )
 
-    Write-Host $Message
+    Write-Host (ConvertTo-SafeLogText $Message)
 
     Add-RunLogLine $Message
 }
@@ -296,7 +307,7 @@ function Write-RunWarning {
         [string]$Message
     )
 
-    Write-Warning $Message
+    Write-Warning (ConvertTo-SafeLogText $Message)
 
     Add-RunLogLine $Message
 }
@@ -557,7 +568,7 @@ function New-VideoThumbnailsForRecentCaptures {
                 ForEach-Object {
                     $line = $_.ToString()
                     if ($line) {
-                        Write-Host $line
+                        Write-Host (ConvertTo-SafeLogText $line)
                         Add-RunLogLine $line
                     }
                 }
@@ -565,7 +576,7 @@ function New-VideoThumbnailsForRecentCaptures {
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $thumbPath -PathType Leaf)) {
                 $allOk = $false
                 $msg = "FFmpeg could not generate thumbnail for: $($file.FullName)"
-                Write-Warning $msg
+                Write-Warning (ConvertTo-SafeLogText $msg)
                 Add-RunLogLine $msg
                 if (Test-Path -LiteralPath $thumbPath -PathType Leaf) {
                     Remove-Item -LiteralPath $thumbPath -Force -ErrorAction SilentlyContinue
@@ -575,7 +586,7 @@ function New-VideoThumbnailsForRecentCaptures {
         catch {
             $allOk = $false
             $msg = "Thumbnail generation failed for $($file.FullName): $($_.Exception.Message)"
-            Write-Warning $msg
+            Write-Warning (ConvertTo-SafeLogText $msg)
             Add-RunLogLine $msg
         }
     }
@@ -672,14 +683,14 @@ function New-MediaInfoForRecentCaptures {
             else {
                 $allOk = $false
                 $msg = "FFprobe could not generate media info for: $($file.FullName)"
-                Write-Warning $msg
+                Write-Warning (ConvertTo-SafeLogText $msg)
                 Add-RunLogLine $msg
             }
         }
         catch {
             $allOk = $false
             $msg = "Media info generation failed for $($file.FullName): $($_.Exception.Message)"
-            Write-Warning $msg
+            Write-Warning (ConvertTo-SafeLogText $msg)
             Add-RunLogLine $msg
         }
     }
@@ -1253,6 +1264,7 @@ if ($RetryBehavior -eq "Custom") {
 
 $CommonArgs = @(
     "--ignore-config",
+    "--cache-dir", (Join-Path $PSScriptRoot ".ytdlp-cache"),
     "--continue",
     "--restrict-filenames",
     "--trim-filenames", "180",
@@ -1572,7 +1584,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
         & $YtDlpPath @CommonArgs $Url 2>&1 |
             ForEach-Object {
                 $line = $_.ToString()
-                Write-Host $line
+                Write-Host (ConvertTo-SafeLogText $line)
                 Add-RunLogLine $line
 
                 if ($UniversalArchiveActive) {
@@ -1588,7 +1600,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     catch {
         $YtDlpExitCode = 1
         $msg = "ERROR capturing URL: $Url`r`n$($_.Exception.Message)"
-        Write-Warning $msg
+        Write-Warning (ConvertTo-SafeLogText $msg)
         Add-RunLogLine $msg
     }
     finally {
@@ -1633,7 +1645,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
     if ($YtDlpExitCode -ne 0) {
         $HadCaptureFailure = $true
         $msg = "yt-dlp exited with code $YtDlpExitCode for URL: $Url"
-        Write-Warning $msg
+        Write-Warning (ConvertTo-SafeLogText $msg)
         Add-RunLogLine $msg
 
         if ($FailureHandling -eq "Stop") {
@@ -1677,13 +1689,16 @@ Write-Section "Hashing captured files"
 
 $manifestSince = if ($ManifestMode -eq "RunOnly") { $RunStartTime } else { [datetime]::MinValue }
 $manifestEncoding = New-Object System.Text.UTF8Encoding($false)
-$manifestWriter = New-Object System.IO.StreamWriter($HashManifest, $false, $manifestEncoding)
+$ManifestFailures = 0
+$ManifestPartial = $HashManifest + '.' + [guid]::NewGuid().ToString('N') + '.partial'
+$manifestWriter = $null
 try {
+    $manifestWriter = New-Object System.IO.StreamWriter($ManifestPartial, $false, $manifestEncoding)
     $manifestWriter.WriteLine('"Algorithm","Hash","Path"')
 
     # Hash all eligible files except the active run log first. The run log is
     # still open while manifest warnings and the final summary are written.
-    foreach ($file in Get-ChildItem -LiteralPath $CaseDir -Recurse -File -ErrorAction SilentlyContinue) {
+    foreach ($file in Get-ChildItem -LiteralPath $CaseDir -Recurse -File -ErrorAction Stop) {
         if ($file.FullName -eq $HashManifest -or $file.FullName -eq $RunLog) {
             continue
         }
@@ -1707,6 +1722,7 @@ try {
             $manifestWriter.WriteLine(('"SHA256","{0}","{1}"' -f $hash, $safePath))
         }
         catch {
+            $ManifestFailures++
             Write-RunWarning "Could not hash file for manifest: $($file.FullName) - $($_.Exception.Message)"
         }
     }
@@ -1733,21 +1749,45 @@ try {
             $manifestWriter.WriteLine(('"SHA256","{0}","{1}"' -f $runLogHash, $safeRunLogPath))
         }
         catch {
+            $ManifestFailures++
             Write-Warning "Could not hash finalized run log for manifest: $RunLog - $($_.Exception.Message)"
         }
     }
+    $manifestWriter.Dispose()
+    $manifestWriter = $null
+    if ($ManifestFailures -eq 0) {
+        [System.IO.File]::Move($ManifestPartial, $HashManifest)
+    }
+}
+catch {
+    $ManifestFailures++
+    Write-Warning "Could not complete hash manifest: $($_.Exception.Message)"
 }
 finally {
-    Close-RunLogWriter
-    $manifestWriter.Dispose()
+    try {
+        Close-RunLogWriter
+    }
+    finally {
+        try {
+            if ($null -ne $manifestWriter) { $manifestWriter.Dispose() }
+        }
+        finally {
+            if (Test-Path -LiteralPath $ManifestPartial) {
+                Remove-Item -LiteralPath $ManifestPartial -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+if ($ManifestFailures -gt 0) {
+    Write-Warning "Hash manifest was not committed because one or more files could not be processed. Successfully captured URL records were retained."
 }
 
-Write-Host "Hash manifest written to: $HashManifest"
+if ($ManifestFailures -eq 0) { Write-Host "Hash manifest written to: $HashManifest" }
 
 # Windows PowerShell -File otherwise reports successful script completion as exit 0.
 # Make the wrapper's process result authoritative for the GUI/queue whenever any
 # submitted URL returned a non-zero yt-dlp result.
-if ($HadCaptureFailure) {
+if ($HadCaptureFailure -or $ManifestFailures -gt 0) {
     exit 1
 }
 

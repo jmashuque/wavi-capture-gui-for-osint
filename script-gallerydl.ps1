@@ -102,6 +102,15 @@ else {
 
 $AppTempFolder = Join-Path $ScriptRoot "gui-temp"
 
+function ConvertTo-SafeLogText {
+    param([AllowNull()][AllowEmptyString()][string]$Message)
+
+    # Mask URL userinfo in wrapper messages and native-tool diagnostics alike.
+    # Keep scheme, endpoint and diagnostic text; never use this for execution args.
+    return [regex]::Replace([string]$Message,
+        '(?i)\b((?:https?|socks4a?|socks5h?)://)[^\s/\\''"<>?#]+@', '${1}***@')
+}
+
 function New-AppTempFile {
     param(
         [Parameter(Mandatory = $true)][string]$Prefix,
@@ -278,7 +287,7 @@ function Invoke-GalleryDlSafely {
                 }
                 else {
                     if ($Line.Length -gt 0) {
-                        Write-Host $Line
+                        Write-Host (ConvertTo-SafeLogText $Line)
                         Write-RunLogLineOnly $Line
                     }
                     $StdOutTask = $Process.StandardOutput.ReadLineAsync()
@@ -291,7 +300,7 @@ function Invoke-GalleryDlSafely {
                 }
                 else {
                     if ($Line.Length -gt 0) {
-                        Write-Host $Line
+                        Write-Host (ConvertTo-SafeLogText $Line)
                         Write-RunLogLineOnly $Line
                     }
                     $StdErrTask = $Process.StandardError.ReadLineAsync()
@@ -582,7 +591,8 @@ function Resolve-EvidenceStampTemplate {
 function Invoke-NativeCaptureText {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$Arguments
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 300
     )
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $FilePath
@@ -593,20 +603,42 @@ function Invoke-NativeCaptureText {
     $startInfo.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
+    $started = $false
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         if (-not $process.Start()) {
             throw "Could not start native tool: $FilePath"
         }
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
+        $started = $true
+        # Drain both pipes while the child runs; sequential reads can deadlock.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $remaining = [int][Math]::Max(0, ($TimeoutSeconds * 1000) - $clock.ElapsedMilliseconds)
+        if (-not $process.WaitForExit($remaining)) {
+            throw [System.TimeoutException]::new("Native tool exceeded the $TimeoutSeconds second timeout: $FilePath")
+        }
+        $remaining = [int][Math]::Max(0, ($TimeoutSeconds * 1000) - $clock.ElapsedMilliseconds)
+        if (-not [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), $remaining)) {
+            throw [System.TimeoutException]::new("Native tool output did not close within $TimeoutSeconds seconds: $FilePath")
+        }
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
             throw ("Native tool failed with exit code {0}: {1}" -f $process.ExitCode, $stderr.Trim())
         }
         return $stdout.Trim()
     }
     finally {
-        $process.Dispose()
+        try {
+            if ($started -and -not $process.HasExited) {
+                $process.Kill()
+                [void]$process.WaitForExit(2000)
+            }
+        }
+        finally {
+            $clock.Stop()
+            $process.Dispose()
+        }
     }
 }
 
@@ -615,7 +647,7 @@ function Get-EvidenceImageDimensions {
         [Parameter(Mandatory = $true)][string]$FFprobePath,
         [Parameter(Mandatory = $true)][string]$ImagePath
     )
-    $result = Invoke-NativeCaptureText -FilePath $FFprobePath -Arguments @(
+    $result = Invoke-NativeCaptureText -FilePath $FFprobePath -TimeoutSeconds 30 -Arguments @(
         '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=s=x:p=0', $ImagePath
     )
     if ($result -notmatch '^(\d+)x(\d+)$') {
@@ -704,6 +736,54 @@ function New-EvidenceFooterImage {
     }
 }
 
+function New-EvidenceOutputReservation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Stem,
+        [Parameter(Mandatory = $true)][string]$Extension
+    )
+
+    for ($attempt = 1; $attempt -le 10000; $attempt++) {
+        $suffix = if ($attempt -eq 1) { '' } else { '_' + $attempt }
+        $candidateStem = $Stem + $suffix
+        $derivativePath = Join-Path $Directory ($candidateStem + $Extension)
+        $sidecarPath = Join-Path $Directory ($candidateStem + '.evidence.json')
+        # The reservation is shared by every output format for this stem.
+        # CreateNew arbitrates concurrent writers; closing the handle removes
+        # the reservation, including when Windows terminates the process.
+        $reservationPath = $sidecarPath + '.reserve'
+        try {
+            $stream = [System.IO.FileStream]::new(
+                $reservationPath, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None,
+                4096, [System.IO.FileOptions]::DeleteOnClose)
+        }
+        catch [System.IO.IOException] {
+            if ((Test-Path -LiteralPath $reservationPath)) {
+                continue
+            }
+            throw
+        }
+
+        $keepReservation = $false
+        try {
+            if ((Test-Path -LiteralPath $derivativePath) -or (Test-Path -LiteralPath $sidecarPath)) {
+                continue
+            }
+            $keepReservation = $true
+            return @{
+                derivative_path = $derivativePath
+                sidecar_path = $sidecarPath
+                stream = $stream
+            }
+        }
+        finally {
+            if (-not $keepReservation) { $stream.Dispose() }
+        }
+    }
+    throw 'Could not reserve an unused evidence image and provenance filename pair.'
+}
+
 function New-EvidenceDerivative {
     param(
         [Parameter(Mandatory = $true)][System.IO.FileInfo]$OriginalFile,
@@ -729,69 +809,69 @@ function New-EvidenceDerivative {
 
     $sourceExtension = $OriginalFile.Extension.ToLowerInvariant()
     $outputExtension = if ($MatchSourceFormat) { $sourceExtension } else { '.png' }
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($OriginalFile.Name)
-    $sourceSuffix = if ((-not $MatchSourceFormat) -and $sourceExtension -ne '.png') { '_' + $sourceExtension.TrimStart('.') } else { '' }
-    $derivativeStem = $baseName + $sourceSuffix + '_evidence_' + $RunStamp
-    $derivativePath = Join-Path $destinationDirectory ($derivativeStem + $outputExtension)
-    $sidecarPath = Join-Path $destinationDirectory ($derivativeStem + '.evidence.json')
+    # Keep the original extension in the stem so different source formats do
+    # not share a provenance filename, even when source-format matching is on.
+    $derivativeStem = $OriginalFile.Name + '_evidence_' + $RunStamp
+    $reservation = $null
+    $footerImage = $null
     $tempDerivative = Join-Path $destinationDirectory ('.wavi-evidence-' + [guid]::NewGuid().ToString('N') + $outputExtension)
     $tempSidecar = Join-Path $destinationDirectory ('.wavi-evidence-' + [guid]::NewGuid().ToString('N') + '.json')
-    $footerImage = New-AppTempFile -Prefix 'wavi-evidence-footer-' -Suffix '.png'
-
-    $originalHashBefore = Get-Sha256HashCompat -Path $originalFullPath
-    $dimensions = Get-EvidenceImageDimensions -FFprobePath $FFprobePath -ImagePath $originalFullPath
-    $width = [int]$dimensions[0]
-
-    $domainLabel = if ($SubmittedUrls.Count -eq 1) {
-        try {
-            $uri = [Uri]$SubmittedUrls[0]
-            if ($uri.Host) { $uri.Host } else { 'unknown-domain' }
-        }
-        catch { 'unknown-domain' }
-    }
-    elseif ($SubmittedUrls.Count -gt 1) {
-        'multiple-domains'
-    }
-    else {
-        'unknown-domain'
-    }
-    $submittedUrlLabel = if ($SubmittedUrls.Count -eq 1) {
-        [string]$SubmittedUrls[0]
-    }
-    else {
-        ("Multiple submitted URLs ({0})" -f $SubmittedUrls.Count)
-    }
-
-    $resolvedStampText = Resolve-EvidenceStampTemplate `
-        -Template $StampTemplate `
-        -Version $Version `
-        -CaseName $SafeCaseName `
-        -CaptureLocal $CaptureLocal `
-        -CaptureUtc $CaptureUtc `
-        -DomainLabel $domainLabel `
-        -SubmittedUrlLabel $submittedUrlLabel `
-        -SourceCount $SubmittedUrls.Count `
-        -OriginalRelativePath $originalRelativeToCase `
-        -OriginalFileName $OriginalFile.Name `
-        -OriginalExtension $sourceExtension.TrimStart('.') `
-        -OriginalSha256 $originalHashBefore
-
-    $footerLayout = New-EvidenceFooterImage `
-        -Width $width `
-        -Text $resolvedStampText `
-        -OutputPath $footerImage
-
-    $filter = '[0:v]format=rgba[base];[1:v]format=rgba[footer];[base][footer]vstack=inputs=2[v]'
-    $ffmpegArgs = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $originalFullPath, '-i', $footerImage, '-filter_complex', $filter, '-map', '[v]', '-frames:v', '1', '-map_metadata', '-1')
-    switch ($outputExtension) {
-        '.jpg'  { $ffmpegArgs += @('-q:v', '2') }
-        '.jpeg' { $ffmpegArgs += @('-q:v', '2') }
-        '.png'  { $ffmpegArgs += @('-compression_level', '6') }
-        '.webp' { $ffmpegArgs += @('-lossless', '1') }
-    }
-    $ffmpegArgs += $tempDerivative
-
     try {
+        $footerImage = New-AppTempFile -Prefix 'wavi-evidence-footer-' -Suffix '.png'
+
+        $originalHashBefore = Get-Sha256HashCompat -Path $originalFullPath
+        $dimensions = Get-EvidenceImageDimensions -FFprobePath $FFprobePath -ImagePath $originalFullPath
+        $width = [int]$dimensions[0]
+
+        $domainLabel = if ($SubmittedUrls.Count -eq 1) {
+            try {
+                $uri = [Uri]$SubmittedUrls[0]
+                if ($uri.Host) { $uri.Host } else { 'unknown-domain' }
+            }
+            catch { 'unknown-domain' }
+        }
+        elseif ($SubmittedUrls.Count -gt 1) {
+            'multiple-domains'
+        }
+        else {
+            'unknown-domain'
+        }
+        $submittedUrlLabel = if ($SubmittedUrls.Count -eq 1) {
+            [string]$SubmittedUrls[0]
+        }
+        else {
+            ("Multiple submitted URLs ({0})" -f $SubmittedUrls.Count)
+        }
+
+        $resolvedStampText = Resolve-EvidenceStampTemplate `
+            -Template $StampTemplate `
+            -Version $Version `
+            -CaseName $SafeCaseName `
+            -CaptureLocal $CaptureLocal `
+            -CaptureUtc $CaptureUtc `
+            -DomainLabel $domainLabel `
+            -SubmittedUrlLabel $submittedUrlLabel `
+            -SourceCount $SubmittedUrls.Count `
+            -OriginalRelativePath $originalRelativeToCase `
+            -OriginalFileName $OriginalFile.Name `
+            -OriginalExtension $sourceExtension.TrimStart('.') `
+            -OriginalSha256 $originalHashBefore
+
+        $footerLayout = New-EvidenceFooterImage `
+            -Width $width `
+            -Text $resolvedStampText `
+            -OutputPath $footerImage
+
+        $filter = '[0:v]format=rgba[base];[1:v]format=rgba[footer];[base][footer]vstack=inputs=2[v]'
+        $ffmpegArgs = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $originalFullPath, '-i', $footerImage, '-filter_complex', $filter, '-map', '[v]', '-frames:v', '1', '-map_metadata', '-1')
+        switch ($outputExtension) {
+            '.jpg'  { $ffmpegArgs += @('-q:v', '2') }
+            '.jpeg' { $ffmpegArgs += @('-q:v', '2') }
+            '.png'  { $ffmpegArgs += @('-compression_level', '6') }
+            '.webp' { $ffmpegArgs += @('-lossless', '1') }
+        }
+        $ffmpegArgs += $tempDerivative
+
         [void](Invoke-NativeCaptureText -FilePath $FFmpegPath -Arguments $ffmpegArgs)
         if (-not (Test-Path -LiteralPath $tempDerivative -PathType Leaf)) {
             throw "FFmpeg did not create the evidence derivative."
@@ -804,6 +884,9 @@ function New-EvidenceDerivative {
 
         $tempDerivativeItem = Get-Item -LiteralPath $tempDerivative -ErrorAction Stop
         $derivativeHash = Get-Sha256HashCompat -Path $tempDerivativeItem.FullName
+        $reservation = New-EvidenceOutputReservation -Directory $destinationDirectory -Stem $derivativeStem -Extension $outputExtension
+        $derivativePath = $reservation.derivative_path
+        $sidecarPath = $reservation.sidecar_path
         $derivativeRelativeToCase = $derivativePath.Substring($CaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
 
         $payload = [ordered]@{
@@ -845,9 +928,11 @@ function New-EvidenceDerivative {
         $derivativeCommitted = $false
         $sidecarCommitted = $false
         try {
-            Move-Item -LiteralPath $tempDerivative -Destination $derivativePath -Force
+            # The two-argument .NET move refuses an existing destination even
+            # if a non-WAVI writer creates it after our reservation check.
+            [System.IO.File]::Move($tempDerivative, $derivativePath)
             $derivativeCommitted = $true
-            Move-Item -LiteralPath $tempSidecar -Destination $sidecarPath -Force
+            [System.IO.File]::Move($tempSidecar, $sidecarPath)
             $sidecarCommitted = $true
         }
         catch {
@@ -871,7 +956,10 @@ function New-EvidenceDerivative {
     finally {
         Remove-Item -LiteralPath $tempDerivative -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $tempSidecar -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $footerImage -Force -ErrorAction SilentlyContinue
+        if ($footerImage) {
+            Remove-Item -LiteralPath $footerImage -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $reservation) { $reservation.stream.Dispose() }
     }
 }
 
@@ -941,6 +1029,8 @@ function Initialize-RunLogWriter {
 function Write-RunLogLineOnly {
     param([AllowNull()][string]$Message)
 
+    $Message = ConvertTo-SafeLogText $Message
+
     if ($null -eq $script:RunLogWriter) {
         Initialize-RunLogWriter
     }
@@ -969,7 +1059,7 @@ Initialize-RunLogWriter
 
 function Write-RunLog {
     param([string]$Message)
-    Write-Host $Message
+    Write-Host (ConvertTo-SafeLogText $Message)
     Write-RunLogLineOnly $Message
 }
 
@@ -1241,7 +1331,7 @@ if ($Urls.Count -gt 1) {
         $Failed = $Urls.Count
         $Completed = 0
         $msg = "ERROR capturing image URL batch:`r`n$($_.Exception.Message)"
-        Write-Warning $msg
+        Write-Warning (ConvertTo-SafeLogText $msg)
         Write-RunLogLineOnly $msg
 
         $Index = 0
@@ -1276,7 +1366,7 @@ else {
         catch {
             $ExitCode = 1
             $msg = "ERROR capturing image URL $Index`: $Url`r`n$($_.Exception.Message)"
-            Write-Warning $msg
+            Write-Warning (ConvertTo-SafeLogText $msg)
             Write-RunLogLineOnly $msg
         }
 
@@ -1348,14 +1438,18 @@ if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
 }
 
 Write-Section "Gallery/Profile Capture Manifest"
-$CaseFiles = Get-ChildItem -LiteralPath $CaseFolder -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
-    $_.FullName -notlike "*\.gui-cache\*" -and $_.FullName -notlike "*\manifests\*"
-}
 $RunLogFullPath = [System.IO.Path]::GetFullPath($RunLog)
 
 $ManifestEncoding = New-Object System.Text.UTF8Encoding($false)
-$ManifestWriter = New-Object System.IO.StreamWriter($ManifestFile, $false, $ManifestEncoding)
+$ManifestFailures = 0
+$ManifestPartial = $ManifestFile + '.' + [guid]::NewGuid().ToString('N') + '.partial'
+$ManifestWriter = $null
 try {
+    $CaseFiles = Get-ChildItem -LiteralPath $CaseFolder -File -Recurse -ErrorAction Stop | Where-Object {
+        $_.FullName -notlike "*\.gui-cache\*" -and $_.FullName -notlike "*\manifests\*"
+    }
+
+    $ManifestWriter = New-Object System.IO.StreamWriter($ManifestPartial, $false, $ManifestEncoding)
     $ManifestWriter.WriteLine("SHA256,SizeBytes,RelativePath")
     foreach ($File in $CaseFiles) {
         $FileFullPath = [System.IO.Path]::GetFullPath($File.FullName)
@@ -1369,6 +1463,7 @@ try {
             $ManifestWriter.WriteLine(('"{0}",{1},"{2}"' -f $Hash, $File.Length, ($Relative -replace '"', '""')))
         }
         catch {
+            $ManifestFailures++
             Write-RunLog "WARNING: Could not hash file: $($File.FullName) - $($_.Exception.Message)"
         }
     }
@@ -1392,15 +1487,39 @@ try {
         $ManifestWriter.WriteLine(('"{0}",{1},"{2}"' -f $RunLogHash, $RunLogItem.Length, ($RunLogRelative -replace '"', '""')))
     }
     catch {
+        $ManifestFailures++
         Write-Warning "Could not hash finalized run log: $RunLog - $($_.Exception.Message)"
     }
+    $ManifestWriter.Dispose()
+    $ManifestWriter = $null
+    if ($ManifestFailures -eq 0) {
+        [System.IO.File]::Move($ManifestPartial, $ManifestFile)
+    }
+}
+catch {
+    $ManifestFailures++
+    Write-Warning "Could not complete hash manifest: $($_.Exception.Message)"
 }
 finally {
-    Close-RunLogWriter
-    $ManifestWriter.Dispose()
+    try {
+        Close-RunLogWriter
+    }
+    finally {
+        try {
+            if ($null -ne $ManifestWriter) { $ManifestWriter.Dispose() }
+        }
+        finally {
+            if (Test-Path -LiteralPath $ManifestPartial) {
+                Remove-Item -LiteralPath $ManifestPartial -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+if ($ManifestFailures -gt 0) {
+    Write-Warning "Hash manifest was not committed because one or more files could not be processed. Successfully captured URL records were retained."
 }
 
-if ($Failed -gt 0) {
+if ($Failed -gt 0 -or $EvidenceDerivativeFailures -gt 0 -or $ManifestFailures -gt 0) {
     exit 1
 }
 
