@@ -36,7 +36,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk, simpledialog
 
 APP_TITLE = "Webpage/Audio/Video/Image Capture GUI for OSINT"
 APP_WINDOW_TITLE = "WAVI Capture GUI for OSINT"
-APP_VERSION = "v3.2026.1008"
+APP_VERSION = "v3.2026.1011"
 APP_RELEASES_LATEST_URL = "https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_WINDOW_WIDTH = 1180
 APP_WINDOW_DEFAULT_HEIGHT = 790
@@ -58,7 +58,7 @@ OUTPUT_LOG_ALL_MAX_RECORDS = 50000
 APP_GITHUB_LATEST_API_URL = "https://api.github.com/repos/jmashuque/wavi-capture-gui-for-osint/releases/latest"
 APP_UPDATE_DIR_NAME = "gui-update"
 APP_UPDATE_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
-SETTINGS_SCHEMA_VERSION = 54
+SETTINGS_SCHEMA_VERSION = 58
 WEB_CAPTURE_RENDERER_MAX_SINGLE_DIMENSION_PX = 16382
 BROWSER_INTAKE_HOST = "127.0.0.1"
 BROWSER_INTAKE_DEFAULT_PORT = 17654
@@ -145,6 +145,7 @@ IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS = (
     "%url%",
     "%domain%",
     "%source_count%",
+    "%item_datetime%",
     None,
     "%date%",
     "%time%",
@@ -218,6 +219,10 @@ DEFAULTS = {
     "image_evidence_derivative": False,
     "image_evidence_match_source_format": False,
     "image_evidence_stamp_template": DEFAULT_IMAGE_EVIDENCE_STAMP_TEMPLATE,
+    "image_evidence_footer_percent": "10",
+    "image_evidence_readability": True,
+    "image_evidence_min_font": "16",
+    "image_evidence_left_percent": "50",
     "image_rate_limit": "normal",
     "image_max_items_enabled": False,
     "image_max_items": "",
@@ -484,6 +489,10 @@ DOMAIN_PRESET_SETTING_KEYS = [
     "image_evidence_derivative",
     "image_evidence_match_source_format",
     "image_evidence_stamp_template",
+    "image_evidence_footer_percent",
+    "image_evidence_readability",
+    "image_evidence_min_font",
+    "image_evidence_left_percent",
     "image_rate_limit",
     "image_max_items_enabled",
     "image_max_items",
@@ -551,6 +560,7 @@ APP_SETTINGS_DEFAULTS = {
     "window_state": "normal",
     "output_log_selected_engine": "Audio/Video",
     "output_log_follow_output": True,
+    "output_log_highlight_alerts": True,
     "browser_intake_token": "",
     "browser_intake_enabled": False,
     "browser_intake_port": BROWSER_INTAKE_DEFAULT_PORT,
@@ -1032,9 +1042,11 @@ engine_log_lock = threading.RLock()
 output_log_text = None
 output_log_engine_var = None
 output_log_follow_var = None
+output_log_highlight_var = None
 output_log_engine_selector = None
 output_log_selected_engine = "Audio/Video"
 output_log_follow_output = True
+output_log_highlight_alerts = True
 
 
 def redact_log_url_credentials(text):
@@ -2626,13 +2638,50 @@ def get_output_log_display_text(view=None):
         return "".join(str(record.get("text", "")) for record in engine_log_buffers[key])
 
 
+def is_output_log_alert_line(line):
+    # Match severity markers, not words buried in filenames, URLs or normal prose.
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(line))
+    return bool(re.match(
+        r"^\s*(?:\[[^\]\r\n]*\]\s*)*"
+        r"(?:\[(?:warn(?:ing)?|error|fatal|fail)\]"
+        r"|(?:warn(?:ing)?|error|fatal)\b(?:\s*:|\s+-|\s+\S)"
+        r"|(?:failed|unable) to\b|Traceback \(most recent call last\):"
+        r"|[A-Za-z_][\w.]*(?:Error|Exception):)", value, re.IGNORECASE,
+    ))
+
+
+def insert_output_log_display_text(value):
+    # Recheck the unfinished last line when a native-tool message arrives in chunks.
+    # Tk line indices avoid Python/Tcl character-count differences for Unicode.
+    start = output_log_text.index("end-1c linestart")
+    output_log_text.insert("end", str(value or ""), ())
+    apply_output_log_highlighting(start)
+
+
+def apply_output_log_highlighting(start="1.0"):
+    output_log_text.tag_configure("log_alert", foreground=get_theme_colors()["stop_fg"])
+    output_log_text.tag_lower("log_alert", "sel")
+    output_log_text.tag_remove("log_alert", start, "end")
+    if not output_log_highlight_alerts:
+        return
+    first_line = int(start.split(".")[0])
+    ranges = []
+    for offset, line in enumerate(output_log_text.get(start, "end-1c").split("\n")):
+        if is_output_log_alert_line(line):
+            number = first_line + offset
+            ranges.extend((f"{number}.0", f"{number}.end"))
+    # Bound Tcl argument batches during a full history refresh.
+    for offset in range(0, len(ranges), 1000):
+        output_log_text.tag_add("log_alert", *ranges[offset:offset + 1000])
+
+
 def set_output_log_text_content(value):
     if not widget_exists(output_log_text):
         return
     try:
         output_log_text.configure(state="normal")
         output_log_text.delete("1.0", "end")
-        output_log_text.insert("end", str(value or ""))
+        insert_output_log_display_text(value)
         output_log_text.configure(state="disabled")
         if output_log_follow_output:
             output_log_text.see("end")
@@ -2654,7 +2703,7 @@ def append_record_to_output_log_tab(record):
     value = format_all_engine_log_record(record) if selected == "All Engines" else str(record.get("text", ""))
     try:
         output_log_text.configure(state="normal")
-        output_log_text.insert("end", value)
+        insert_output_log_display_text(value)
         output_log_text.configure(state="disabled")
         if output_log_follow_output:
             output_log_text.see("end")
@@ -2735,6 +2784,19 @@ def on_output_log_follow_changed():
     schedule_settings_autosave()
 
 
+def on_output_log_highlight_changed():
+    global output_log_highlight_alerts
+    if output_log_highlight_var is not None:
+        output_log_highlight_alerts = bool(output_log_highlight_var.get())
+    if widget_exists(output_log_text):
+        try:
+            # Retag in place: keep the current scroll position, selection and text.
+            apply_output_log_highlighting()
+        except Exception as exc:
+            log_debug_exception("Could not update Output Log highlighting", exc)
+    schedule_settings_autosave()
+
+
 def clear_output_log_display():
     selected = normalize_output_log_view(output_log_selected_engine)
     if selected == "All Engines":
@@ -2762,17 +2824,120 @@ def copy_visible_output_log():
     )
 
 
-def save_visible_output_log():
+def get_output_log_redaction_values():
+    """Collect known identifying values without reading files or changing settings."""
+    values = set()
+    sensitive_key = re.compile(
+        r"(?i)(case.*name|resolved_case|case_template|output_root|file.*name|file.*template|"
+        r"path|cookies|proxy|password|secret|token|authorization|username|user_name|"
+        r"profile.*name|url|domain|title|author|uploader|job_id|capture_id)"
+    )
+
+    def collect(value, key="", depth=0):
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                collect(child, str(child_key), depth + 1)
+        elif isinstance(value, (list, tuple, set)):
+            for child in value:
+                collect(child, key, depth + 1)
+        elif isinstance(value, str) and sensitive_key.search(key):
+            cleaned = value.strip()
+            if len(cleaned) >= 3 and cleaned.lower() not in {"true", "false", "none", "default", "auto", "disabled", "enabled"}:
+                values.add(cleaned)
+
+    for name, value in list(globals().items()):
+        if name.endswith("_var") and sensitive_key.search(name):
+            try:
+                collect(value.get(), name)
+            except Exception:
+                pass
+    for name in ("last_capture_context", "last_image_capture_context", "last_web_capture_context", "job_queue"):
+        collect(globals().get(name, {}))
+    collect(globals().get("active_profile_name", ""), "profile_name")
+    for name in ("USERNAME", "USER", "COMPUTERNAME", "USERDOMAIN", "USERPROFILE", "HOME"):
+        collect(os.environ.get(name, ""), "username")
+    return values
+
+
+def redact_output_log_text(text, sensitive_values=()):
+    """Conservative export-only filtering; arbitrary free text still needs review."""
+    value = str(text or "")
+    # Remove terminal escape sequences before applying recognisable text patterns.
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    for item in sorted(set(sensitive_values), key=len, reverse=True):
+        if not isinstance(item, str) or len(item.strip()) < 3:
+            continue
+        value = re.sub(r"(?<!\w)" + re.escape(item) + r"(?!\w)", "[REDACTED]", value, flags=re.I)
+
+    output = []
+    command_next = False
+    for line in value.splitlines(keepends=True):
+        ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+        body = line.rstrip("\r\n")
+        if command_next and body.strip():
+            output.append("[COMMAND REDACTED]" + ending)
+            command_next = False
+            continue
+        if re.search(r"(?i)\bcommand(?: line)?\s*:\s*$", body):
+            command_next = True
+        # Commands and arbitrary JSON metadata may contain custom values or secrets.
+        if re.search(r"(?i)\bcommand(?: line)?\s*:\s*\S|(?:powershell|pwsh)(?:\.exe)?\s+|(?:yt-dlp|gallery-dl)(?:\.exe)?\s+--", body):
+            body = "[COMMAND REDACTED]"
+        elif body.lstrip().startswith(("{", "[{")):
+            body = "[STRUCTURED DATA REDACTED]"
+        else:
+            # yt-dlp prints unquoted filenames here, including spaces. Earlier
+            # known-value replacements may already have removed the path prefix.
+            body = re.sub(
+                r"(?i)(\bDeleting original file\s+).+?(\s+\(pass -k to keep\))?$",
+                r"\1[CAPTURE FILE]\2", body,
+            )
+            # Keep a diagnostic prefix while removing identifying labelled payloads.
+            body = re.sub(
+                r"(?i)(\b(?:case(?: name| folder| directory)?|resolved case name template|"
+                r"filename(?: template)?|file name|title|author|uploader|username|user name|"
+                r"(?:added .*?)?queue job|output root|case root|hostname|computer name|"
+                r"account|profile(?: loaded| saved| deleted)?|active profile|domain(?:s)?|"
+                r"job[ _-]?id|capture[ _-]?id|item[ _-]?id|video[ _-]?id|"
+                r"authorization|proxy-authorization|cookie|set-cookie|password|passwd|"
+                r"token|access_token|refresh_token|api[ _-]?key|secret)\b[\"']?\s*[:=]\s*).*$",
+                r"\1[REDACTED]", body,
+            )
+            body = re.sub(r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_.=~-]+", "[CREDENTIAL]", body)
+            body = re.sub(r"(?i)\b(?:https?|ftp|file|socks4a?|socks5h?)://[^\s<>\"']+", "[URL]", body)
+            body = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[EMAIL]", body)
+            # Quoted paths first; unquoted paths conservatively consume their tail.
+            body = re.sub(r'''["'](?:[A-Za-z]:[\\/]|\\\\|/)[^\r\n"']*["']''', "[PATH]", body)
+            body = re.sub(r"(?i)(?:\b[A-Z]:[\\/]|\\\\)[^\r\n]*", "[PATH]", body)
+            body = re.sub(r"(?<![\w:])/(?:[^\s/]+/)+[^\r\n]*", "[PATH]", body)
+            body = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[IP]", body)
+            body = re.sub(r"(?i)(?<!\w)(?:[0-9a-f]{0,4}:){2,}[0-9a-f:]{0,39}(?:%[\w.-]+)?(?!\w)", lambda match: "[IP]" if "::" in match.group() or re.search(r"[a-f]", match.group(), re.I) or match.group().count(":") >= 7 else match.group(), body)
+            body = re.sub(r"(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b", "[DEVICE]", body)
+            body = re.sub(r"(?i)\bS-1-\d+(?:-\d+)+\b", "[USER ID]", body)
+            body = re.sub(r"(?i)\b(?:[0-9a-f]{8}-[0-9a-f-]{27,}|[0-9a-f]{32,128})\b", "[ID]", body)
+            body = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b|\b\d{8}[_T-]\d{6}(?:Z)?\b", "[TIMESTAMP]", body)
+            body = re.sub(r"(?i)(?<![\w])(?:[\w-]+\.)+(?:com|org|net|edu|gov|ca|co|io|social|local|internal|onion|[a-z]{2,24})(?![\w])", "[HOST/FILE]", body)
+            # Download destinations and extractor IDs often lack an absolute path.
+            body = re.sub(r"(?i)(\b(?:Destination|Saving to|Saved to|Downloading to)\s*:?\s+).*$", r"\1[CAPTURE FILE]", body)
+            body = re.sub(r"(\[[\w:.-]+\]\s+)[^\s:]+(?=:\s)", r"\1[ITEM]", body)
+        output.append(body + ending)
+    return "".join(output)
+
+
+def save_visible_output_log(redacted=False):
     value = get_output_log_display_text()
     if not value:
         messagebox.showinfo("Output Log", "The selected output display is empty.", parent=root)
         return
     selected = normalize_output_log_view(output_log_selected_engine)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", selected.lower()).strip("-") or "output"
-    default_name = f"wavi-{safe_name}-log-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    export_kind = "redacted-log" if redacted else "log"
+    default_name = f"wavi-{safe_name}-{export_kind}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     path = filedialog.asksaveasfilename(
         parent=root,
-        title="Save Output Log",
+        title="Save Redacted Output Log" if redacted else "Save Output Log",
         defaultextension=".txt",
         initialfile=default_name,
         filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
@@ -2780,6 +2945,13 @@ def save_visible_output_log():
     if not path:
         return
     try:
+        if redacted:
+            value = redact_output_log_text(value, get_output_log_redaction_values())
+            value = (
+                "WAVI redacted visible output log\n"
+                "Automatic redaction is best effort. Review remaining free text before sharing.\n\n"
+                + value
+            )
         with open(path, "w", encoding="utf-8", newline="") as handle:
             handle.write(value)
         messagebox.showinfo("Output Log", f"Output log saved to:\n\n{path}", parent=root)
@@ -2793,6 +2965,8 @@ def apply_output_log_settings_to_tab():
             output_log_engine_var.set(normalize_output_log_view(output_log_selected_engine))
         if output_log_follow_var is not None:
             output_log_follow_var.set(bool(output_log_follow_output))
+        if output_log_highlight_var is not None:
+            output_log_highlight_var.set(bool(output_log_highlight_alerts))
     except Exception:
         pass
     refresh_output_log_tab()
@@ -3090,6 +3264,9 @@ def configure_tk_widget_theme(widget, colors):
                 selectbackground=colors["select_bg"],
                 selectforeground=colors["select_fg"],
             )
+            if widget is globals().get("output_log_text"):
+                widget.tag_configure("log_alert", foreground=colors["stop_fg"])
+                widget.tag_lower("log_alert", "sel")
         elif widget_class in {"Button"}:
             widget.configure(
                 bg=colors["button_bg"],
@@ -3791,8 +3968,8 @@ YTDLP_FILENAME_TAGS = [
     ("%channel%", "%(channel|unknown)s", "unknown-channel"),
     ("%channel_id%", "%(channel_id|unknown)s", "unknown-channel-id"),
     ("%creator%", "%(creator|unknown)s", "unknown-creator"),
-    ("%upload_date%", "%(upload_date|unknown)s", "20260623"),
-    ("%release_date%", "%(release_date|unknown)s", "20260623"),
+    ("%upload_datetime%", "%(timestamp>%Y-%m-%d_%H%M%SZ,upload_date>%Y-%m-%d|unknown)s", "2026-06-23_143000Z"),
+    ("%release_datetime%", "%(release_timestamp>%Y-%m-%d_%H%M%SZ,release_date>%Y-%m-%d|unknown)s", "2026-06-23_143000Z"),
     ("%duration%", "%(duration_string|duration|unknown)s", "00-01-23"),
     ("%playlist_title%", "%(playlist_title|playlist|unknown)s", "Sample Playlist"),
     ("%playlist_id%", "%(playlist_id|unknown)s", "SAMPLEPL"),
@@ -3814,6 +3991,12 @@ def apply_filename_template_compat_aliases(template, aliases):
 
 
 YTDLP_FILENAME_COMPAT_ALIASES = dict(COMMON_FILENAME_COMPAT_ALIASES)
+
+# Preserve saved date-only filename behaviour; promote datetime names in menus.
+YTDLP_FILENAME_LEGACY_ALIASES = [
+    ("%upload_date%", "%(upload_date|unknown)s", "20260623"),
+    ("%release_date%", "%(release_date|unknown)s", "20260623"),
+]
 
 GALLERYDL_FILENAME_TAGS = [
     (
@@ -3849,7 +4032,7 @@ GALLERYDL_FILENAME_TAGS = [
         "{user[username]|user[name]|username|author|creator|uploader|owner_username|fullname|owner_id|'unknown-user'}",
         "sample-user",
     ),
-    ("%item_date%", "{date|post_date|created|created_at|'unknown-date'}", "2026-06-23"),
+    ("%item_datetime%", "{date|post_date|created|created_at|'unknown-date'}", "2026-06-23 14:30:00"),
     ("%num%", "{num|index|page|position|'1'}", "001"),
     ("%count%", "{count|total|'1'}", "1"),
     (
@@ -3862,6 +4045,7 @@ GALLERYDL_FILENAME_TAGS = [
 GALLERYDL_FILENAME_COMPAT_ALIASES = dict(COMMON_FILENAME_COMPAT_ALIASES)
 
 GALLERYDL_FILENAME_LEGACY_ALIASES = [
+    ("%item_date%", "{date|post_date|created|created_at|'unknown-date'}", "2026-06-23"),
     ("%date_utc%", "{date!s}", "2026-06-23"),
 ]
 
@@ -3952,7 +4136,7 @@ def render_filename_template_for_ytdlp(template, now=None, domains=None, presets
     if resolved_case_name:
         rendered = rendered.replace("%case%", safe_case_name(str(resolved_case_name)))
 
-    for tag, native, _sample in sorted(YTDLP_FILENAME_TAGS, key=lambda item: len(item[0]), reverse=True):
+    for tag, native, _sample in sorted(YTDLP_FILENAME_TAGS + YTDLP_FILENAME_LEGACY_ALIASES, key=lambda item: len(item[0]), reverse=True):
         rendered = rendered.replace(tag, native)
 
     return validate_filename_template(rendered)
@@ -3968,7 +4152,7 @@ def render_filename_template_example(template, now=None, domains=None, presets=N
     if resolved_case_name:
         rendered = rendered.replace("%case%", safe_case_name(str(resolved_case_name)))
 
-    for tag, _native, sample in sorted(YTDLP_FILENAME_TAGS, key=lambda item: len(item[0]), reverse=True):
+    for tag, _native, sample in sorted(YTDLP_FILENAME_TAGS + YTDLP_FILENAME_LEGACY_ALIASES, key=lambda item: len(item[0]), reverse=True):
         rendered = rendered.replace(tag, safe_case_name(str(sample)))
 
     return rendered
@@ -4186,7 +4370,38 @@ def validate_image_evidence_stamp_template(template):
     unknown = sorted(set(re.findall(r"%[A-Za-z0-9_]+%", value)) - IMAGE_EVIDENCE_STAMP_ALLOWED_TAGS)
     if unknown:
         raise ValueError("Unsupported Gallery/Profile evidence stamp tag(s): " + ", ".join(unknown))
+    # Alignment is line-local: one section per side, no nesting or loose text.
+    for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if not re.search(r"</?(?:Left|Right)\b", line, re.I):
+            continue
+        matches = list(re.finditer(r"<(Left|Right)>(.*?)</\1>", line, re.I))
+        remainder = re.sub(r"<(Left|Right)>(.*?)</\1>", "", line, flags=re.I)
+        sides = [match.group(1).lower() for match in matches]
+        if (not matches or remainder.strip() or len(sides) != len(set(sides))
+                or any(re.search(r"</?(?:Left|Right)\b", match.group(2), re.I) for match in matches)):
+            raise ValueError("Evidence stamp alignment must use complete <Left>...</Left> and/or <Right>...</Right> sections on one line, with no nesting, duplicates, or text outside them.")
     return value
+
+
+def validate_image_evidence_left_percent(value):
+    value = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,2}", value) or not 1 <= int(value) <= 99:
+        raise ValueError("Evidence left-column width must be a whole percentage from 1 to 99.")
+    return str(int(value))
+
+
+def validate_image_evidence_min_font(value):
+    value = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,2}", value) or not 8 <= int(value) <= 72:
+        raise ValueError("Evidence minimum font size must be a whole number from 8 to 72 pixels.")
+    return str(int(value))
+
+
+def validate_image_evidence_footer_percent(value):
+    value = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,3}", value) or not 1 <= int(value) <= 100:
+        raise ValueError("Evidence footer height must be a whole percentage from 1 to 100 of the source image height.")
+    return str(int(value))
 
 
 def set_url_preview_pending_playlist_name(value):
@@ -7990,6 +8205,10 @@ def get_settings_dict():
         "image_evidence_derivative": image_evidence_derivative_var.get(),
         "image_evidence_match_source_format": image_evidence_match_source_format_var.get(),
         "image_evidence_stamp_template": get_image_evidence_stamp_template_value(),
+        "image_evidence_footer_percent": image_evidence_footer_percent_var.get().strip(),
+        "image_evidence_readability": image_evidence_readability_var.get(),
+        "image_evidence_min_font": image_evidence_min_font_var.get().strip(),
+        "image_evidence_left_percent": image_evidence_left_percent_var.get().strip(),
         "image_rate_limit": image_rate_limit_var.get(),
         "image_max_items_enabled": image_max_items_enabled_var.get(),
         "image_max_items": normalize_optional_positive_int_string(image_max_items_var.get()),
@@ -8273,6 +8492,10 @@ def apply_settings_dict(settings):
     image_evidence_derivative_var.set(bool(settings.get("image_evidence_derivative", DEFAULTS["image_evidence_derivative"])))
     image_evidence_match_source_format_var.set(bool(settings.get("image_evidence_match_source_format", DEFAULTS["image_evidence_match_source_format"])))
     set_image_evidence_stamp_template_value(str(settings.get("image_evidence_stamp_template", DEFAULTS["image_evidence_stamp_template"]) or DEFAULTS["image_evidence_stamp_template"]))
+    image_evidence_footer_percent_var.set(str(settings.get("image_evidence_footer_percent", DEFAULTS["image_evidence_footer_percent"])))
+    image_evidence_readability_var.set(bool(settings.get("image_evidence_readability", DEFAULTS["image_evidence_readability"])))
+    image_evidence_min_font_var.set(str(settings.get("image_evidence_min_font", DEFAULTS["image_evidence_min_font"])))
+    image_evidence_left_percent_var.set(str(settings.get("image_evidence_left_percent", DEFAULTS["image_evidence_left_percent"])))
     image_rate_limit_var.set(settings.get("image_rate_limit", DEFAULTS["image_rate_limit"]))
     image_max_items_enabled_var.set(bool(settings.get("image_max_items_enabled", DEFAULTS["image_max_items_enabled"])))
     image_max_items_var.set(normalize_optional_positive_int_string(settings.get("image_max_items", DEFAULTS["image_max_items"])))
@@ -9163,6 +9386,7 @@ def get_app_settings_dict():
         "window_state": get_current_window_state(),
         "output_log_selected_engine": normalize_output_log_view(output_log_selected_engine),
         "output_log_follow_output": bool(output_log_follow_output),
+        "output_log_highlight_alerts": bool(output_log_highlight_alerts),
         "browser_intake_token": get_browser_intake_token(),
         "browser_intake_enabled": bool(browser_intake_enabled),
         "browser_intake_port": get_browser_intake_port(),
@@ -9245,12 +9469,15 @@ def apply_app_settings_dict(settings):
     except Exception:
         pass
 
-    global output_log_selected_engine, output_log_follow_output
+    global output_log_selected_engine, output_log_follow_output, output_log_highlight_alerts
     output_log_selected_engine = normalize_output_log_view(
         settings.get("output_log_selected_engine", APP_SETTINGS_DEFAULTS["output_log_selected_engine"])
     )
     output_log_follow_output = bool(
         settings.get("output_log_follow_output", APP_SETTINGS_DEFAULTS["output_log_follow_output"])
+    )
+    output_log_highlight_alerts = bool(
+        settings.get("output_log_highlight_alerts", APP_SETTINGS_DEFAULTS["output_log_highlight_alerts"])
     )
     try:
         apply_output_log_settings_to_tab()
@@ -13941,16 +14168,60 @@ def add_current_job_to_queue_and_start():
         start_job_queue()
 
 
-def add_jobs_to_queue_by_domain():
-    try:
-        validate_inputs()
-        urls = get_current_url_lines_for_queue()
-        if not urls:
-            raise ValueError(describe_current_url_source_problem("adding jobs by domain"))
+def get_queue_action_context(engine="yt-dlp"):
+    """Route shared queue actions through each capture tab's existing helpers."""
+    if engine == "gallery-dl":
+        return {
+            "urls": get_image_url_list,
+            "settings": get_image_settings_dict,
+            "case_key": "image_case_name",
+            "case_name": get_resolved_image_case_name,
+            "validate": validate_image_inputs,
+            "add": add_image_urls_to_queue_as_job,
+            "log": image_append_log,
+            "failed": get_image_failed_url_records,
+            "all_urls": lambda: list(image_url_all_view_cache) if image_url_view_mode != "all" and image_url_all_view_cache else get_image_url_list(),
+        }
+    if engine == "web-capture":
+        return {
+            "urls": get_web_url_list,
+            "settings": get_web_settings_dict,
+            "case_key": "web_case_name",
+            "case_name": get_resolved_web_case_name,
+            "validate": lambda: validate_web_settings_and_urls(
+                get_web_settings_dict(), get_web_url_list(), get_resolved_web_case_name()
+            ),
+            "add": add_web_urls_to_queue_as_job,
+            "log": web_append_log,
+            "failed": get_web_failed_url_records,
+            "all_urls": lambda: list(web_url_all_view_cache) if web_url_view_mode != "all" and web_url_all_view_cache else get_web_url_list(),
+        }
+    if engine != "yt-dlp":
+        raise ValueError(f"Unsupported queue capture engine: {engine}")
+    return {
+        "urls": get_current_url_lines_for_queue,
+        "settings": get_settings_dict,
+        "case_key": "case_name",
+        "case_name": get_resolved_case_name,
+        "validate": validate_inputs,
+        "add": add_urls_to_queue_as_job,
+        "log": append_log,
+        "failed": get_failed_url_records,
+        "all_urls": lambda: get_current_url_list_for_tools(use_all_cache=True),
+    }
 
-        settings = get_settings_dict()
-        base_case_name = get_resolved_case_name(now=datetime.now())
-        template_has_dynamic_domain_tags = any(tag in settings.get("case_name", "") for tag in ("%domains%", "%presets%"))
+
+def add_jobs_to_queue_by_domain(engine="yt-dlp"):
+    try:
+        context = get_queue_action_context(engine)
+        context["validate"]()
+        urls = context["urls"]()
+        if not urls:
+            raise ValueError("No URLs are available in this capture tab to group by domain.")
+
+        settings = context["settings"]()
+        base_case_name = context["case_name"](now=datetime.now())
+        template_has_dynamic_domain_tags = any(tag in settings.get(context["case_key"], "") for tag in ("%domains%", "%presets%"))
         groups = {}
         order = []
 
@@ -13968,15 +14239,15 @@ def add_jobs_to_queue_by_domain():
         for domain in sorted(order):
             domain_suffix = safe_case_name(domain)
             resolved_name = None if template_has_dynamic_domain_tags else safe_case_name(f"{base_case_name}-{domain_suffix}")
-            if add_urls_to_queue_as_job(
+            if context["add"](
                 groups[domain],
                 resolved_case_name=resolved_name,
                 settings=settings,
-                case_template=settings.get("case_name", ""),
+                case_template=settings.get(context["case_key"], ""),
             ):
                 added_count += 1
 
-        append_log(f"\nAdded {added_count} domain-grouped job(s) to the queue.\n")
+        context["log"](f"\nAdded {added_count} domain-grouped job(s) to the queue.\n")
     except Exception as e:
         messagebox.showerror("Add jobs by domain failed", str(e))
 
@@ -14236,12 +14507,13 @@ def show_split_queue_dialog(url_count):
     return result["mode"], result["value"]
 
 
-def split_and_add_to_queue():
+def split_and_add_to_queue(engine="yt-dlp"):
     try:
-        validate_inputs()
-        urls = get_current_url_lines_for_queue()
+        context = get_queue_action_context(engine)
+        context["validate"]()
+        urls = context["urls"]()
         if not urls:
-            raise ValueError(describe_current_url_source_problem("splitting and adding jobs to the queue"))
+            raise ValueError("No URLs are available in this capture tab to split into queue jobs.")
 
         mode, value = show_split_queue_dialog(len(urls))
 
@@ -14259,9 +14531,9 @@ def split_and_add_to_queue():
             messagebox.showinfo("No groups created", "No URL groups were created.")
             return False
 
-        settings = get_settings_dict()
+        settings = context["settings"]()
         base_time = datetime.now()
-        base_case_name = get_resolved_case_name(now=base_time)
+        base_case_name = context["case_name"](now=base_time)
 
         if not job_queue_window_is_open():
             open_job_queue()
@@ -14271,15 +14543,15 @@ def split_and_add_to_queue():
         for index, group_urls in enumerate(groups, start=1):
             resolved_name = safe_case_name(f"{base_case_name}-part{index:02d}")
 
-            if add_urls_to_queue_as_job(
+            if context["add"](
                 group_urls,
                 resolved_case_name=resolved_name,
                 settings=settings,
-                case_template=settings.get("case_name", ""),
+                case_template=settings.get(context["case_key"], ""),
             ):
                 added_count += 1
 
-        append_log(
+        context["log"](
             f"\nSplit {len(urls)} URL(s) into {added_count} queue job(s) using {split_label}.\n"
         )
 
@@ -14289,29 +14561,15 @@ def split_and_add_to_queue():
         return False
 
 
-def get_failed_urls_for_current_context():
-    base_urls = get_current_url_list_for_tools(use_all_cache=True)
-    base_set = {normalize_url_for_compare(url) for url in base_urls}
-    failed_records = get_failed_url_records()
-
-    failed_urls = []
-    seen = set()
-
-    for record in failed_records:
-        normalized = record.get("normalized", "")
-        if base_set and normalized not in base_set:
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        failed_urls.append(record["url"])
-
-    return failed_urls
+def get_failed_urls_for_current_context(engine="yt-dlp"):
+    context = get_queue_action_context(engine)
+    return filter_history_urls_for_base(context["all_urls"](), context["failed"]())
 
 
-def add_failed_to_queue():
+def add_failed_to_queue(engine="yt-dlp"):
     try:
-        failed_urls = get_failed_urls_for_current_context()
+        context = get_queue_action_context(engine)
+        failed_urls = get_failed_urls_for_current_context(engine)
         if not failed_urls:
             messagebox.showinfo("No failed URLs", "No failed URLs were found for the current Output Root/current URL set.")
             return False
@@ -14319,7 +14577,7 @@ def add_failed_to_queue():
         if not job_queue_window_is_open():
             open_job_queue()
 
-        return add_urls_to_queue_as_job(failed_urls)
+        return context["add"](failed_urls)
     except Exception as e:
         messagebox.showerror("Add failed URLs failed", str(e))
         return False
@@ -18274,10 +18532,12 @@ def collapse_capture_tab_options(tab_label, save=False):
         IMAGE_CAPTURE_TAB_LABEL: (
             "hide_image_capture_options_panel",
             "hide_image_advanced_options_panel",
+            "hide_image_stamping_options_panel",
         ),
         LEGACY_IMAGE_CAPTURE_TAB_LABEL: (
             "hide_image_capture_options_panel",
             "hide_image_advanced_options_panel",
+            "hide_image_stamping_options_panel",
         ),
         "Webpage Capture": (
             "hide_web_capture_options_panel",
@@ -22440,6 +22700,46 @@ def get_streams_by_type(info, stream_type):
     return [stream for stream in streams if stream.get("codec_type") == stream_type]
 
 
+def get_case_browser_relative_folder(file_path, root_path):
+    """Display the containing folder without repeating the file name."""
+    folder = os.path.dirname(file_path)
+    try:
+        relative_folder = os.path.relpath(folder, root_path)
+    except (ValueError, OSError):
+        relative_folder = folder
+    return "(current folder)" if relative_folder == "." else relative_folder
+
+
+def get_case_browser_duration(info, file_path):
+    """Return a real playback duration; still-image probe timings are not useful."""
+    streams = info.get("streams", []) if isinstance(info, dict) else []
+    if is_browser_image_file(file_path):
+        animated = False
+        if os.path.splitext(file_path)[1].lower() in {".gif", ".webp", ".png", ".avif"}:
+            for stream in streams:
+                try:
+                    if stream.get("codec_type") == "video" and int(stream.get("nb_frames", 0)) > 1:
+                        animated = True
+                        break
+                except (TypeError, ValueError):
+                    pass
+        if not animated:
+            return ""
+    elif not (is_browser_video_file(file_path) or is_browser_audio_file(file_path)):
+        return ""
+
+    candidates = [info.get("format", {}).get("duration")]
+    candidates.extend(stream.get("duration") for stream in streams if stream.get("codec_type") in {"video", "audio"})
+    for value in candidates:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(seconds) and seconds > 0:
+            return "<1 s" if seconds < 1 else format_seconds_for_display(seconds)
+    return ""
+
+
 def get_media_info_summary(info, file_path):
     if not info:
         return {
@@ -22451,7 +22751,7 @@ def get_media_info_summary(info, file_path):
     video_streams = get_streams_by_type(info, "video")
     audio_streams = get_streams_by_type(info, "audio")
 
-    duration = format_seconds_for_display(format_info.get("duration"))
+    duration = get_case_browser_duration(info, file_path)
     size = format_bytes_for_display(format_info.get("size"))
     bitrate = format_bitrate_for_display(format_info.get("bit_rate"))
 
@@ -22517,7 +22817,7 @@ def get_media_info_summary(info, file_path):
                 pass
 
         tooltip_lines.append("")
-        tooltip_lines.append("Video:")
+        tooltip_lines.append("Image:" if is_browser_image_file(file_path) else "Video:")
         if width and height:
             tooltip_lines.append(f"  Resolution: {width}x{height}")
         if codec:
@@ -22547,13 +22847,9 @@ def get_media_info_summary(info, file_path):
         if sample_rate:
             tooltip_lines.append(f"  Sample rate: {sample_rate} Hz")
 
-    try:
-        rel_path = os.path.relpath(file_path, output_root_var.get().strip())
-    except Exception:
-        rel_path = file_path
-
+    relative_folder = get_case_browser_relative_folder(file_path, output_root_var.get().strip())
     tooltip_lines.append("")
-    tooltip_lines.append(f"Path: {rel_path}")
+    tooltip_lines.append(f"Relative Folder: {relative_folder}")
 
     return {
         "card": " | ".join(card_lines),
@@ -22861,7 +23157,7 @@ class LazyTreeviewThumbnailPreview:
                 if APP_CLOSING or not self._context_is_active() or request_id != self.request_id or path != self.current_path:
                     return
 
-                if is_browser_video_file(path) or is_browser_audio_file(path):
+                if is_browser_media_file(path):
                     try:
                         media_info = load_or_generate_media_info_with_exe(path, ffprobe_exe)
                     except Exception as e:
@@ -22913,7 +23209,7 @@ class LazyTreeviewThumbnailPreview:
         except Exception:
             pass
 
-        if is_browser_video_file(path) or is_browser_audio_file(path):
+        if is_browser_media_file(path):
             try:
                 summary = get_media_info_summary(media_info, path)
                 tooltip = summary.get("tooltip") or ""
@@ -22922,13 +23218,9 @@ class LazyTreeviewThumbnailPreview:
             except Exception as e:
                 log_debug_exception("Compact preview media summary failed", e)
 
-        try:
-            rel_path = os.path.relpath(path, output_root_var.get().strip())
-            if rel_path and rel_path != path:
-                if "Path:" not in "\n".join(detail_lines):
-                    detail_lines.extend(["", f"Path: {rel_path}"])
-        except Exception:
-            pass
+        relative_folder = get_case_browser_relative_folder(path, output_root_var.get().strip())
+        if not any(line.startswith("Relative Folder:") for line in detail_lines):
+            detail_lines.extend(["", f"Relative Folder: {relative_folder}"])
 
         if error_text:
             detail_lines.append(f"Preview error: {error_text}")
@@ -23966,18 +24258,18 @@ def open_case_browser(select_tab=True, silent=False):
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
 
-        columns = ("type", "size", "modified", "relative_path")
+        columns = ("type", "size", "modified", "relative_folder")
         file_tree = ttk.Treeview(list_frame, columns=columns, show="tree headings", selectmode="extended")
         file_tree.heading("#0", text="Name")
         file_tree.heading("type", text="Type")
         file_tree.heading("size", text="Size")
         file_tree.heading("modified", text="Modified")
-        file_tree.heading("relative_path", text="Relative Path")
+        file_tree.heading("relative_folder", text="Relative Folder")
         file_tree.column("#0", width=260, minwidth=160, stretch=True)
         file_tree.column("type", width=90, minwidth=70, anchor="w", stretch=False)
         file_tree.column("size", width=90, minwidth=70, anchor="e", stretch=False)
         file_tree.column("modified", width=140, minwidth=110, anchor="w", stretch=False)
-        file_tree.column("relative_path", width=420, minwidth=180, anchor="w", stretch=True)
+        file_tree.column("relative_folder", width=420, minwidth=180, anchor="w", stretch=True)
         file_tree.grid(row=0, column=0, sticky="nsew")
 
         ybar = ttk.Scrollbar(list_frame, orient="vertical", command=file_tree.yview)
@@ -24008,10 +24300,7 @@ def open_case_browser(select_tab=True, silent=False):
             end_index = min(len(files), start_index + batch_size)
             for index in range(start_index, end_index):
                 path = files[index]
-                try:
-                    rel_path = os.path.relpath(path, folder_path)
-                except Exception:
-                    rel_path = path
+                relative_folder = get_case_browser_relative_folder(path, folder_path)
                 item_id = file_tree.insert(
                     "",
                     "end",
@@ -24020,7 +24309,7 @@ def open_case_browser(select_tab=True, silent=False):
                         get_case_browser_file_type_label(path),
                         get_case_browser_file_size(path),
                         get_case_browser_modified_time(path),
-                        rel_path,
+                        relative_folder,
                     ),
                 )
                 compact_path_map[item_id] = path
@@ -24265,14 +24554,11 @@ def open_case_browser(select_tab=True, silent=False):
                 info_label.grid(row=2, column=0, sticky="ew")
                 rel_row = 3
 
-            try:
-                rel_path = os.path.relpath(path, folder_path)
-            except Exception:
-                rel_path = path
+            relative_folder = get_case_browser_relative_folder(path, folder_path)
 
             type_label = ttk.Label(
                 card,
-                text=wrap_case_browser_card_text(rel_path, label_chars),
+                text=wrap_case_browser_card_text(relative_folder, label_chars),
                 wraplength=wrap,
                 justify="center",
                 anchor="center",
@@ -27313,7 +27599,7 @@ def run_web_preflight_check():
     return True
 
 
-def add_web_urls_to_queue_as_job(urls=None):
+def add_web_urls_to_queue_as_job(urls=None, resolved_case_name=None, settings=None, case_template=None):
     try:
         urls = urls if urls is not None else get_web_url_list()
         clean_urls = []
@@ -27330,20 +27616,23 @@ def add_web_urls_to_queue_as_job(urls=None):
         if not clean_urls:
             raise ValueError("No valid HTTP/HTTPS Webpage Capture URLs are available to add to the queue.")
 
-        settings = get_web_settings_dict()
+        settings = settings.copy() if isinstance(settings, dict) else get_web_settings_dict()
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
-        case_template = settings.get("web_case_name", "")
-        resolved_case_name = resolve_windows_case_name(
-            render_case_name_template(
-                case_template,
-                now=datetime.now(),
-                domains=domains,
-                presets=[],
-                playlist="",
-                engine="web-capture",
-            ),
-            label="Webpage Capture Case Name",
-        )
+        case_template = case_template if case_template is not None else settings.get("web_case_name", "")
+        if resolved_case_name:
+            resolved_case_name = validate_windows_resolved_case_name(resolved_case_name, label="Queue Job Case Name")
+        else:
+            resolved_case_name = resolve_windows_case_name(
+                render_case_name_template(
+                    case_template,
+                    now=datetime.now(),
+                    domains=domains,
+                    presets=[],
+                    playlist="",
+                    engine="web-capture",
+                ),
+                label="Webpage Capture Case Name",
+            )
         normalized_output_root = normalize_and_validate_output_root(
             settings.get("web_output_root", settings.get("output_root", "")),
             label="Webpage Capture",
@@ -27978,6 +28267,10 @@ image_write_tags_var = tk.BooleanVar(value=DEFAULTS["image_write_tags"])
 image_evidence_derivative_var = tk.BooleanVar(value=DEFAULTS["image_evidence_derivative"])
 image_evidence_match_source_format_var = tk.BooleanVar(value=DEFAULTS["image_evidence_match_source_format"])
 image_evidence_stamp_template_var = tk.StringVar(value=DEFAULTS["image_evidence_stamp_template"])
+image_evidence_footer_percent_var = tk.StringVar(value=DEFAULTS["image_evidence_footer_percent"])
+image_evidence_readability_var = tk.BooleanVar(value=DEFAULTS["image_evidence_readability"])
+image_evidence_min_font_var = tk.StringVar(value=DEFAULTS["image_evidence_min_font"])
+image_evidence_left_percent_var = tk.StringVar(value=DEFAULTS["image_evidence_left_percent"])
 image_rate_limit_var = tk.StringVar(value=DEFAULTS["image_rate_limit"])
 image_max_items_enabled_var = tk.BooleanVar(value=DEFAULTS["image_max_items_enabled"])
 image_max_items_var = tk.StringVar(value=DEFAULTS["image_max_items"])
@@ -28193,6 +28486,10 @@ for option_var in [
     image_evidence_derivative_var,
     image_evidence_match_source_format_var,
     image_evidence_stamp_template_var,
+    image_evidence_footer_percent_var,
+    image_evidence_readability_var,
+    image_evidence_min_font_var,
+    image_evidence_left_percent_var,
     image_rate_limit_var,
     image_max_items_enabled_var,
     image_max_items_var,
@@ -28259,7 +28556,14 @@ ttk.Checkbutton(
     variable=output_log_follow_var,
     command=on_output_log_follow_changed,
 ).grid(row=0, column=2, sticky="e", padx=(12, 8))
-ttk.Button(output_log_toolbar, text="Clear Display", command=clear_output_log_display).grid(row=0, column=3, sticky="e")
+output_log_highlight_var = tk.BooleanVar(value=bool(output_log_highlight_alerts))
+ttk.Checkbutton(
+    output_log_toolbar,
+    text="Highlight warnings/errors",
+    variable=output_log_highlight_var,
+    command=on_output_log_highlight_changed,
+).grid(row=0, column=3, sticky="e", padx=(0, 8))
+ttk.Button(output_log_toolbar, text="Clear Display", command=clear_output_log_display).grid(row=0, column=4, sticky="e")
 
 output_log_text = scrolledtext.ScrolledText(output_log_tab, wrap="word", state="disabled")
 output_log_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 6))
@@ -28268,6 +28572,7 @@ output_log_actions = ttk.Frame(output_log_tab, padding=(10, 0, 10, 10))
 output_log_actions.grid(row=2, column=0, sticky="ew")
 ttk.Button(output_log_actions, text="Copy Visible", command=copy_visible_output_log).pack(side="left")
 ttk.Button(output_log_actions, text="Save Visible...", command=save_visible_output_log).pack(side="left", padx=(6, 0))
+ttk.Button(output_log_actions, text="Save Redacted...", command=lambda: save_visible_output_log(redacted=True)).pack(side="left", padx=(6, 0))
 ttk.Label(
     output_log_actions,
     text="Clear Display affects only the in-memory viewer; case log files are not deleted.",
@@ -29525,6 +29830,10 @@ def get_image_settings_dict():
         "image_evidence_derivative": bool(image_evidence_derivative_var.get()),
         "image_evidence_match_source_format": bool(image_evidence_match_source_format_var.get()),
         "image_evidence_stamp_template": get_image_evidence_stamp_template_value(),
+        "image_evidence_footer_percent": image_evidence_footer_percent_var.get().strip(),
+        "image_evidence_readability": image_evidence_readability_var.get(),
+        "image_evidence_min_font": image_evidence_min_font_var.get().strip(),
+        "image_evidence_left_percent": image_evidence_left_percent_var.get().strip(),
         "ffmpeg_folder": ffmpeg_folder_var.get().strip(),
         "image_rate_limit": image_rate_limit_var.get(),
         "image_max_items_enabled": bool(image_max_items_enabled_var.get()),
@@ -29574,6 +29883,9 @@ def validate_image_inputs(urls_override=None):
     validate_gallery_filename_template(image_filename_template_var.get())
     if image_evidence_derivative_var.get() and image_capture_mode_var.get() != "metadata_only":
         validate_image_evidence_stamp_template(get_image_evidence_stamp_template_value())
+        validate_image_evidence_footer_percent(image_evidence_footer_percent_var.get())
+        validate_image_evidence_min_font(image_evidence_min_font_var.get())
+        validate_image_evidence_left_percent(image_evidence_left_percent_var.get())
         ffmpeg_exe = resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
         ffprobe_exe = resolve_ffmpeg_executable_for_gui("ffprobe.exe")
         if not os.path.isfile(ffmpeg_exe) or not os.path.isfile(ffprobe_exe):
@@ -29609,6 +29921,9 @@ def validate_gallery_queue_job_inputs(job):
     capture_mode = str(settings.get("image_capture_mode", DEFAULTS["image_capture_mode"]) or DEFAULTS["image_capture_mode"]).lower()
     if bool(settings.get("image_evidence_derivative", DEFAULTS["image_evidence_derivative"])) and capture_mode != "metadata_only":
         validate_image_evidence_stamp_template(str(settings.get("image_evidence_stamp_template", DEFAULTS["image_evidence_stamp_template"]) or DEFAULTS["image_evidence_stamp_template"]))
+        validate_image_evidence_footer_percent(settings.get("image_evidence_footer_percent", DEFAULTS["image_evidence_footer_percent"]))
+        validate_image_evidence_min_font(settings.get("image_evidence_min_font", DEFAULTS["image_evidence_min_font"]))
+        validate_image_evidence_left_percent(settings.get("image_evidence_left_percent", DEFAULTS["image_evidence_left_percent"]))
         ffmpeg_folder = str(settings.get("ffmpeg_folder", ffmpeg_folder_var.get()) or "").strip()
         ffmpeg_path = os.path.join(ffmpeg_folder, "ffmpeg.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffmpeg.exe")
         ffprobe_path = os.path.join(ffmpeg_folder, "ffprobe.exe") if ffmpeg_folder else resolve_ffmpeg_executable_for_gui("ffprobe.exe")
@@ -29660,6 +29975,10 @@ def build_gallery_powershell_command_for_job(job):
             "-FFmpegFolder", str(settings.get("ffmpeg_folder", ffmpeg_folder_var.get()) or "").strip(),
             "-WaviVersion", APP_VERSION,
             "-EvidenceStampTemplateBase64", stamp_template_b64,
+            "-EvidenceFooterPercent", validate_image_evidence_footer_percent(settings.get("image_evidence_footer_percent", DEFAULTS["image_evidence_footer_percent"])),
+            "-EvidenceReadability", "1" if bool(settings.get("image_evidence_readability", DEFAULTS["image_evidence_readability"])) else "0",
+            "-EvidenceMinFont", validate_image_evidence_min_font(settings.get("image_evidence_min_font", DEFAULTS["image_evidence_min_font"])),
+            "-EvidenceLeftPercent", validate_image_evidence_left_percent(settings.get("image_evidence_left_percent", DEFAULTS["image_evidence_left_percent"])),
         ]
         if bool(settings.get("image_evidence_match_source_format", DEFAULTS["image_evidence_match_source_format"])):
             cmd += ["-MatchEvidenceSourceFormat"]
@@ -29819,7 +30138,7 @@ def run_image_preflight_check():
 
     image_preflight_done_var.set(passed is True)
 
-def add_image_urls_to_queue_as_job(urls=None):
+def add_image_urls_to_queue_as_job(urls=None, resolved_case_name=None, settings=None, case_template=None):
     try:
         validate_image_inputs(urls_override=urls if urls is not None else None)
         clean_urls = []
@@ -29835,7 +30154,7 @@ def add_image_urls_to_queue_as_job(urls=None):
             clean_urls.append(cleaned)
         if not clean_urls:
             raise ValueError(describe_image_url_source_problem("adding the current Gallery/Profile Capture to the queue"))
-        settings = get_image_settings_dict()
+        settings = settings.copy() if isinstance(settings, dict) else get_image_settings_dict()
         settings, applied_presets = apply_checked_domain_presets_to_settings(settings, clean_urls)
         normalized_output_root = normalize_and_validate_output_root(
             settings.get("image_output_root", settings.get("output_root", "")),
@@ -29850,18 +30169,21 @@ def add_image_urls_to_queue_as_job(urls=None):
         )
         domains = sorted({domain for domain in (get_url_domain_key(url) for url in clean_urls) if domain})
         now = datetime.now()
-        case_template = settings["image_case_name"]
-        resolved_case_name = resolve_windows_case_name(
-            render_case_name_template(
-                case_template,
-                now=now,
-                domains=domains,
-                presets=applied_presets,
-                playlist="",
-                engine="gallery-dl",
-            ),
-            label="Gallery/Profile Capture Case Name",
-        )
+        case_template = case_template if case_template is not None else settings.get("image_case_name", "")
+        if resolved_case_name:
+            resolved_case_name = validate_windows_resolved_case_name(resolved_case_name, label="Queue Job Case Name")
+        else:
+            resolved_case_name = resolve_windows_case_name(
+                render_case_name_template(
+                    case_template,
+                    now=now,
+                    domains=domains,
+                    presets=applied_presets,
+                    playlist="",
+                    engine="gallery-dl",
+                ),
+                label="Gallery/Profile Capture Case Name",
+            )
         job = {
             "job_id": make_job_id(),
             "engine": "gallery-dl",
@@ -30204,9 +30526,9 @@ def update_image_options_state(*_args):
 def get_image_pacing_label(value=None):
     value = (value or image_rate_limit_var.get() or "normal").lower()
     labels = {
-        "fast": "Fast - no added delay",
-        "normal": "Normal - sleep 1.0-3.0 sec; request 0.5-1.5 sec; 429 sleep 60 sec",
-        "cautious": "Cautious - sleep 3.0-8.0 sec; request 1.0-3.0 sec; 429 sleep 120 sec",
+        "fast": "Fast - no added pacing; 429 sleep 60 sec",
+        "normal": "Normal - sleep 10.0-20.0 sec; request 5.0-10.0 sec; 429 sleep 120 sec",
+        "cautious": "Cautious - sleep 25.0-45.0 sec; request 15.0-30.0 sec; 429 sleep 300 sec",
     }
     return labels.get(value, labels["normal"])
 
@@ -30214,9 +30536,9 @@ def get_image_pacing_label(value=None):
 def get_image_pacing_summary(value=None):
     value = (value or image_rate_limit_var.get() or "normal").lower()
     labels = {
-        "fast": "Fast - no added delay",
-        "normal": "Normal - sleep 1.0-3.0s; request 0.5-1.5s; 429 60s",
-        "cautious": "Cautious - sleep 3.0-8.0s; request 1.0-3.0s; 429 120s",
+        "fast": "Fast - no added pacing; 429 sleep 60 sec",
+        "normal": "Normal - sleep 10.0-20.0s; request 5.0-10.0s; 429 120s",
+        "cautious": "Cautious - sleep 25.0-45.0s; request 15.0-30.0s; 429 300s",
     }
     return labels.get(value, labels["normal"])
 
@@ -30277,8 +30599,6 @@ def hide_image_capture_options_panel(save=False):
 
 
 def hide_image_advanced_options_panel(save=False):
-    if save:
-        sync_image_evidence_stamp_template_from_widget(schedule_autosave=False)
     remove_grid_managed_widget(image_advanced_options_panel)
 
     try:
@@ -30291,12 +30611,43 @@ def hide_image_advanced_options_panel(save=False):
         schedule_settings_autosave()
 
 
+def hide_image_stamping_options_panel(save=False):
+    if save:
+        sync_image_evidence_stamp_template_from_widget(schedule_autosave=False)
+    remove_grid_managed_widget(image_stamping_options_panel)
+    image_stamping_options_button.config(text="Stamping Options ▾")
+    if save:
+        update_image_options_summary()
+        schedule_settings_autosave()
+
+
+def toggle_image_stamping_options_panel():
+    if image_stamping_options_panel.winfo_ismapped():
+        hide_image_stamping_options_panel(save=True)
+        return
+    hide_image_capture_options_panel(save=True)
+    hide_image_advanced_options_panel(save=True)
+    update_image_options_summary()
+    image_stamping_options_panel.grid(
+        row=8, column=0, columnspan=4, rowspan=8,
+        sticky="nsew", padx=0, pady=(8, 0),
+    )
+    image_stamping_options_panel.tkraise()
+    image_stamping_options_button.config(text="Stamping Options ▴")
+    refresh_scrollable_options_panel(image_stamping_options_panel)
+
+
+def close_image_stamping_options_panel():
+    hide_image_stamping_options_panel(save=True)
+
+
 def toggle_image_capture_options_panel():
     if image_capture_options_panel.winfo_ismapped():
         hide_image_capture_options_panel(save=True)
         return
 
     hide_image_advanced_options_panel(save=True)
+    hide_image_stamping_options_panel(save=True)
     update_image_options_summary()
     image_capture_options_panel.grid(
         row=8,
@@ -30322,6 +30673,7 @@ def toggle_image_advanced_options_panel():
         return
 
     hide_image_capture_options_panel(save=True)
+    hide_image_stamping_options_panel(save=True)
     update_image_options_summary()
     image_advanced_options_panel.grid(
         row=8,
@@ -30350,6 +30702,10 @@ for image_option_var in [
     image_evidence_derivative_var,
     image_evidence_match_source_format_var,
     image_evidence_stamp_template_var,
+    image_evidence_footer_percent_var,
+    image_evidence_readability_var,
+    image_evidence_min_font_var,
+    image_evidence_left_percent_var,
     image_rate_limit_var,
     image_max_items_enabled_var,
     image_max_items_var,
@@ -30467,14 +30823,16 @@ def build_image_capture_tab():
 
     options = ttk.Frame(image_capture_tab)
     options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(4, 3))
-    options.columnconfigure(2, weight=1)
-    global image_capture_options_button, image_advanced_options_button, image_options_summary_label
+    options.columnconfigure(3, weight=1)
+    global image_stamping_options_button, image_capture_options_button, image_advanced_options_button, image_options_summary_label
     image_capture_options_button = ttk.Button(options, text="Capture Options ▾", command=toggle_image_capture_options_panel)
     image_capture_options_button.grid(row=0, column=0, sticky="w", padx=(0, 8))
+    image_stamping_options_button = ttk.Button(options, text="Stamping Options ▾", command=toggle_image_stamping_options_panel)
+    image_stamping_options_button.grid(row=0, column=1, sticky="w", padx=(0, 8))
     image_advanced_options_button = ttk.Button(options, text="Advanced Options ▾", command=toggle_image_advanced_options_panel)
-    image_advanced_options_button.grid(row=0, column=1, sticky="w", padx=(0, 10))
+    image_advanced_options_button.grid(row=0, column=2, sticky="w", padx=(0, 10))
     image_options_summary_label = ttk.Label(options, textvariable=image_options_summary_var, wraplength=760, justify="left")
-    image_options_summary_label.grid(row=0, column=2, sticky="ew")
+    image_options_summary_label.grid(row=0, column=3, sticky="ew")
 
     def update_image_options_summary_wrap(_event=None):
         try:
@@ -30483,6 +30841,7 @@ def build_image_capture_tab():
                 options.winfo_width()
                 - image_capture_options_button.winfo_width()
                 - image_advanced_options_button.winfo_width()
+                - image_stamping_options_button.winfo_width()
                 - 54,
             )
             image_options_summary_label.configure(wraplength=width)
@@ -30581,6 +30940,9 @@ def build_image_capture_tab():
     image_start_capture_menu = tk.Menu(root, tearoff=0)
     image_start_capture_menu.add_command(label="Add Job to Queue", command=add_image_job_and_open_queue)
     image_start_capture_menu.add_command(label="Add Job to Queue and Start", command=add_image_job_to_queue_and_start)
+    image_start_capture_menu.add_command(label="Split and Add to Queue", command=lambda: split_and_add_to_queue("gallery-dl"))
+    image_start_capture_menu.add_command(label="Add Jobs to Queue by Domain", command=lambda: add_jobs_to_queue_by_domain("gallery-dl"))
+    image_start_capture_menu.add_command(label="Add Failed to Queue", command=lambda: add_failed_to_queue("gallery-dl"))
     image_stop_button = tk.Button(workflow, text="■ Stop", command=stop_image_capture, fg="red", state="disabled", **main_action_button_style)
     image_stop_button.grid(row=0, column=3, sticky="ew", padx=(0, 8))
     global image_copy_summary_button, image_copy_summary_menu_button, image_copy_summary_menu
@@ -30862,6 +31224,9 @@ def build_web_capture_tab():
     web_start_capture_menu = tk.Menu(root, tearoff=0)
     web_start_capture_menu.add_command(label="Add Job to Queue", command=add_web_job_and_open_queue)
     web_start_capture_menu.add_command(label="Add Job to Queue and Start", command=add_web_job_to_queue_and_start)
+    web_start_capture_menu.add_command(label="Split and Add to Queue", command=lambda: split_and_add_to_queue("web-capture"))
+    web_start_capture_menu.add_command(label="Add Jobs to Queue by Domain", command=lambda: add_jobs_to_queue_by_domain("web-capture"))
+    web_start_capture_menu.add_command(label="Add Failed to Queue", command=lambda: add_failed_to_queue("web-capture"))
     web_stop_button = tk.Button(
         workflow,
         text="■ Stop",
@@ -32246,7 +32611,7 @@ image_advanced_options_content.columnconfigure(1, weight=1, uniform="image_advan
 
 ttk.Label(
     image_advanced_options_content,
-    text="These settings control gallery-dl pacing, retries, timeout behavior, and optional evidence stamping.",
+    text="These settings control gallery-dl pacing, retries, timeout behaviour, and concurrent captures.",
     wraplength=980,
     justify="left",
 ).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
@@ -32283,8 +32648,15 @@ image_concurrent_captures_menu = ttk.Combobox(
 image_concurrent_captures_menu.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
 image_retry_frame.columnconfigure(1, weight=1)
 
-image_evidence_frame = ttk.LabelFrame(image_advanced_options_content, text="Evidence Stamping", padding=8)
-image_evidence_frame.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+add_options_panel_close_button(
+    image_advanced_options_content, "Close Advanced Options", close_image_advanced_options_panel,
+)
+image_advanced_options_panel.grid_remove()
+
+image_stamping_options_panel, image_stamping_options_content = create_scrollable_options_panel(image_capture_tab, 'Stamping Options', padding=12)
+image_stamping_options_content.columnconfigure(0, weight=1)
+image_evidence_frame = ttk.LabelFrame(image_stamping_options_content, text="Evidence Stamping", padding=8)
+image_evidence_frame.grid(row=0, column=0, columnspan=1, sticky="nsew", pady=(0, 8))
 image_evidence_frame.columnconfigure(0, weight=1)
 
 image_evidence_derivative_check = ttk.Checkbutton(
@@ -32303,8 +32675,47 @@ image_evidence_match_source_format_check = ttk.Checkbutton(
 )
 image_evidence_match_source_format_check.grid(row=1, column=0, sticky="w", pady=(2, 2))
 
+image_evidence_scale_frame = ttk.Frame(image_evidence_frame)
+image_evidence_scale_frame.grid(row=2, column=0, sticky="w", pady=(3, 6))
+ttk.Label(image_evidence_scale_frame, text="Preferred footer height (% of source image height)").pack(side="left")
+image_evidence_footer_percent_spinbox = ttk.Spinbox(
+    image_evidence_scale_frame, from_=1, to=100, increment=1, width=5,
+    textvariable=image_evidence_footer_percent_var,
+    command=schedule_settings_autosave,
+)
+image_evidence_footer_percent_spinbox.pack(side="left", padx=(8, 0))
+image_evidence_footer_percent_spinbox.bind("<FocusOut>", lambda _event: schedule_settings_autosave())
+image_evidence_footer_percent_spinbox.bind("<Return>", lambda _event: schedule_settings_autosave())
+
+image_evidence_readability_frame = ttk.Frame(image_evidence_frame)
+image_evidence_readability_frame.grid(row=3, column=0, sticky="w", pady=(0, 6))
+image_evidence_readability_check = ttk.Checkbutton(
+    image_evidence_readability_frame, text="Prioritise stamp readability",
+    variable=image_evidence_readability_var, command=schedule_settings_autosave,
+)
+image_evidence_readability_check.pack(side="left")
+ttk.Label(image_evidence_readability_frame, text="Minimum font size (px)").pack(side="left", padx=(12, 0))
+image_evidence_min_font_spinbox = ttk.Spinbox(
+    image_evidence_readability_frame, from_=8, to=72, increment=1, width=5,
+    textvariable=image_evidence_min_font_var, command=schedule_settings_autosave,
+)
+image_evidence_min_font_spinbox.pack(side="left", padx=(8, 0))
+image_evidence_min_font_spinbox.bind("<FocusOut>", lambda _event: schedule_settings_autosave())
+image_evidence_min_font_spinbox.bind("<Return>", lambda _event: schedule_settings_autosave())
+
+image_evidence_bias_frame = ttk.Frame(image_evidence_frame)
+image_evidence_bias_frame.grid(row=4, column=0, sticky="ew", pady=(0, 6))
+ttk.Label(image_evidence_bias_frame, text="Left column width (%)").pack(side="left")
+image_evidence_left_percent_slider = tk.Scale(
+    image_evidence_bias_frame, from_=1, to=99, resolution=1, orient="horizontal",
+    variable=image_evidence_left_percent_var, length=240, showvalue=True,
+    command=lambda _value: schedule_settings_autosave(),
+)
+image_evidence_left_percent_slider.pack(side="left", padx=(8, 8))
+ttk.Label(image_evidence_bias_frame, text="Right uses the remainder; 50 = equal columns").pack(side="left")
+
 image_evidence_stamp_toolbar = ttk.Frame(image_evidence_frame)
-image_evidence_stamp_toolbar.grid(row=2, column=0, sticky="ew")
+image_evidence_stamp_toolbar.grid(row=5, column=0, sticky="ew")
 image_evidence_stamp_toolbar.columnconfigure(0, weight=1)
 ttk.Label(image_evidence_stamp_toolbar, text="Stamped text template").grid(row=0, column=0, sticky="w")
 image_evidence_stamp_tag_button = ttk.Button(
@@ -32315,11 +32726,11 @@ image_evidence_stamp_tag_button = ttk.Button(
 image_evidence_stamp_tag_button.grid(row=0, column=1, sticky="e")
 
 image_evidence_stamp_text = scrolledtext.ScrolledText(image_evidence_frame, height=7, wrap="word")
-image_evidence_stamp_text.grid(row=3, column=0, sticky="nsew", pady=(3, 0))
+image_evidence_stamp_text.grid(row=6, column=0, sticky="nsew", pady=(3, 0))
 image_evidence_stamp_text.insert("1.0", image_evidence_stamp_template_var.get())
 
 image_evidence_stamp_tag_menu = tk.Menu(image_evidence_frame, tearoff=False)
-for image_evidence_tag_item in IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS:
+for image_evidence_tag_item in [*IMAGE_EVIDENCE_STAMP_TAG_MENU_ITEMS, None, "<Left></Left>", "<Right></Right>", "<Left>%url%</Left><Right>%utcdatetime%</Right>"]:
     if image_evidence_tag_item is None:
         image_evidence_stamp_tag_menu.add_separator()
         continue
@@ -32337,17 +32748,24 @@ image_evidence_stamp_text.bind("<FocusOut>", on_image_evidence_stamp_template_ed
 ttk.Label(
     image_evidence_frame,
     text=(
-        "Tags are resolved separately for each stamped artifact. For multi-URL runs, %url% resolves to a "
-        "non-attributing multiple-URL label instead of claiming a specific submitted URL belongs to the item."
+        "Use <Left>text</Left><Right>text</Right> on one line for separate wrapping columns. "
+        "Plain lines use the full width. Readability prioritises the minimum font size, expanding the footer "
+        "and widening narrow canvases when needed; the source image is not resized. Turn it off for a fixed footer ratio. "
+        "%url% uses each captured item\'s page URL when available, otherwise its direct media URL. "
+        "Missing per-item metadata is shown as Item URL unavailable; submitted profile/gallery URLs are not used."
     ),
     wraplength=920,
     justify="left",
-).grid(row=4, column=0, sticky="w", pady=(4, 0))
+).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
 image_evidence_derivative_widgets = [
     image_evidence_derivative_check,
     image_evidence_stamp_text,
     image_evidence_stamp_tag_button,
+    image_evidence_footer_percent_spinbox,
+    image_evidence_readability_check,
+    image_evidence_min_font_spinbox,
+    image_evidence_left_percent_slider,
 ]
 image_evidence_match_source_format_widgets = [
     image_evidence_match_source_format_check,
@@ -32355,11 +32773,11 @@ image_evidence_match_source_format_widgets = [
 
 
 add_options_panel_close_button(
-    image_advanced_options_content,
-    "Close Advanced Options",
-    close_image_advanced_options_panel,
+    image_stamping_options_content,
+    "Close Stamping Options",
+    close_image_stamping_options_panel,
 )
-image_advanced_options_panel.grid_remove()
+image_stamping_options_panel.grid_remove()
 
 update_image_options_summary()
 

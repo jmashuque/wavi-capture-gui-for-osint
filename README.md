@@ -311,7 +311,10 @@ This section is for technical users who are comfortable with capture-tool behavi
 
 ### Output Log
 
-The **Output Log** tab shows live direct and queued capture output. The **Engine** selector provides **Audio/Video**, **Gallery/Profile**, **Webpage**, and **All Engines** views. The combined view merges records in timestamp order.
+**Save Redacted...**, beside **Save Visible...**, exports a filtered copy of the selected output display. It removes known identifying case/user/capture values and common URLs, domains, paths, filenames, addresses, credentials, IDs and absolute timestamps. Commands and sensitive labelled payloads may be removed in full, while useful status and error diagnostics are retained where possible. The visible display and original logs are unchanged. Automatic filtering cannot recognise every sensitive detail in free-form text; review the exported copy before sharing.
+
+
+The **Output Log** tab shows live direct and queued capture output. The **Engine** selector provides **Audio/Video**, **Gallery/Profile**, **Webpage**, and **All Engines** views. The combined view merges records in timestamp order. **Highlight warnings/errors**, beside **Follow output**, is enabled by default and saved between sessions. Toggle it to apply or remove highlighting immediately without moving the current log view. When enabled, warning and error lines with recognised severity markers appear in red in every engine view, including All Engines. Colours adapt to light/dark mode and are restored when switching views. Copied and saved logs remain plain text.
 
 - **Follow output** scrolls to new messages. Disable it while reviewing earlier output.
 - **Copy Visible** uses WAVI's shared clipboard safeguards and refuses oversized content without truncating or replacing the current clipboard.
@@ -325,7 +328,7 @@ Each capture tab uses the same URL-box tools. **Load** replaces the current URL 
 **Advanced ▼** provides operations that are useful when preparing larger URL sets:
 
 - **Strip Parameter-like Tags** removes trailing parameter-like `&name=value` segments. Use it only when those suffixes are known to be unwanted because removing them can change the requested resource.
-- **Group by Domain** reorganizes the current list into domain groups without creating queue jobs. Use **Add Jobs to Queue by Domain** when separate Audio/Video queue jobs are required instead.
+- **Group by Domain** reorganizes the current list into domain groups without creating queue jobs. Use **Add Jobs to Queue by Domain** when separate queue jobs are required instead.
 - **URL Statistics** summarizes the current URL set without changing it.
 - **Normalize URLs** standardizes supported URL text for list handling; review the result when exact submitted syntax matters.
 - **Remove Duplicates** keeps one copy of repeated URLs.
@@ -344,6 +347,18 @@ WAVI uses the same capture-time tags across the capture engines wherever they ap
 - `%engine%` — `audio-video`, `image`, or `webpage`
 
 Filename templates also use `%domain%` for the source domain when WAVI can determine one. `%case%`, `%id%`, `%title%`, and `%ext%` keep the same purpose wherever the engine exposes those values. For Gallery/Profile Capture, gallery-dl keyword names differ substantially between extractors, so WAVI resolves the generic `%id%`, `%title%`, `%author%`, `%username%`, `%user%`, `%filename%`, and `%url%` tags through ordered equivalent-field fallbacks rather than emitting `None` simply because one generic key is absent.
+
+**Source publication datetime tags** are separate from capture timestamps:
+
+| Where | Tag | Meaning |
+|---|---|---|
+| Audio/Video filename | `%upload_datetime%` | Source availability/upload datetime where supplied, otherwise upload date only. |
+| Audio/Video filename | `%release_datetime%` | Source release datetime where supplied, otherwise release date only. |
+| Gallery/Profile filename and evidence stamp | `%item_datetime%` | The source item's date or datetime from `date`, `post_date`, `created` or `created_at`. |
+
+**Datetime may return just a date or both a date and time**, depending on the source metadata. It does not imply that a time or timezone is known. Audio/Video full timestamps use UTC (`YYYY-MM-DD_HHMMSSZ`); date-only values use `YYYY-MM-DD`. Gallery/Profile filename values retain the extractor's formatting and normal filename sanitisation. Evidence stamps preserve available date/time precision and supplied offsets; timestamps without a timezone are not labelled UTC. Numeric Unix timestamps in evidence metadata are represented in UTC. Missing publication metadata never falls back to capture time or filesystem timestamps: filename tags use an unknown placeholder, and stamps show **Item datetime unavailable**.
+
+The old Audio/Video `%upload_date%` and `%release_date%` tags remain accepted but hidden from Insert Tag, preserving their existing date-only output. Gallery/Profile `%item_date%` remains a hidden compatibility name for its existing metadata expression. The earlier `%date_utc%` compatibility tag is unchanged. These additions do not apply to case names or Webpage Capture, and the common capture-time tags retain their current meanings.
 
 For backwards compatibility, `%webpage_domain%` remains a hidden alias for `%domain%` in Audio/Video, Gallery/Profile, and Webpage filename templates. `%extension%` remains a hidden alias for `%ext%` in Audio/Video and Gallery/Profile. Engine-specific metadata tags are documented in their capture sections and are not forced into common meanings when they are not equivalent.
 
@@ -458,7 +473,7 @@ The default Audio/Video filename template is:
 %datetime%_%domain%_%id%_%title%.%ext%
 ```
 
-The default combines the common WAVI capture timestamp/domain tags with yt-dlp content ID, title, and extension values. Source-specific yt-dlp metadata tags such as `%upload_date%`, `%uploader%`, `%extractor%`, and `%playlist_index%` remain available when useful.
+The default combines the common WAVI capture timestamp/domain tags with yt-dlp content ID, title, and extension values. Source-specific yt-dlp metadata tags such as `%upload_datetime%`, `%release_datetime%`, `%uploader%`, `%extractor%`, and `%playlist_index%` remain available when useful.
 
 **Output records**
 
@@ -515,9 +530,11 @@ Gallery/Profile Capture uses `script-gallerydl.ps1` and `gallery-dl.exe`. Its pr
 
 Sidecar availability and contents depend on the site and its gallery-dl extractor. A checked option does not guarantee that every source provides that data.
 
+**HTTP 429 (Too Many Requests):** WAVI explicitly enables gallery-dl HTTP media-download retries. Before a retry, Fast uses a 60-second delay, Normal uses 120 seconds and Cautious uses 300 seconds. The selected retry count limits attempts per request. This is a delay for the affected downloader, not a pause of all WAVI activity: separate concurrent captures can continue, and gallery-dl may move on after retries are exhausted. Site-specific extraction handling may also differ. The capture log records the configured policy.
+
 **Evidence stamping**
 
-Evidence stamping is under **Advanced Options** and is off by default. **Enable evidence stamping for newly captured static images** leaves the downloaded original untouched and creates a separate stamped derivative under `derived\evidence`. Stamped derivatives use **lossless PNG by default**, regardless of the source image format. Enable **Match evidence source format** when the derivative should retain the original image format instead.
+Evidence stamping is under **Stamping Options**, between **Capture Options** and **Advanced Options** and is off by default. **Enable evidence stamping for newly captured static images** leaves the downloaded original untouched and creates a separate stamped derivative under `derived\evidence`. Stamped derivatives use **lossless PNG by default**, regardless of the source image format. Enable **Match evidence source format** when the derivative should retain the original image format instead.
 
 The **Stamped text template** box controls the text rendered in the black footer beneath each supported image. **Insert Tag** adds WAVI placeholders at the cursor. The default template is:
 
@@ -526,14 +543,27 @@ The **Stamped text template** box controls the text rendered in the black footer
 %utcdatetime%
 ```
 
-The stamp tag menu now uses the same normalized naming style as the other WAVI tag menus and shows only the tag names themselves. Available stamp tags are `%url%`, `%domain%`, `%source_count%`, `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%case%`, `%engine%`, `%version%`, `%filename%`, `%ext%`, `%original%`, and `%sha256%`. In a single-URL run, `%url%` resolves to that submitted URL. In a multi-URL run it resolves to a non-attributing multiple-URL label, because WAVI does not claim that a specific submitted URL belongs to a specific downloaded item without per-item attribution. Long substituted values are wrapped in the footer rather than silently truncated.
+To align text on the same row, use:
+
+```text
+<Left>%url%</Left><Right>%utcdatetime%</Right>
+<Left>%filename%</Left><Right>%case%</Right>
+```
+
+Paired sections use independently sized columns separated by a gap. Each side wraps independently and the next row starts below both columns. A line with only one section uses the full width with that alignment; plain-text lines remain left-aligned across the full width. Keep each section's opening and closing tags on the same template line. Do not nest sections, repeat a side on one line, or place other text outside aligned sections. **Insert Tag** includes alignment helpers. The percentage is saved with settings, profiles, domain presets and queued jobs; older settings and jobs use 10%.
+
+The stamp tag menu now uses the same normalized naming style as the other WAVI tag menus and shows only the tag names themselves. Available stamp tags are `%url%`, `%domain%`, `%source_count%`, `%item_datetime%`, `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%case%`, `%engine%`, `%version%`, `%filename%`, `%ext%`, `%original%`, and `%sha256%`. `%url%` resolves separately for each captured file: its item/post page URL where the extractor supplies one, otherwise its direct media URL. `%domain%` follows that resolved URL. Supported metadata fields are `post_url`, `webpage_url`, `permalink`, `canonical_url` and `page_url`; Twitter post and Pixiv artwork links can also be derived from their item IDs. Missing or unverified metadata produces **Item URL unavailable**, never the submitted gallery/profile URL. This applies equally to single-URL and batch captures. Long substituted values are wrapped in the footer rather than silently truncated. `%item_datetime%` uses the completed file's hash-verified metadata, retaining a date alone when no time is supplied. Its value, source field and date/datetime precision are recorded in the evidence sidecar (schema 8). Missing, invalid or unverified publication metadata displays **Item datetime unavailable**. For example, use `<Left>Posted: %item_datetime%</Left><Right>Captured: %utcdatetime%</Right>` to keep publication and capture times distinct.
 
 - Supported source-image formats are JPEG, PNG, WebP, BMP, and TIFF. Animated GIFs, video, and other media are not modified or converted by this option.
 - By default, all supported stamped image derivatives are written as lossless PNG. This avoids an additional lossy JPEG generation when the captured source is JPEG.
 - **Match evidence source format** retains the source format instead. JPEG derivatives are then re-encoded as high-quality JPEG, while PNG and WebP derivatives use lossless output settings.
 - WAVI appends the black evidence footer below the image rather than covering original image pixels.
-- Evidence footer layout is calculated independently for each image using actual rendered text width. The footer uses fixed equal top and bottom padding, a fixed font size, and only wraps text when it exceeds the available horizontal space; narrower images may therefore require additional rendered lines and a taller footer.
-- Each derivative has an adjacent `.evidence.json` provenance record containing the stamp template and resolved stamp text, source and derivative formats, the selected format policy, the complete original and derivative paths, independent SHA-256 hashes, sizes, capture timestamp, and the submitted source URL list.
+- **Left column width (%)** is a slider from 1–99, default 50. It divides paired `<Left>…</Left><Right>…</Right>` rows after subtracting outer padding and the gap: 25 gives 25% to the left and 75% to the right; 75 reverses that allocation. Text wraps at each boundary rather than being clipped. Plain lines and single-sided rows retain the full width. The setting is saved in profiles and queued jobs. Extreme splits may leave too little room for a character; shorten the text or move the slider towards 50 if a layout cannot fit.
+- **Preferred footer height (% of source image height)** starts each footer at 1–100% of source height (default 10%, rounded up). WAVI chooses the largest fitting whole-pixel font and centres text vertically.
+- **Prioritise stamp readability** is enabled by default. **Minimum font size (px)** defaults to 16 and accepts 8–72. When that font cannot fit, WAVI expands the footer. Narrow images may also receive a wider black canvas, with the source image centred above the footer at its original dimensions. The original file is untouched; the image content is not upscaled.
+- With readability off, the percentage is fixed and the previous 6-pixel minimum applies. If text cannot fit, the derivative fails rather than clipping. Readability expansion is also bounded (32,768-pixel footer height and 100 million combined canvas pixels); shorten the template or reduce the minimum font size if that limit is reached. Settings persist in profiles and queued jobs.
+- Each derivative has an adjacent `.evidence.json` provenance record containing the stamp template, resolved stamp text and rows, footer percentage, preferred and actual footer dimensions, readability/minimum-font settings, source dimensions, centring offset, left/right percentages and chosen font size, source and derivative formats, the selected format policy, the complete original and derivative paths, independent SHA-256 hashes, sizes, capture timestamp, and the submitted source URL list. The source section also identifies the per-item URL, whether it is an item page or direct media URL, the metadata field used, and whether the metadata hash matched.
+- When stamping is enabled, WAVI records each completed file’s full path, source URL metadata and SHA-256 in a run-specific `logs/gallery-dl-evidence-sources_*.jsonl` file, even in media-only mode. The source mapping must match the file’s SHA-256 before being used. The adjacent configuration file and JSONL record are included in the case manifest. This adds one file-hashing pass during capture.
 - WAVI verifies the original SHA-256 again after derivative generation. The derivative and provenance JSON are included in the case manifest independently from the original.
 - Evidence stamping requires `ffmpeg.exe` and `ffprobe.exe` from the configured FFmpeg folder. The option is inactive for metadata-only captures because no media is downloaded.
 
@@ -567,8 +597,8 @@ Extractor support varies by site. A keyword that is meaningful for one extractor
 | Preset | General sleep | Per-request sleep | HTTP 429 sleep |
 |---|---:|---:|---:|
 | **Fast** | none added | none added | tool default |
-| **Normal** | 1 to 3 seconds | 0.5 to 1.5 seconds | 60 seconds |
-| **Cautious** | 3 to 8 seconds | 1 to 3 seconds | 120 seconds |
+| **Normal** | 10 to 20 seconds | 5 to 10 seconds | 120 seconds |
+| **Cautious** | 25 to 45 seconds | 15 to 30 seconds | 300 seconds |
 
 Use **Normal** for routine work. **Fast** is useful only when the source and policy permit rapid requests. **Cautious** is preferable for sensitive, unstable, or rate-limited sources.
 
@@ -590,7 +620,7 @@ The default template is:
 
 Use the preview below the template to confirm the expected relative path before capture. Keep identifiers in the template where possible so similarly named profile or collection items do not overwrite one another. gallery-dl metadata keys vary by extractor, so WAVI's generic Gallery/Profile tags use ordered fallback fields instead of assuming one site-specific key. For example, `%id%` prefers `id` but can fall back through fields such as `media_id`, `post_id`, `shortcode`, and other common item identifiers; `%author%` can fall back to username/creator-style metadata; and `%url%` prefers post/source URLs before falling back to the current file URL. This keeps common templates useful on sources such as Instagram Reels where gallery-dl exposes `media_id`, `username`, and `post_url` instead of generic `id`, `author`, and `url` fields. `%filename%` also falls back through common file/item identifiers when an extractor has no literal `filename` value. Keep `%id%` and/or `%filename%` in multi-item templates; descriptive fields such as title or author are not guaranteed to be unique.
 
-`%item_date%` exposes the source item's gallery-dl date metadata using common date-field fallbacks. The older Gallery/Profile `%date_utc%` spelling remains accepted for existing templates but stays engine-specific because its source-item meaning is not equivalent to WAVI's capture-time `%utcdatetime%`. For a mixed-domain job, `%domain%` resolves to `multiple-domains`. See [Template Tags](#template-tags) for the common tags and compatibility aliases.
+`%item_datetime%` exposes the source item's gallery-dl date or datetime metadata using common date-field fallbacks. `%item_date%` remains accepted as a hidden compatibility name. The older Gallery/Profile `%date_utc%` spelling remains accepted for existing templates but stays engine-specific because its source-item meaning is not equivalent to WAVI's capture-time `%utcdatetime%`. For a mixed-domain job, `%domain%` resolves to `multiple-domains`. See [Template Tags](#template-tags) for the common tags and compatibility aliases.
 
 Typical output:
 
@@ -838,7 +868,7 @@ Each recoverable job can write `manifests/gui-job-recovery-<job-id>.json` under 
 
 ### Queue Building and Case Folder Safety
 
-The **Start Capture ▼** menus can stage work without immediately running it. All three engines support **Add Job to Queue** and **Add Job to Queue and Start**. Audio/Video additionally provides:
+The **Start Capture ▼** menus can stage work without immediately running it. All three engines support **Add Job to Queue**, **Add Job to Queue and Start**, and the following options:
 
 - **Split and Add to Queue** — splits the current URL list by either URLs per group or requested number of groups. URL order is preserved and each generated job receives a `-partXX` suffix on the resolved case name.
 - **Add Jobs to Queue by Domain** — creates separate jobs for each source domain. When the case template does not already contain a dynamic domain/preset tag, WAVI appends the domain to the resolved case name.
@@ -851,6 +881,8 @@ Before a capture or queue job starts, WAVI warns when the resolved case folder a
 **Capture > Delete Current Case Folder** permanently deletes the resolved current case folder and everything inside it after confirmation. This is a destructive convenience command, not an archive/reset operation; use it only when the displayed case path is definitely the folder intended for removal.
 
 ### Case Browser
+
+List and tile views show the containing **Relative Folder** separately from the filename. Hover overlays also omit the filename from the folder location. Media hover overlays use the same metadata as cards, including image resolution and codec. Duration appears only when applicable and available. Files directly in the selected folder show **(current folder)**.
 
 Case Browser automatically follows the current Output Root and provides a local review view over captured case folders. Its controls are display/review aids and do not alter captured files unless a separate destructive action is explicitly chosen elsewhere.
 

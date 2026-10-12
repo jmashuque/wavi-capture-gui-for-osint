@@ -70,7 +70,14 @@
     [switch]$MatchEvidenceSourceFormat,
 
     [Parameter(Mandatory = $false)]
-    [string]$EvidenceStampTemplateBase64
+    [string]$EvidenceStampTemplateBase64,
+
+    [ValidateRange(1, 100)]
+    [int]$EvidenceFooterPercent = 10,
+
+    [ValidateSet(0, 1)][int]$EvidenceReadability = 1,
+    [ValidateRange(8, 72)][int]$EvidenceMinFont = 16,
+    [ValidateRange(1, 99)][int]$EvidenceLeftPercent = 50
 )
 
 $ErrorActionPreference = "Stop"
@@ -483,7 +490,7 @@ function Test-EvidenceTextFitsWidth {
         [int]::MaxValue,
         [System.Drawing.StringFormat]::GenericTypographic
     )
-    return ($measured.Width -le ($MaxWidth + 0.25))
+    return ($measured.Width -le $MaxWidth)
 }
 
 function Convert-EvidenceTextToMeasuredLines {
@@ -495,7 +502,7 @@ function Convert-EvidenceTextToMeasuredLines {
     )
 
     $result = New-Object System.Collections.Generic.List[string]
-    $logicalLines = ([string]$Text) -split '\r?\n'
+    $logicalLines = ([string]$Text) -split '\r\n|\r|\n'
     foreach ($logicalLine in $logicalLines) {
         $remaining = [string]$logicalLine
         if ($remaining.Length -eq 0) {
@@ -510,11 +517,13 @@ function Convert-EvidenceTextToMeasuredLines {
             }
 
             $low = 1
-            $high = $remaining.Length
+            $boundaries = [System.Globalization.StringInfo]::ParseCombiningCharacters($remaining)
+            $high = $boundaries.Length
             $best = 1
             while ($low -le $high) {
                 $mid = [int][Math]::Floor(($low + $high) / 2)
-                $candidate = $remaining.Substring(0, $mid)
+                $end = if ($mid -lt $boundaries.Length) { $boundaries[$mid] } else { $remaining.Length }
+                $candidate = $remaining.Substring(0, $end)
                 if (Test-EvidenceTextFitsWidth -Graphics $Graphics -Font $Font -Text $candidate -MaxWidth $MaxWidth) {
                     $best = $mid
                     $low = $mid + 1
@@ -524,6 +533,7 @@ function Convert-EvidenceTextToMeasuredLines {
                 }
             }
 
+            $best = if ($best -lt $boundaries.Length) { $boundaries[$best] } else { $remaining.Length }
             $candidate = $remaining.Substring(0, $best)
             $spaceAt = $candidate.LastIndexOf(' ')
             if ($spaceAt -gt 0) {
@@ -545,6 +555,122 @@ function Convert-EvidenceTextToMeasuredLines {
     return $result.ToArray()
 }
 
+function Read-EvidenceSourceIndex {
+    param([string]$Path, [Parameter(Mandatory = $true)][string]$MediaRoot)
+    $index = @{}
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $index
+    }
+    $rootPrefix = [System.IO.Path]::GetFullPath($MediaRoot).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $reader = [System.IO.File]::OpenText($Path)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try {
+                $record = $line | ConvertFrom-Json -ErrorAction Stop
+                $itemPath = [string]$record._path
+                if ([string]::IsNullOrWhiteSpace($itemPath) -or -not [System.IO.Path]::IsPathRooted($itemPath)) { continue }
+                $itemPath = [System.IO.Path]::GetFullPath($itemPath)
+                if (-not $itemPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                # A later successful download to the same exact path replaces its earlier record.
+                $index[$itemPath.ToLowerInvariant()] = $record
+            }
+            catch {
+                Write-RunLog 'WARNING: An invalid evidence source record was ignored; no URL will be guessed from it.'
+            }
+        }
+    }
+    finally { $reader.Dispose() }
+    return $index
+}
+
+function Get-EvidenceHttpUrl {
+    param([AllowNull()][object]$Value)
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $text = $Value.Trim()
+    if ($text -match '[\x00-\x20\x7F]') { return $null }
+    $uri = $null
+    if (-not [Uri]::TryCreate($text, [UriKind]::Absolute, [ref]$uri)) { return $null }
+    if ($uri.Scheme -notin @('http', 'https') -or [string]::IsNullOrWhiteSpace($uri.Host) -or $uri.UserInfo) { return $null }
+    return $text
+}
+
+function Resolve-EvidenceItemSource {
+    param([AllowNull()][object]$Metadata)
+    $result = [ordered]@{ url = $null; kind = 'unavailable'; field = $null; media_url = $null }
+    if ($null -eq $Metadata) { return [pscustomobject]$result }
+    $category = [string]$Metadata.category
+    $result.media_url = Get-EvidenceHttpUrl -Value $Metadata._url
+    foreach ($field in @('post_url', 'webpage_url', 'permalink', 'canonical_url', 'page_url')) {
+        $value = $Metadata.$field
+        # Reddit exposes its post permalink as a site-relative path.
+        if ($category -eq 'reddit' -and $field -eq 'permalink' -and $value -is [string] -and $value -match '^/r/[^/]+/comments/[A-Za-z0-9]+(?:/|$)') {
+            $value = 'https://www.reddit.com' + $value
+        }
+        $url = Get-EvidenceHttpUrl -Value $value
+        if ($url) {
+            # Instagram also uses post_url for story/highlight collections.
+            # Only accept a permalink to an individual post/reel/story here.
+            if ($category -eq 'instagram' -and ([Uri]$url).AbsolutePath -notmatch '^/(?:p|reel|tv)/[^/]+/?$|^/stories/[^/]+/[0-9]+/?$') { continue }
+            $result.url = $url; $result.kind = 'item-page'; $result.field = $field
+            return [pscustomobject]$result
+        }
+    }
+    # These stable permalink forms are derived only from item-specific identifiers.
+    if ($category -eq 'twitter' -and [string]$Metadata.tweet_id -match '^[0-9]+$') {
+        $result.url = 'https://twitter.com/i/web/status/' + [string]$Metadata.tweet_id
+        $result.kind = 'item-page'; $result.field = 'twitter.tweet_id'
+    }
+    elseif ($category -eq 'pixiv' -and [string]$Metadata.id -match '^[0-9]+$' -and [string]$Metadata.subcategory -notmatch 'novel|avatar|background') {
+        $result.url = 'https://www.pixiv.net/artworks/' + [string]$Metadata.id
+        $result.kind = 'item-page'; $result.field = 'pixiv.id'
+    }
+    elseif ($result.media_url) {
+        $result.url = $result.media_url; $result.kind = 'direct-media'; $result.field = '_url'
+    }
+    return [pscustomobject]$result
+}
+
+function Resolve-EvidenceItemDateTime {
+    param([AllowNull()][object]$Metadata)
+    $result = [ordered]@{ value = $null; field = $null; precision = 'unavailable' }
+    if ($null -eq $Metadata) { return [pscustomobject]$result }
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    foreach ($field in @('date', 'post_date', 'created', 'created_at')) {
+        $raw = $Metadata.$field
+        if ($null -eq $raw) { continue }
+        $text = if ($raw -is [datetime]) { $raw.ToString('o', $culture) } elseif ($raw -is [datetimeoffset]) { $raw.ToString('o', $culture) } else { ([string]$raw).Trim() }
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+        $parsed = [datetime]::MinValue
+        if ($text -match '^\d{4}-\d{2}-\d{2}$|^\d{8}$') {
+            $format = if ($text.Length -eq 8) { 'yyyyMMdd' } else { 'yyyy-MM-dd' }
+            if (-not [datetime]::TryParseExact($text, $format, $culture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { continue }
+            $result.value = $parsed.ToString('yyyy-MM-dd', $culture)
+            $result.precision = 'date'
+        }
+        elseif ($text -match '^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:?\d{2})?$') {
+            if (-not [datetime]::TryParse($text, $culture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { continue }
+            # Preserve supplied precision/offset; never invent a timezone or time.
+            $result.value = $text.Replace('T', ' ')
+            $result.precision = 'datetime'
+        }
+        elseif ($text -match '^\d{10}(?:\d{3})?$') {
+            try {
+                $seconds = [double]::Parse($text, $culture)
+                if ($text.Length -eq 13) { $seconds /= 1000 }
+                $epoch = [datetime]::SpecifyKind([datetime]'1970-01-01', [DateTimeKind]::Utc)
+                $result.value = $epoch.AddSeconds($seconds).ToString('yyyy-MM-dd HH:mm:ss.fffZ', $culture)
+                $result.precision = 'datetime'
+            }
+            catch { continue }
+        }
+        else { continue }
+        $result.field = $field
+        return [pscustomobject]$result
+    }
+    return [pscustomobject]$result
+}
+
 function Resolve-EvidenceStampTemplate {
     param(
         [Parameter(Mandatory = $true)][string]$Template,
@@ -553,7 +679,8 @@ function Resolve-EvidenceStampTemplate {
         [Parameter(Mandatory = $true)][datetime]$CaptureLocal,
         [Parameter(Mandatory = $true)][datetime]$CaptureUtc,
         [Parameter(Mandatory = $true)][string]$DomainLabel,
-        [Parameter(Mandatory = $true)][string]$SubmittedUrlLabel,
+        [Parameter(Mandatory = $true)][string]$ItemUrlLabel,
+        [string]$ItemDateTimeLabel = 'Item datetime unavailable',
         [Parameter(Mandatory = $true)][int]$SourceCount,
         [Parameter(Mandatory = $true)][string]$OriginalRelativePath,
         [Parameter(Mandatory = $true)][string]$OriginalFileName,
@@ -574,7 +701,8 @@ function Resolve-EvidenceStampTemplate {
         '%datetime%' = $localDateTime
         '%utcdatetime%' = $utcDateTime
         '%engine%' = 'image'
-        '%url%' = $SubmittedUrlLabel
+        '%url%' = $ItemUrlLabel
+        '%item_datetime%' = $ItemDateTimeLabel
         '%domain%' = $DomainLabel
         '%source_count%' = [string]$SourceCount
         '%original%' = $OriginalRelativePath
@@ -656,83 +784,186 @@ function Get-EvidenceImageDimensions {
     return @([int]$Matches[1], [int]$Matches[2])
 }
 
+function Convert-EvidenceTemplateToRows {
+    param([Parameter(Mandatory = $true)][string]$Template)
+    foreach ($line in ($Template -split '\r\n|\r|\n')) {
+        if ($line -notmatch '(?i)</?(Left|Right)\b') {
+            [pscustomobject]@{ left = [string]$line; right = ''; paired = $false; right_only = $false }
+            continue
+        }
+        $sections = [regex]::Matches($line, '(?i)<(Left|Right)>(.*?)</\1>')
+        $remainder = [regex]::Replace($line, '(?i)<(Left|Right)>(.*?)</\1>', '')
+        $parts = @{}
+        foreach ($section in $sections) {
+            $side = $section.Groups[1].Value.ToLowerInvariant()
+            $content = $section.Groups[2].Value
+            if ($parts.ContainsKey($side) -or $content -match '(?i)</?(Left|Right)\b') {
+                throw 'Evidence alignment sections cannot be duplicated or nested.'
+            }
+            $parts[$side] = $content
+        }
+        if ($sections.Count -eq 0 -or -not [string]::IsNullOrWhiteSpace($remainder)) {
+            throw 'Use complete <Left>...</Left> and/or <Right>...</Right> sections on one line, without text outside them.'
+        }
+        [pscustomobject]@{
+            left = [string]$parts['left']; right = [string]$parts['right']
+            paired = ($parts.ContainsKey('left') -and $parts.ContainsKey('right'))
+            right_only = (-not $parts.ContainsKey('left'))
+        }
+    }
+}
+
+function Measure-EvidenceFooterRows {
+    param($Rows, $Graphics, $Font, [single]$TextWidth, [single]$Gap, [int]$LineSpacing, [ValidateRange(1, 99)][int]$LeftPercent = 50)
+    $layout = New-Object System.Collections.Generic.List[object]
+    $lineHeight = [int][Math]::Ceiling($Font.GetHeight($Graphics))
+    $lineCount = 0
+    $fitsWidth = $true
+    foreach ($row in $Rows) {
+        $leftWidth = if ($row.paired) { ($TextWidth - $Gap) * ($LeftPercent / 100.0) } else { $TextWidth }
+        $rightWidth = if ($row.paired) { ($TextWidth - $Gap) - $leftWidth } else { $TextWidth }
+        if ($leftWidth -le 0 -or $rightWidth -le 0) { return [pscustomobject]@{ fits_width = $false; height = 0; rows = @() } }
+        $leftLines = @(Convert-EvidenceTextToMeasuredLines -Text $row.left -Graphics $Graphics -Font $Font -MaxWidth $leftWidth)
+        $rightLines = @(Convert-EvidenceTextToMeasuredLines -Text $row.right -Graphics $Graphics -Font $Font -MaxWidth $rightWidth)
+        $count = [Math]::Max(1, [Math]::Max($leftLines.Count, $rightLines.Count))
+        foreach ($line in $leftLines) {
+            if (-not (Test-EvidenceTextFitsWidth -Graphics $Graphics -Font $Font -Text $line -MaxWidth $leftWidth)) { $fitsWidth = $false }
+        }
+        foreach ($line in $rightLines) {
+            if (-not (Test-EvidenceTextFitsWidth -Graphics $Graphics -Font $Font -Text $line -MaxWidth $rightWidth)) { $fitsWidth = $false }
+        }
+        [void]$layout.Add([pscustomobject]@{
+            left = $leftLines; right = $rightLines; count = $count
+            paired = $row.paired; right_only = $row.right_only; left_width = $leftWidth; right_width = $rightWidth
+        })
+        $lineCount += $count
+    }
+    return [pscustomobject]@{
+        rows = $layout.ToArray(); line_height = $lineHeight; line_count = $lineCount
+        height = ($lineCount * $lineHeight) + ([Math]::Max(0, $lineCount - 1) * $LineSpacing)
+        fits_width = $fitsWidth
+    }
+}
+
 function New-EvidenceFooterImage {
     param(
         [Parameter(Mandatory = $true)][int]$Width,
-        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][int]$SourceHeight,
+        [Parameter(Mandatory = $true)][object[]]$Rows,
+        [ValidateRange(1, 100)][int]$FooterPercent = 10,
+        [bool]$PrioritiseReadability = $true,
+        [ValidateRange(8, 72)][int]$MinimumFontSize = 16,
+        [ValidateRange(1, 99)][int]$LeftPercent = 50,
         [Parameter(Mandatory = $true)][string]$OutputPath
     )
-
-    if ($Width -lt 1) {
-        throw 'Evidence footer width is invalid.'
-    }
-
+    if ($Width -lt 1 -or $SourceHeight -lt 1) { throw 'Evidence image dimensions are invalid.' }
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop | Out-Null
-
-    $fontSize = 14
-    $lineSpacing = 3
-    $horizontalPadding = 12
-    $verticalPadding = 10
-    $textWidth = [single][Math]::Max(1, $Width - ($horizontalPadding * 2))
-
-    $measureBitmap = $null
-    $measureGraphics = $null
-    $font = $null
+    $footerHeight = [int][Math]::Ceiling($SourceHeight * ($FooterPercent / 100.0))
+    $preferredHeight = $footerHeight; $sourceWidth = $Width
+    $horizontalPadding = [int][Math]::Max(1, [Math]::Round([Math]::Min($Width * 0.02, $footerHeight * 0.08)))
+    $verticalPadding = [int][Math]::Max(1, [Math]::Round($footerHeight * 0.08))
+    $gap = [int][Math]::Max(2, $horizontalPadding)
+    $textWidth = [single]($Width - 2 * $horizontalPadding)
+    $availableHeight = $footerHeight - 2 * $verticalPadding
+    $measureBitmap = $null; $measureGraphics = $null; $font = $null
+    $bestLayout = $null; $fontSize = 0; $lineSpacing = 0
     try {
         $measureBitmap = New-Object System.Drawing.Bitmap(1, 1, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
         $measureGraphics = [System.Drawing.Graphics]::FromImage($measureBitmap)
         $measureGraphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $font = New-Object System.Drawing.Font('Segoe UI', [single]$fontSize, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-
-        $lines = Convert-EvidenceTextToMeasuredLines -Text $Text -Graphics $measureGraphics -Font $font -MaxWidth $textWidth
-        if ($lines.Count -lt 1) {
-            $lines = @('')
+        $minimum = 6
+        if ($PrioritiseReadability) {
+            $minimum = $MinimumFontSize
+            $font = New-Object System.Drawing.Font('Segoe UI', [single]$minimum, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+            $minimumSpacing = [int][Math]::Max(1, [Math]::Round($minimum * 0.15))
+            $minimumLayout = Measure-EvidenceFooterRows -Rows $Rows -Graphics $measureGraphics -Font $font -TextWidth $textWidth -Gap $gap -LineSpacing $minimumSpacing -LeftPercent $LeftPercent
+            if (-not $minimumLayout.fits_width -or $minimumLayout.height -gt $availableHeight) {
+                # Give narrow sources a practical text canvas without resampling them.
+                $Width = [int][Math]::Max($Width, $minimum * 24)
+                $horizontalPadding = [int][Math]::Max($horizontalPadding, [Math]::Ceiling($minimum / 2.0))
+                $verticalPadding = [int][Math]::Max($verticalPadding, [Math]::Ceiling($minimum / 2.0))
+                $gap = [int][Math]::Max(2, $horizontalPadding)
+                $textWidth = [single]($Width - 2 * $horizontalPadding)
+                $minimumLayout = Measure-EvidenceFooterRows -Rows $Rows -Graphics $measureGraphics -Font $font -TextWidth $textWidth -Gap $gap -LineSpacing $minimumSpacing -LeftPercent $LeftPercent
+                if (-not $minimumLayout.fits_width) { throw 'Evidence text cannot fit the readability canvas. Original image retained.' }
+                $footerHeight = [int][Math]::Max($preferredHeight, [Math]::Ceiling($minimumLayout.height + 2 * $verticalPadding))
+                if ($footerHeight -gt 32768 -or ([double]$Width * ($SourceHeight + $footerHeight)) -gt 100000000) {
+                    throw 'Evidence readability expansion exceeds the image size limit. Shorten the template or reduce the minimum font size. Original image retained.'
+                }
+                $availableHeight = $footerHeight - 2 * $verticalPadding
+            }
+            $font.Dispose(); $font = $null
         }
-        $lineHeight = [int][Math]::Ceiling($font.GetHeight($measureGraphics))
-        $textHeight = ($lines.Count * $lineHeight) + ([Math]::Max(0, $lines.Count - 1) * $lineSpacing)
-        $footerHeight = (2 * $verticalPadding) + $textHeight
+        # Largest fitting integer-pixel font, respecting the chosen minimum.
+        $low = $minimum; $high = [int][Math]::Max(0, $availableHeight)
+        while ($low -le $high) {
+            $candidateSize = [int][Math]::Floor(($low + $high) / 2)
+            $candidateSpacing = [int][Math]::Max(1, [Math]::Round($candidateSize * 0.15))
+            $font = New-Object System.Drawing.Font('Segoe UI', [single]$candidateSize, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+            $candidate = Measure-EvidenceFooterRows -Rows $Rows -Graphics $measureGraphics -Font $font -TextWidth $textWidth -Gap $gap -LineSpacing $candidateSpacing -LeftPercent $LeftPercent
+            $font.Dispose(); $font = $null
+            if ($candidate.fits_width -and $candidate.height -le $availableHeight) {
+                $fontSize = $candidateSize; $bestLayout = $candidate; $lineSpacing = $candidateSpacing
+                $low = $candidateSize + 1
+            }
+            else { $high = $candidateSize - 1 }
+        }
+        if ($null -eq $bestLayout) {
+            throw 'Evidence text cannot fit this footer at the minimum font size. Enable readability, increase Footer height (%) or shorten the template. Original image retained.'
+        }
     }
     finally {
         if ($font) { $font.Dispose() }
         if ($measureGraphics) { $measureGraphics.Dispose() }
         if ($measureBitmap) { $measureBitmap.Dispose() }
     }
-
-    $bitmap = $null
-    $graphics = $null
-    $drawFont = $null
-    $brush = $null
+    $bitmap = $null; $graphics = $null; $drawFont = $null; $brush = $null; $format = $null
     try {
         $bitmap = New-Object System.Drawing.Bitmap($Width, $footerHeight, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
         $graphics.Clear([System.Drawing.Color]::Black)
         $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
-        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
         $drawFont = New-Object System.Drawing.Font('Segoe UI', [single]$fontSize, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
         $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-
-        $x = [single]$horizontalPadding
-        $y = [single]$verticalPadding
-        foreach ($line in $lines) {
-            $graphics.DrawString([string]$line, $drawFont, $brush, $x, $y, [System.Drawing.StringFormat]::GenericTypographic)
-            $y += [single]($lineHeight + $lineSpacing)
+        $format = [System.Drawing.StringFormat]::GenericTypographic.Clone()
+        $format.FormatFlags = $format.FormatFlags -bor [System.Drawing.StringFormatFlags]::NoWrap
+        $y = [single](($footerHeight - $bestLayout.height) / 2.0)
+        foreach ($row in $bestLayout.rows) {
+            foreach ($side in @('left', 'right')) {
+                if (($side -eq 'left' -and $row.right_only) -or ($side -eq 'right' -and -not ($row.paired -or $row.right_only))) { continue }
+                $x = [single]$horizontalPadding
+                if ($side -eq 'right') {
+                    $format.Alignment = [System.Drawing.StringAlignment]::Far
+                    if ($row.paired) { $x += [single]($row.left_width + $gap) }
+                }
+                else { $format.Alignment = [System.Drawing.StringAlignment]::Near }
+                $lineY = $y
+                foreach ($line in $row.$side) {
+                    $rect = [System.Drawing.RectangleF]::new($x, $lineY, [single]$(if ($side -eq 'right') { $row.right_width } else { $row.left_width }), [single]$bestLayout.line_height)
+                    $graphics.DrawString([string]$line, $drawFont, $brush, $rect, $format)
+                    $lineY += [single]($bestLayout.line_height + $lineSpacing)
+                }
+            }
+            $y += [single]($row.count * ($bestLayout.line_height + $lineSpacing))
         }
-
         $bitmap.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
     }
     finally {
+        if ($format) { $format.Dispose() }
         if ($brush) { $brush.Dispose() }
         if ($drawFont) { $drawFont.Dispose() }
         if ($graphics) { $graphics.Dispose() }
         if ($bitmap) { $bitmap.Dispose() }
     }
-
     return [pscustomobject]@{
-        height = [int]$footerHeight
-        line_count = [int]$lines.Count
-        font_size = [int]$fontSize
-        horizontal_padding = [int]$horizontalPadding
-        vertical_padding = [int]$verticalPadding
+        height = $footerHeight; source_height = $SourceHeight; footer_percent = $FooterPercent
+        width = $Width; source_width = $sourceWidth; preferred_height = $preferredHeight
+        prioritise_readability = $PrioritiseReadability; minimum_font_size = $minimum
+        left_percent = $LeftPercent; right_percent = (100 - $LeftPercent)
+        image_offset_x = [int][Math]::Floor(($Width - $sourceWidth) / 2.0)
+        line_count = $bestLayout.line_count; font_size = $fontSize; line_spacing = $lineSpacing
+        horizontal_padding = $horizontalPadding; vertical_padding = $verticalPadding
+        text_top = (($footerHeight - $bestLayout.height) / 2.0); column_gap = $gap
     }
 }
 
@@ -794,8 +1025,14 @@ function New-EvidenceDerivative {
         [Parameter(Mandatory = $true)][datetime]$CaptureLocal,
         [Parameter(Mandatory = $true)][datetime]$CaptureUtc,
         [Parameter(Mandatory = $true)][string[]]$SubmittedUrls,
+        [AllowNull()][object]$ItemSourceMetadata,
+        [string]$ItemSourceRecordPath,
         [Parameter(Mandatory = $true)][string]$Version,
         [Parameter(Mandatory = $true)][string]$StampTemplate,
+        [ValidateRange(1, 100)][int]$FooterPercent = 10,
+        [bool]$PrioritiseReadability = $true,
+        [ValidateRange(8, 72)][int]$MinimumFontSize = 16,
+        [ValidateRange(1, 99)][int]$LeftPercent = 50,
         [switch]$MatchSourceFormat
     )
 
@@ -823,46 +1060,46 @@ function New-EvidenceDerivative {
         $dimensions = Get-EvidenceImageDimensions -FFprobePath $FFprobePath -ImagePath $originalFullPath
         $width = [int]$dimensions[0]
 
-        $domainLabel = if ($SubmittedUrls.Count -eq 1) {
-            try {
-                $uri = [Uri]$SubmittedUrls[0]
-                if ($uri.Host) { $uri.Host } else { 'unknown-domain' }
+        $sourceMetadataVerified = ($null -ne $ItemSourceMetadata -and
+            [string]::Equals([string]$ItemSourceMetadata._wavi_sha256, $originalHashBefore, [System.StringComparison]::OrdinalIgnoreCase))
+        $itemSource = if ($sourceMetadataVerified) { Resolve-EvidenceItemSource -Metadata $ItemSourceMetadata } else { Resolve-EvidenceItemSource -Metadata $null }
+        $itemDateTime = Resolve-EvidenceItemDateTime -Metadata $(if ($sourceMetadataVerified) { $ItemSourceMetadata } else { $null })
+        $itemDateTimeLabel = if ($itemDateTime.value) { $itemDateTime.value } else { 'Item datetime unavailable' }
+        $itemUrlLabel = if ($itemSource.url) { $itemSource.url } else { 'Item URL unavailable' }
+        $domainLabel = if ($itemSource.url) { ([Uri]$itemSource.url).Host } else { 'unknown-domain' }
+        if (-not $itemSource.url) {
+            Write-RunLog ("WARNING: No per-item source URL is available for {0}; the stamp will explicitly say Item URL unavailable." -f $OriginalFile.Name)
+        }
+
+        $stampValues = @{
+            Version = $Version; CaseName = $SafeCaseName
+            CaptureLocal = $CaptureLocal; CaptureUtc = $CaptureUtc
+            DomainLabel = $domainLabel; ItemUrlLabel = $itemUrlLabel; ItemDateTimeLabel = $itemDateTimeLabel
+            SourceCount = $SubmittedUrls.Count; OriginalRelativePath = $originalRelativeToCase
+            OriginalFileName = $OriginalFile.Name; OriginalExtension = $sourceExtension.TrimStart('.')
+            OriginalSha256 = $originalHashBefore
+        }
+        # Parse only the user's template: substituted metadata is always literal text.
+        $stampRows = @(Convert-EvidenceTemplateToRows -Template $StampTemplate)
+        foreach ($row in $stampRows) {
+            foreach ($side in @('left', 'right')) {
+                if (-not [string]::IsNullOrEmpty($row.$side)) {
+                    $row.$side = Resolve-EvidenceStampTemplate -Template $row.$side @stampValues
+                }
             }
-            catch { 'unknown-domain' }
         }
-        elseif ($SubmittedUrls.Count -gt 1) {
-            'multiple-domains'
-        }
-        else {
-            'unknown-domain'
-        }
-        $submittedUrlLabel = if ($SubmittedUrls.Count -eq 1) {
-            [string]$SubmittedUrls[0]
-        }
-        else {
-            ("Multiple submitted URLs ({0})" -f $SubmittedUrls.Count)
-        }
-
-        $resolvedStampText = Resolve-EvidenceStampTemplate `
-            -Template $StampTemplate `
-            -Version $Version `
-            -CaseName $SafeCaseName `
-            -CaptureLocal $CaptureLocal `
-            -CaptureUtc $CaptureUtc `
-            -DomainLabel $domainLabel `
-            -SubmittedUrlLabel $submittedUrlLabel `
-            -SourceCount $SubmittedUrls.Count `
-            -OriginalRelativePath $originalRelativeToCase `
-            -OriginalFileName $OriginalFile.Name `
-            -OriginalExtension $sourceExtension.TrimStart('.') `
-            -OriginalSha256 $originalHashBefore
-
+        $resolvedStampText = Resolve-EvidenceStampTemplate -Template $StampTemplate @stampValues
         $footerLayout = New-EvidenceFooterImage `
             -Width $width `
-            -Text $resolvedStampText `
+            -SourceHeight ([int]$dimensions[1]) `
+            -Rows $stampRows `
+            -FooterPercent $FooterPercent `
+            -PrioritiseReadability $PrioritiseReadability `
+            -MinimumFontSize $MinimumFontSize `
+            -LeftPercent $LeftPercent `
             -OutputPath $footerImage
 
-        $filter = '[0:v]format=rgba[base];[1:v]format=rgba[footer];[base][footer]vstack=inputs=2[v]'
+        $filter = "[0:v]format=rgba,pad=w=$($footerLayout.width):h=ih:x=$($footerLayout.image_offset_x):y=0:color=black[base];[1:v]format=rgba[footer];[base][footer]vstack=inputs=2[v]"
         $ffmpegArgs = @('-hide_banner', '-loglevel', 'error', '-y', '-i', $originalFullPath, '-i', $footerImage, '-filter_complex', $filter, '-map', '[v]', '-frames:v', '1', '-map_metadata', '-1')
         switch ($outputExtension) {
             '.jpg'  { $ffmpegArgs += @('-q:v', '2') }
@@ -890,7 +1127,7 @@ function New-EvidenceDerivative {
         $derivativeRelativeToCase = $derivativePath.Substring($CaseRoot.Length).TrimStart('\', '/') -replace '\\', '/'
 
         $payload = [ordered]@{
-            schema_version = 3
+            schema_version = 8
             artifact_type = 'wavi-evidence-derivative'
             created_utc = $CaptureUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
             generator = [ordered]@{
@@ -901,6 +1138,8 @@ function New-EvidenceDerivative {
             stamp = [ordered]@{
                 template = $StampTemplate
                 rendered_text = $resolvedStampText
+                resolved_rows = @($stampRows)
+                layout = $footerLayout
             }
             original = [ordered]@{
                 relative_path = $originalRelativeToCase
@@ -918,9 +1157,18 @@ function New-EvidenceDerivative {
                 size_bytes = [int64]$tempDerivativeItem.Length
             }
             source = [ordered]@{
+                item_datetime = $itemDateTime.value
+                item_datetime_field = $itemDateTime.field
+                item_datetime_precision = $itemDateTime.precision
+                item_url = $itemSource.url
+                item_url_kind = $itemSource.kind
+                item_url_field = $itemSource.field
+                media_url = $itemSource.media_url
+                metadata_record = $ItemSourceRecordPath
+                metadata_hash_verified = [bool]$sourceMetadataVerified
                 submitted_url_count = [int]$SubmittedUrls.Count
                 submitted_urls = @($SubmittedUrls)
-                note = $(if ($SubmittedUrls.Count -eq 1) { 'Single submitted source URL for this capture run.' } else { 'Multiple source URLs were submitted in this capture run; WAVI does not claim per-item URL attribution in the overlay.' })
+                note = 'The stamped URL comes from the completed file metadata: item page when available, otherwise its direct media URL. Submitted URLs describe the capture run and are never substituted for missing item metadata.'
             }
         }
         Write-Utf8NoBomText -Path $tempSidecar -Text (($payload | ConvertTo-Json -Depth 8) + [Environment]::NewLine)
@@ -961,6 +1209,11 @@ function New-EvidenceDerivative {
         }
         if ($null -ne $reservation) { $reservation.stream.Dispose() }
     }
+}
+
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    if ($EvidenceStampTemplate.Length -gt 8000) { throw 'Evidence stamp template exceeds 8,000 characters.' }
+    $null = @(Convert-EvidenceTemplateToRows -Template $EvidenceStampTemplate)
 }
 
 if (-not (Test-Path -LiteralPath $InputFile -PathType Leaf)) {
@@ -1116,8 +1369,34 @@ $BaseArgs = @(
     "--write-unsupported", $UnsupportedFile,
     "--retries", [string]$Retries,
     "--http-timeout", [string]$Timeout,
+    # sleep-429 alone does not enable retries for HTTP media downloads.
+    "--option", "downloader.http.retry-codes=[429]",
     "--windows-filenames"
 )
+
+# Record only completed files, independently of optional user-facing metadata outputs.
+# Named postprocessor appends to the existing CLI postprocessors rather than replacing them.
+$EvidenceSourceFile = $null
+if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
+    $sourceRecordId = [guid]::NewGuid().ToString('N')
+    $sourceRecordName = 'gallery-dl-evidence-sources_' + $sourceRecordId + '.jsonl'
+    $EvidenceSourceFile = Join-Path $LogsFolder $sourceRecordName
+    $sourceConfigPath = Join-Path $LogsFolder ('gallery-dl-evidence-sources_' + $sourceRecordId + '.config.json')
+    $sourceConfig = @{
+        extractor = @{ 'metadata-url' = '_url'; 'metadata-path' = '_path' }
+        postprocessor = @{
+            'wavi-evidence-hash' = @{ name = 'hash'; event = 'file'; hashes = 'sha256:_wavi_sha256' }
+            'wavi-evidence-source' = @{
+                name = 'metadata'; mode = 'jsonl'; event = 'after'
+                'base-directory' = $LogsFolder; filename = $sourceRecordName
+                include = @('_path', '_url', '_wavi_sha256', 'category', 'subcategory', 'post_url', 'webpage_url', 'permalink', 'canonical_url', 'page_url', 'tweet_id', 'id', 'date', 'post_date', 'created', 'created_at')
+            }
+        }
+    }
+    Write-Utf8NoBomText -Path $sourceConfigPath -Text ($sourceConfig | ConvertTo-Json -Depth 8)
+    $BaseArgs += @('--config', $sourceConfigPath, '--postprocessor', 'wavi-evidence-hash', '--postprocessor', 'wavi-evidence-source')
+    Write-RunLog ("Per-item evidence source records: {0}" -f $EvidenceSourceFile)
+}
 
 if (-not $MediaOnly -and $WriteMetadata) { $BaseArgs += "--write-metadata" }
 if (-not $MediaOnly -and $WriteInfoJson) { $BaseArgs += "--write-info-json" }
@@ -1149,10 +1428,13 @@ if (-not [string]::IsNullOrWhiteSpace($ProxyUrl)) {
 }
 
 switch ($RateLimit) {
-    "Fast" { }
-    "Normal" { $BaseArgs += @("--sleep", "1.0-3.0", "--sleep-request", "0.5-1.5", "--sleep-429", "60") }
-    "Cautious" { $BaseArgs += @("--sleep", "3.0-8.0", "--sleep-request", "1.0-3.0", "--sleep-429", "120") }
+    "Fast" { $BaseArgs += @("--sleep-429", "60") }
+    "Normal" { $BaseArgs += @("--sleep", "10.0-20.0", "--sleep-request", "5.0-10.0", "--sleep-429", "120") }
+    "Cautious" { $BaseArgs += @("--sleep", "25.0-45.0", "--sleep-request", "15.0-30.0", "--sleep-429", "300") }
 }
+
+$Http429SleepSeconds = if ($RateLimit -eq "Cautious") { 300 } elseif ($RateLimit -eq "Normal") { 120 } else { 60 }
+Write-RunLog ("HTTP 429: media retries enabled; {0}s delay before retry, up to {1} retries per request. Other concurrent captures are independent." -f $Http429SleepSeconds, $Retries)
 
 if (-not [string]::IsNullOrWhiteSpace($IncludeKeywords)) {
     $IncludeKeywordList = @(
@@ -1388,6 +1670,8 @@ $EvidenceDerivativeGenerated = 0
 $EvidenceDerivativeFailures = 0
 if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
     Write-Section "Gallery/Profile Evidence Stamping"
+    $evidenceSourceIndex = Read-EvidenceSourceIndex -Path $EvidenceSourceFile -MediaRoot $MediaFolder
+    $evidenceSourceRelative = if ($EvidenceSourceFile) { $EvidenceSourceFile.Substring($CaseFolder.Length).TrimStart('\', '/') -replace '\\', '/' } else { $null }
     $captureUtcText = $RunStartedUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $captureLocalTime = $RunStartedLocal
     $candidateImages = New-Object System.Collections.Generic.List[System.IO.FileInfo]
@@ -1419,8 +1703,14 @@ if ($CreateEvidenceDerivative -and -not $MetadataOnly) {
                     -CaptureLocal $captureLocalTime `
                     -CaptureUtc $RunStartedUtc `
                     -SubmittedUrls $Urls `
+                    -ItemSourceMetadata $evidenceSourceIndex[[System.IO.Path]::GetFullPath($imageFile.FullName).ToLowerInvariant()] `
+                    -ItemSourceRecordPath $evidenceSourceRelative `
                     -Version $WaviVersion `
                     -StampTemplate $EvidenceStampTemplate `
+                    -FooterPercent $EvidenceFooterPercent `
+                    -PrioritiseReadability ([bool]$EvidenceReadability) `
+                    -MinimumFontSize $EvidenceMinFont `
+                    -LeftPercent $EvidenceLeftPercent `
                     -MatchSourceFormat:$MatchEvidenceSourceFormat
                 $EvidenceDerivativeGenerated++
                 Write-RunLog ("Evidence-stamped derivative created: {0} -> {1}" -f $result.original, $result.derivative)

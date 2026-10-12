@@ -2,6 +2,17 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v3.2026.1011](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.1011) - Evidence Stamping, Capture Pacing, and Review Improvements
+
+- Added a dedicated **Stamping Options** panel for Gallery/Profile Capture.
+- Added left/right stamp alignment, adjustable column widths, footer sizing, and improved text readability on smaller images.
+- Corrected evidence stamps to use the captured item’s URL.
+- Added source datetime tags to Gallery/Profile evidence stamps and Gallery/Profile and Audio/Video filenames, preserving existing date-tag compatibility.
+- Increased Normal and Cautious Gallery/Profile pacing delays and corrected HTTP 429 cooldown handling.
+- Added queue splitting, domain grouping, and failed-URL queue options to Gallery/Profile and Webpage Capture.
+- Added optional warning/error highlighting and redacted log exports to Output Log.
+- Simplified Case Browser folder displays and expanded hover metadata, hiding inapplicable durations.
+
 ## [v3.2026.1008](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.1008) - Capture Reliability, Cache Controls, and PDF Refinements
 
 - Added **Clear yt-dlp Cache** and **Clear Deno Cache** to the Tools menu, with checks for active capture and related operations before clearing.
