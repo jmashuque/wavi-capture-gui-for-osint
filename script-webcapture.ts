@@ -515,7 +515,6 @@ function renderFilenameTemplate(template, context) {
     ...captureTimeFilenameTags(context.date),
     "%engine%": "webpage",
     "%domain%": domainTagValue,
-    "%webpage_domain%": domainTagValue,
     "%title%": safeFileComponent(context.title, "untitled", 120),
     "%index%": String(context.index).padStart(3, "0"),
     "%urlindex%": String(context.index).padStart(3, "0"),
@@ -538,41 +537,6 @@ function htmlEscape(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function formatPdfTemplateLocal(value, mode = "datetime") {
-  const parsed = value ? new Date(value) : null;
-  if (!(parsed instanceof Date) || Number.isNaN(parsed.getTime())) return "";
-  try {
-    if (mode === "date") {
-      return new Intl.DateTimeFormat(undefined, {
-        year: "numeric",
-        month: "numeric",
-        day: "numeric",
-      }).format(parsed);
-    }
-    if (mode === "time") {
-      return new Intl.DateTimeFormat(undefined, {
-        hour: "numeric",
-        minute: "2-digit",
-        second: "2-digit",
-        timeZoneName: "short",
-      }).format(parsed);
-    }
-    return new Intl.DateTimeFormat(undefined, {
-      year: "numeric",
-      month: "numeric",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      second: "2-digit",
-      timeZoneName: "short",
-    }).format(parsed);
-  } catch {
-    if (mode === "date") return parsed.toLocaleDateString();
-    if (mode === "time") return parsed.toLocaleTimeString();
-    return parsed.toLocaleString();
-  }
 }
 
 function buildPdfTemplateReplacements(context) {
@@ -603,18 +567,6 @@ function buildPdfTemplateReplacements(context) {
     ? `${validDate.getUTCFullYear()}${pad2(validDate.getUTCMonth() + 1)}${pad2(validDate.getUTCDate())}_${pad2(validDate.getUTCHours())}${pad2(validDate.getUTCMinutes())}${pad2(validDate.getUTCSeconds())}Z`
     : "";
 
-  // Preserve the long-standing PDF/header-footer placeholders exactly for
-  // saved templates while exposing normalized WAVI names in new menus.
-  const captureDateUtc = validDate
-    ? `${validDate.getUTCFullYear()}-${pad2(validDate.getUTCMonth() + 1)}-${pad2(validDate.getUTCDate())}`
-    : "";
-  const captureTimeUtc = validDate
-    ? `${pad2(validDate.getUTCHours())}:${pad2(validDate.getUTCMinutes())}:${pad2(validDate.getUTCSeconds())} UTC`
-    : "";
-  const captureTimestampUtc = captureDateUtc && captureTimeUtc ? `${captureDateUtc} ${captureTimeUtc}` : captureUtc;
-  const captureDateLocal = formatPdfTemplateLocal(captureUtc, "date");
-  const captureTimeLocal = formatPdfTemplateLocal(captureUtc, "time");
-  const captureTimestampLocal = formatPdfTemplateLocal(captureUtc, "datetime");
   return {
     "%url%": htmlEscape(bestUrl),
     "%requested_url%": htmlEscape(requestedUrl),
@@ -631,16 +583,6 @@ function buildPdfTemplateReplacements(context) {
     "%page_number%": htmlEscape(pageNumber),
     "%page_count%": htmlEscape(pageCount),
 
-    "%best_url%": htmlEscape(bestUrl),
-    "%page_title%": htmlEscape(pageTitle),
-    "%capture_utc%": htmlEscape(captureUtc),
-    "%capture_timestamp_utc%": htmlEscape(captureTimestampUtc),
-    "%capture_date_utc%": htmlEscape(captureDateUtc),
-    "%capture_time_utc%": htmlEscape(captureTimeUtc),
-    "%capture_local%": htmlEscape(captureTimestampLocal),
-    "%capture_timestamp_local%": htmlEscape(captureTimestampLocal),
-    "%capture_date_local%": htmlEscape(captureDateLocal),
-    "%capture_time_local%": htmlEscape(captureTimeLocal),
   };
 }
 
@@ -1760,21 +1702,34 @@ async function waitForDevTools(profileRoot, childStatusPromise, timeoutMs = 2000
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    if (childStatus) {
-      throw new Error(`Browser exited before DevTools became available (code ${childStatus.code}).`);
-    }
+    // A clean launcher exit can precede readiness of the browser it started.
+    // Check the private profile's live endpoint before interpreting child exit.
     try {
       const text = await Deno.readTextFile(activePortPath);
       const lines = text.trim().split(/\r?\n/);
       const port = Number(lines[0]);
-      if (Number.isInteger(port) && port > 0) return port;
+      if (Number.isInteger(port) && port > 0 && port <= 65535 && lines[1]?.startsWith('/devtools/browser/')) {
+        const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+          signal: AbortSignal.timeout(Math.max(1, Math.min(500, deadline - Date.now()))),
+        });
+        if (response.ok) {
+          const version = await response.json();
+          const endpoint = new URL(version.webSocketDebuggerUrl);
+          if (endpoint.pathname === lines[1] && ['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname)
+              && endpoint.protocol === 'ws:' && Number(endpoint.port) === port) return port;
+        }
+      }
     } catch {
-      // File is created after the browser initializes the custom profile.
+      // The profile/endpoint can still be initializing; stay within the deadline.
+    }
+    if (childStatus && childStatus.code !== 0) {
+      throw new Error(`Browser exited before DevTools became available (code ${childStatus.code}).`);
     }
     await delay(100);
   }
 
-  throw new Error("Browser DevTools endpoint did not become available. Remote debugging may be blocked by policy.");
+  const exitDetail = childStatus ? ` Initial browser process exited with code ${childStatus.code}.` : '';
+  throw new Error(`Browser DevTools endpoint did not become available within ${timeoutMs / 1000} seconds.${exitDetail} Remote debugging may be blocked by policy.`);
 }
 
 async function getPageTarget(port) {
@@ -2443,6 +2398,17 @@ function filePathToFileUrl(filePath) {
   return encodeURI(`file://${normalized}`);
 }
 
+function webpagePacingDelayMs(config, previousIndex, nextIndex, random = Math.random) {
+  if (previousIndex === null) return 0;
+  const pacing = config.pacing || {};
+  const keys = pacing.domain_keys || [];
+  if (pacing.same_domain_only && (!keys[previousIndex] || keys[previousIndex] !== keys[nextIndex])) return 0;
+  // Gallery/Profile capture intervals; resource-request throttling is separate.
+  const ranges = { fast: [0, 0], normal: [10, 20], cautious: [25, 45] };
+  const [minimum, maximum] = ranges[String(pacing.preset || "normal").toLowerCase()] || ranges.normal;
+  return Math.round((minimum + (maximum - minimum) * random()) * 1000);
+}
+
 function getPaginatedPngSourceArtifacts(capture) {
   const pngArtifacts = (capture?.artifacts || []).filter((artifact) => normalizeImageFormat(artifact.format) === "png");
   const fullPageArtifacts = pngArtifacts.filter((artifact) => String(artifact.role || "").startsWith("full_page"));
@@ -2622,29 +2588,13 @@ window.addEventListener("unhandledrejection", (event) => {
     return output;
   }
 
-  function replaceLegacyChromiumPlaceholders(template, values) {
-    const container = document.createElement("div");
-    container.innerHTML = String(template || "");
-    const replacements = {
-      url: values["%url%"] || values["%best_url%"] || values["%final_url%"] || values["%requested_url%"] || "",
-      date: values["%datetime%"] || values["%capture_timestamp_local%"] || values["%capture_utc%"] || "",
-      title: values["%title%"] || values["%page_title%"] || "",
-      pageNumber: values["%page_number%"] || "",
-      totalPages: values["%page_count%"] || "",
-    };
-    for (const [className, replacement] of Object.entries(replacements)) {
-      for (const node of container.querySelectorAll("." + className)) node.textContent = String(replacement ?? "");
-    }
-    return container.innerHTML;
-  }
-
   function renderHeaderFooterTemplate(template, pageNumber, pageCount) {
     const values = {
       ...meta.templateValues,
       "%page_number%": String(pageNumber),
       "%page_count%": String(pageCount),
     };
-    return replaceLegacyChromiumPlaceholders(replaceTemplateTags(template, values), values);
+    return replaceTemplateTags(template, values);
   }
 
   function buildPages(pageCount, loadImages, pageSliceHeights = null) {
@@ -2777,40 +2727,43 @@ window.addEventListener("unhandledrejection", (event) => {
     window.__waviPdfProgress.stage = "building-pages";
     let pageCount = Math.max(1, Number(meta.initialPageCount) || 1);
     let structure = null;
-    for (let iteration = 0; iteration < 8; iteration += 1) {
+    let capacities = [];
+    const undecoratedCapacity = Math.max(1, meta.maxPageHeightPoints
+      - (meta.marginTopIn + meta.marginBottomIn) * 72);
+    // Start with the undecorated lower bound. Measure each page's actual bands,
+    // including first/last-only bands, before assigning contiguous image slices.
+    while (true) {
       structure = buildPages(pageCount, false);
       await settleLayout();
-      const measured = measurePages();
-      const fixedExtraPoints = (measured.maxFixedExtraPx / 96) * 72;
-      if (fixedExtraPoints >= meta.maxPageHeightPoints - 1) {
+      const layout = measurePages();
+      capacities = layout.fixedExtraPxByPage.map((extra) =>
+        meta.maxPageHeightPoints - extra * 72 / 96);
+      if (capacities.some((capacity) => capacity < 1)) {
         throw new Error("The configured Captured PNG margins/header/footer leave no usable vertical space at the selected height-to-width ratio.");
       }
-      const maxContentHeightPoints = Math.max(1, meta.maxPageHeightPoints - fixedExtraPoints);
-      const requiredPageCount = Math.max(1, Math.ceil((meta.totalContentHeightPoints - 1e-9) / maxContentHeightPoints));
-      if (requiredPageCount <= pageCount) break;
-      pageCount = requiredPageCount;
+      const deficit = meta.totalContentHeightPoints - capacities.reduce((a, b) => a + b, 0);
+      if (deficit <= 1e-7) break;
+      pageCount += Math.max(1, Math.ceil((deficit - 1e-7) / undecoratedCapacity));
     }
-
-    // Equal image slices leave blank paper wherever the first/last-only
-    // decorations are absent. Distribute content using each page's actual
-    // decoration height so the complete pages, rather than the slices, match.
-    structure = buildPages(pageCount, false);
-    await settleLayout();
-    const layout = measurePages();
-    let pageSliceHeights = null;
-    if (meta.firstLastOnly && meta.displayHeaderFooter && pageCount > 1) {
-      const extras = layout.fixedExtraPxByPage.map((px) => px * 72 / 96);
-      const commonHeightPoints = (meta.totalContentHeightPoints + extras.reduce((a, b) => a + b, 0)) / pageCount;
-      const heights = extras.map((extra) => (commonHeightPoints - extra) / meta.pointsPerCssPx);
-      // Extremely tall decorations can exceed a balanced page's entire height.
-      // Keep the existing safe layout in that case instead of losing content.
-      if (heights.every((height) => height > 0)) pageSliceHeights = heights;
-    }
+    let remainingPoints = meta.totalContentHeightPoints;
+    const pageSliceHeights = capacities.map((capacity, index) => {
+      // Keep a sliver for each later page if a large last-only footer caused
+      // the extra page. Otherwise fill every page and leave only the last short.
+      const reserve = Math.min(meta.pointsPerCssPx, remainingPoints / (pageCount - index))
+        * (pageCount - index - 1);
+      const height = Math.min(capacity, remainingPoints - reserve);
+      remainingPoints -= height;
+      return height / meta.pointsPerCssPx;
+    });
     structure = buildPages(pageCount, true, pageSliceHeights);
     await settleLayout();
     const measured = measurePages();
     const paperWidthIn = Math.max(0.01, measured.maxPageWidthPx / 96);
-    const paperHeightIn = Math.max(0.01, measured.maxPageHeightPx / 96);
+    const paperHeightIn = meta.maxPageHeightPoints / 72;
+    // Keep the selected paper ratio, including the partially filled final page.
+    for (const page of document.querySelectorAll(".page")) {
+      page.style.height = paperHeightIn + "in";
+    }
     if ((paperWidthIn * 72) > meta.maxPageDimensionPoints + 0.5 || (paperHeightIn * 72) > meta.maxPageHeightPoints + 0.5) {
       throw new Error("The generated Captured PNG PDF page size exceeded WAVI's configured page-dimension limit.");
     }
@@ -2902,8 +2855,6 @@ window.addEventListener("unhandledrejection", (event) => {
         "%url%", "%requested_url%", "%final_url%", "%domain%", "%title%",
         "%date%", "%time%", "%datetime%", "%utcdatetime%", "%case%", "%engine%", "%version%",
         "%page_number%", "%page_count%",
-        "%best_url%", "%page_title%", "%capture_utc%", "%capture_timestamp_utc%", "%capture_date_utc%",
-        "%capture_time_utc%", "%capture_local%", "%capture_timestamp_local%", "%capture_date_local%", "%capture_time_local%",
       ],
       image_delivery: "ephemeral_loopback_http",
       source_artifacts: sourceArtifacts.map((artifact) => ({
@@ -3278,7 +3229,7 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
   const captureMode = normalizePdfCaptureMode(config.pdf_capture_mode);
   const params = {
     landscape: Boolean(config.pdf_landscape),
-    displayHeaderFooter: Boolean(config.pdf_display_header_footer),
+    displayHeaderFooter: Boolean(config.pdf_display_header_footer) && Boolean(String(config.pdf_header_template || "").trim() || String(config.pdf_footer_template || "").trim()),
     printBackground: Boolean(config.pdf_print_background),
     scale: Number(config.pdf_scale) || 1,
     paperWidth: Number(config.pdf_paper_width_in) || 8.5,
@@ -3289,8 +3240,8 @@ async function capturePdf(client, config, outputFolder, baseName, pdfContext, ca
     marginRight: Number(config.pdf_margin_right_in) || 0,
     pageRanges: String(config.pdf_page_ranges || "").trim(),
     preferCSSPageSize: Boolean(config.pdf_prefer_css_page_size),
-    headerTemplate: renderPdfTemplate(config.pdf_header_template, pdfContext),
-    footerTemplate: renderPdfTemplate(config.pdf_footer_template, pdfContext),
+    headerTemplate: renderPdfTemplate(config.pdf_header_template, pdfContext) || "<div></div>",
+    footerTemplate: renderPdfTemplate(config.pdf_footer_template, pdfContext) || "<div></div>",
   };
   if (!params.pageRanges) delete params.pageRanges;
 
@@ -3838,12 +3789,93 @@ const INTERACTIVE_MEDIA_ROUTE_MARKERS = [
   "galleries", "album", "albums", "attachment", "attachments", "status", "statuses",
 ];
 
-function normalizeInteractiveCaptureScope(value) {
-  const scope = String(value || "overlay_only").trim();
-  if (["overlay_only", "viewport_only", "overlay_and_viewport"].includes(scope)) return scope;
-  return "overlay_only";
+function cookieBannerRoot(element) {
+  for(let node=element;node && node!==document.body && node!==document.documentElement;node=node.parentElement) {
+    const identity=[node.id,node.className,node.getAttribute('aria-label')].join(' ');
+    const text=String(node.innerText||'').slice(0,5000);
+    const positioned=['fixed','sticky'].includes(getComputedStyle(node).position);
+    const semantic=node.matches('dialog,[role="dialog"],[role="alertdialog"]');
+    if(/\bcookies?\b/i.test(text) && (positioned || semantic || /cookie|consent|onetrust|ot-sdk|trustarc|didomi/i.test(identity))
+      && node.querySelector('button,a,[role="button"]')) return node;
+  }
+  return null;
 }
-
+function cookieActionKind(label) {
+  const t=String(label||'').toLowerCase().trim().replace(/[.!]+$/,'').replace(/\s+/g,' ');
+  if(/^(reject(?: all| cookies| all cookies| optional cookies)?|decline(?: all| cookies)?|necessary(?: cookies)? only|essential(?: cookies)? only|only (?:necessary|essential)(?: cookies)?|continue without accepting)$/.test(t)) return 'reject';
+  if(/^(accept(?: all| cookies| all cookies)?|allow(?: all| cookies| all cookies)?|i agree|agree|accept and continue)$/.test(t)) return 'accept';
+  if(/^(ok(?:ay)?|got it|understood|dismiss|close|continue|close cookie (?:banner|notice))$/.test(t)) return 'dismiss';
+  return '';
+}
+function inspectCookieBannerDom(action, click, findRoot, classify) {
+  const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>2 && r.height>2 && r.bottom>0 && r.right>0 && r.top<innerHeight && r.left<innerWidth && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0.02 && !el.closest('[aria-hidden="true"]');};
+  const buttons=[...document.querySelectorAll('button,a,[role="button"],input[type="button"]')];
+  const roots=new Set();
+  for(const button of buttons) {if(visible(button)){const root=findRoot(button);if(root && visible(root)) roots.add(root);}}
+  if(!roots.size) return {status:'not_found',url:location.href};
+  const candidates=[];
+  for(const root of roots) for(const button of buttons) {
+    if(!root.contains(button) || !visible(button) || button.disabled || button.getAttribute('aria-disabled')==='true' || button.closest('form')) continue;
+    const label=String(button.getAttribute('aria-label')||button.innerText||button.value||button.title||((String(button.className||'').match(/(?:^|\s)(dismiss|close)(?:\s|$)/i)||[])[1])||'').trim();
+    const kind=classify(label),rank=kind===action?2:0;
+    if(!rank) continue;
+    const href=button.getAttribute('href');
+    if(href && href!=='#' && !/^javascript:\s*void\(0\);?$/i.test(href)) continue;
+    const r=button.getBoundingClientRect(),x=Math.max(1,Math.min(innerWidth-1,r.left+r.width/2)),y=Math.max(1,Math.min(innerHeight-1,r.top+r.height/2));
+    const hit=document.elementFromPoint(x,y);
+    if(!hit || !(hit===button || button.contains(hit))) continue;
+    candidates.push({button,root,label,kind,rank});
+  }
+  candidates.sort((a,b)=>b.rank-a.rank);
+  const selected=candidates[0];
+  if(!selected) return {status:'unresolved',reason:'selected_action_unavailable_or_obscured',url:location.href};
+  const result={status:click?'clicked':'available',label:selected.label,action:selected.kind,banner_id:selected.root.id||'',url:location.href};
+  if(click) selected.button.click();
+  return result;
+}
+async function inspectCookieBanner(client, action, click=false) {
+  return await evaluate(client,'('+inspectCookieBannerDom.toString()+')('+JSON.stringify(action)+','+JSON.stringify(click)+','+cookieBannerRoot.toString()+','+cookieActionKind.toString()+')');
+}
+async function handleCookieBanner(client, config, phase='before_capture') {
+  const action=config.cookie_banner?.action || 'leave';
+  if(action==='leave') return {status:'left_unchanged'};
+  if(!['accept','reject','dismiss'].includes(action)) throw new Error('Invalid cookie banner action.');
+  const events=config.cookie_banner_events || (config.cookie_banner_events=[]);
+  const actions = [action, ...(config.cookie_banner?.fallback === true
+    ? ['accept','reject','dismiss'].filter(value => value !== action) : [])];
+  let totalClicks=0;
+  for (const attemptedAction of actions) {
+    if (attemptedAction !== action) console.log('Cookie banner: trying fallback '+attemptedAction+'.');
+    const deadline=Date.now()+10000;
+    let clicks=0,absentSince=0,lastClick=0;
+    while(Date.now()<deadline) {
+      const result=await inspectCookieBanner(client,attemptedAction);
+      if(result.status==='not_found') {
+        if(!absentSince) absentSince=Date.now();
+        if(Date.now()-absentSince>=1000) {
+          const status=totalClicks?'dismissed':'not_found';
+          events.push({phase,status,observed_utc:nowIso()});
+          if(totalClicks) console.log('Cookie banner: dismissal verified.');
+          return {status};
+        }
+      } else {
+        absentSince=0;
+        if(result.status==='available' && clicks<3 && Date.now()-lastClick>=1500) {
+          const clicked=await inspectCookieBanner(client,attemptedAction,true);
+          if(clicked.status==='clicked') {
+            clicks++;totalClicks++;lastClick=Date.now();events.push({...clicked,phase,observed_utc:nowIso()});
+            console.log('Cookie banner: '+clicked.action+' using '+JSON.stringify(clicked.label));
+          }
+        }
+      }
+      await delay(200);
+    }
+    events.push({phase,status:'action_failed',requested_action:attemptedAction,observed_utc:nowIso()});
+  }
+  events.push({phase,status:'unresolved',requested_action:action,observed_utc:nowIso()});
+  console.log('Cookie banner: unresolved; capture stopped.');
+  throw new Error('Cookie banner could not be resolved using '+action+'. Choose another Cookie Banners action or Leave unchanged.');
+}
 function normalizeInteractiveRules(rules) {
   const allowed = new Set(["trigger", "overlay", "close", "next", "previous", "any"]);
   const output = [];
@@ -3900,8 +3932,8 @@ async function getInteractiveOverlayFingerprints(client, rules) {
       el.tagName, el.getAttribute("role"), el.getAttribute("aria-label"), el.getAttribute("aria-modal"),
       el.id, el.className, el.getAttribute("title"), el.getAttribute("aria-labelledby"),
       el.getAttribute("aria-describedby"), el.getAttribute("data-testid"), el.getAttribute("data-test"),
-      el.getAttribute("data-role"), el.getAttribute("data-state"), el.textContent
-    ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 1600);
+      el.getAttribute("data-role"), el.getAttribute("data-state"), el.innerText
+    ].map((value) => typeof value === "string" ? value : "").join(" ").slice(0, 2400);
     const visible = (el) => {
       if (!(el instanceof Element)) return false;
       const style = getComputedStyle(el); const rect = el.getBoundingClientRect();
@@ -3913,7 +3945,7 @@ async function getInteractiveOverlayFingerprints(client, rules) {
     }
     const output = [];
     for (const el of candidates) {
-      if (!visible(el)) continue;
+      if (el === document.body || el === document.documentElement || !visible(el)) continue;
       const desc = descriptor(el);
       const semantic = el.tagName === "DIALOG" || el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
       if (!semantic && TERMS.length && !TERMS.some((term) => termMatch(desc, term))) continue;
@@ -4017,7 +4049,7 @@ async function discoverInteractiveTrigger(client, config, processedFingerprints)
     const pageOrigin = location.origin;
     const ranked = [];
     for (const el of candidateElements) {
-      if (!visible(el)) continue;
+      if (el === document.body || el === document.documentElement || !visible(el)) continue;
       if (el.closest("form")) continue;
       if (el.matches("input,select,textarea") || el.getAttribute("type") === "submit" || el.getAttribute("type") === "reset") continue;
       if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
@@ -4320,7 +4352,7 @@ async function findInteractiveOverlay(client, config, baselineFingerprints) {
     }
     const ranked = [];
     for (const el of candidates) {
-      if (!visible(el)) continue;
+      if (el === document.body || el === document.documentElement || !visible(el)) continue;
       const desc = descriptor(el);
       if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
       const semantic = el.tagName === "DIALOG" || el.getAttribute("role") === "dialog" || el.getAttribute("aria-modal") === "true";
@@ -4365,39 +4397,75 @@ async function findInteractiveOverlay(client, config, baselineFingerprints) {
 }
 
 async function waitForInteractiveUrl(client, expectedUrl, timeoutSeconds = 10) {
-  const maximumMs = Math.max(1000, Math.min(30000, Number(timeoutSeconds || 10) * 1000));
+  const maximumMs = Math.max(3000, Math.min(30000, Number(timeoutSeconds || 10) * 1000));
   const started = Date.now();
+  let currentUrl = "";
   while (Date.now() - started < maximumMs) {
-    const currentUrl = await evaluate(client, "location.href");
-    if (currentUrl === expectedUrl) return { matched: true, elapsed_ms: Date.now() - started, current_url: currentUrl };
+    try {
+      currentUrl = await evaluate(client, "location.href");
+      if (currentUrl === expectedUrl) {
+        // SPA history changes precede the replacement of the viewer DOM. A URL
+        // match alone must never release the next candidate discovery cycle.
+        const stable = await waitForVisualStability(client, { network_quiet_ms: 2000 }, "navigation_return");
+        const state = await evaluate(client, "({url:location.href,ready:document.readyState})");
+        currentUrl = state.url;
+        if (stable.settled && currentUrl === expectedUrl && state.ready === "complete") {
+          return { matched: true, elapsed_ms: Date.now() - started, current_url: currentUrl, visual_stability: stable };
+        }
+      }
+    } catch { /* A full navigation may replace the execution context. */ }
     await delay(150);
   }
-  return { matched: false, elapsed_ms: Date.now() - started, current_url: await evaluate(client, "location.href") };
+  return { matched: false, elapsed_ms: Date.now() - started, current_url: currentUrl };
+}
+
+function itemNavigationType(settings = {}) {
+  return ['overlay','page'].includes(settings.item_type) ? settings.item_type : 'auto';
 }
 
 async function waitForInteractiveOpenResult(client, config, baselineFingerprints, originalUrl) {
-  const maximumMs = Math.max(1000, Math.min(60000, Number(config?.open_timeout_seconds || 10) * 1000));
-  const started = Date.now();
-  while (Date.now() - started < maximumMs) {
-    const overlay = await findInteractiveOverlay(client, config, baselineFingerprints);
-    if (overlay) {
-      return { kind: "overlay", opened: true, elapsed_ms: Date.now() - started, overlay, current_url: await evaluate(client, "location.href") };
-    }
-    const currentUrl = await evaluate(client, "location.href");
-    if (currentUrl && currentUrl !== originalUrl) {
-      let sameOrigin = false;
-      try { sameOrigin = new URL(currentUrl).origin === new URL(originalUrl).origin; } catch { sameOrigin = false; }
-      return {
-        kind: sameOrigin ? "route_navigation" : "cross_origin_navigation",
-        opened: false,
-        elapsed_ms: Date.now() - started,
-        overlay: null,
-        current_url: currentUrl,
-      };
-    }
+  const timeout=Math.max(1000,Math.min(60000,Number(config?.open_timeout_seconds || 10)*1000));
+  const started=Date.now(), type=itemNavigationType(config);
+  let stable='', since=0, lastUrl=originalUrl;
+  while(Date.now()-started<timeout) {
+    try {
+      const currentUrl=await evaluate(client,'location.href');
+      lastUrl=currentUrl || lastUrl;
+      if(currentUrl && new URL(currentUrl).origin!==new URL(originalUrl).origin)
+        return {kind:'cross_origin_navigation',opened:false,current_url:currentUrl,elapsed_ms:Date.now()-started};
+      const detected=type==='page'?null:await findInteractiveOverlay(client,config,baselineFingerprints);
+      const viewer=detected || (type!=='overlay' && currentUrl!==originalUrl ? {kind:'page',id:null} : null);
+      if(viewer) {
+        const snapshot=await inspectInteractiveViewer(client,config,viewer);
+        const key=JSON.stringify([viewer.kind || 'overlay',snapshot.url,snapshot.fingerprint,snapshot.geometry]);
+        if(snapshot.available && snapshot.ready && snapshot.fingerprint) {
+          if(stable!==key){stable=key;since=Date.now();}
+          // A URL change alone is never enough; require stable loaded item media.
+          if(Date.now()-since>=Math.min(timeout/2,Math.max(1000,Number(config.content_wait_ms)||0))) {
+            const page=viewer.kind==='page';
+            return {kind:page?'route_navigation':'overlay',opened:true,
+              overlay:page?null:viewer,viewer,snapshot,current_url:snapshot.url,elapsed_ms:Date.now()-started,
+              classification:type==='auto'?'automatic':'user_selected'};
+          }
+        } else {stable='';since=0;}
+      } else {stable='';since=0;}
+    } catch { stable='';since=0; /* document may be changing during navigation */ }
     await delay(150);
   }
-  return { kind: "timeout", opened: false, elapsed_ms: Date.now() - started, overlay: null, current_url: await evaluate(client, "location.href") };
+  return {kind:'timeout',opened:false,elapsed_ms:Date.now()-started,overlay:null,current_url:lastUrl};
+}
+
+// Composite close rules are literal alternatives, not user-supplied regex.
+function matchInteractiveCloseRule(text, rule) {
+  const groups = String(rule || '').match(/^\(([^()]+)\)\s*\+\s*\(([^()]+)\)$/);
+  if (!groups) return false;
+  const words = value => String(value || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const haystack = ' ' + words(text) + ' ';
+  const prefixes = groups[1].split('|').map(words).filter(Boolean);
+  const destinations = groups[2].split('|').map(words).filter(Boolean);
+  return prefixes.some(prefix => destinations.some(destination =>
+    ['', 'the ', 'my ', 'your '].some(article => haystack.includes(' ' + prefix + ' ' + article + destination + ' '))));
 }
 
 async function findInteractiveCloseControl(client, config, overlayId) {
@@ -4406,7 +4474,9 @@ async function findInteractiveCloseControl(client, config, overlayId) {
   const closeTerms = interactiveRulesForCategory(whitelist, "close");
   const blockedTerms = [...interactiveRulesForCategory(blacklist, "close"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
   return await evaluate(client, `(() => {
+    const cookieRoot = ${cookieBannerRoot.toString()};
     const CLOSE_TERMS = ${JSON.stringify(closeTerms)};
+    const matchComposite = ${matchInteractiveCloseRule.toString()};
     const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
     const overlay = document.querySelector('[data-wavi-interactive-overlay=${JSON.stringify(String(overlayId || ""))}]');
     if (!overlay) return null;
@@ -4433,9 +4503,12 @@ async function findInteractiveCloseControl(client, config, overlayId) {
     const ranked = [];
     for (const el of overlay.querySelectorAll("button,a,[role='button'],[tabindex]:not([tabindex='-1']),[onclick]")) {
       if (!visible(el) || el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
+      if (cookieRoot(el)) continue;
       const desc = descriptor(el);
       if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
-      const matched = CLOSE_TERMS.filter((term) => termMatch(desc, term));
+      const labels = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText];
+      const matched = CLOSE_TERMS.filter((term) => String(term).startsWith('(')
+        ? labels.some(label => matchComposite(label, term)) : termMatch(desc, term));
       if (!matched.length) continue;
       const rect = el.getBoundingClientRect();
       const upperRightBonus = rect.top < window.innerHeight * 0.35 && rect.left > window.innerWidth * 0.55 ? 5 : 0;
@@ -4461,7 +4534,9 @@ async function findInteractivePageCloseControl(client, config) {
   const closeTerms = interactiveRulesForCategory(whitelist, "close");
   const blockedTerms = [...interactiveRulesForCategory(blacklist, "close"), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
   return await evaluate(client, `(() => {
+    const cookieRoot = ${cookieBannerRoot.toString()};
     const CLOSE_TERMS = ${JSON.stringify(closeTerms)};
+    const matchComposite = ${matchInteractiveCloseRule.toString()};
     const BLOCKED_TERMS = ${JSON.stringify(blockedTerms)};
     const norm = (value) => String(value || "").replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
     const termMatch = (haystack, term) => {
@@ -4487,9 +4562,12 @@ async function findInteractivePageCloseControl(client, config) {
     for (const el of document.querySelectorAll("button,a,[role='button'],[tabindex]:not([tabindex='-1']),[onclick]")) {
       if (!visible(el) || el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") continue;
       if (el.closest("form")) continue;
+      if (cookieRoot(el)) continue;
       const desc = descriptor(el);
       if (BLOCKED_TERMS.some((term) => termMatch(desc, term))) continue;
-      const matched = CLOSE_TERMS.filter((term) => termMatch(desc, term));
+      const labels = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText];
+      const matched = CLOSE_TERMS.filter((term) => String(term).startsWith('(')
+        ? labels.some(label => matchComposite(label, term)) : termMatch(desc, term));
       if (!matched.length) continue;
       const rect = el.getBoundingClientRect();
       const upperRightBonus = rect.top < window.innerHeight * 0.35 && rect.left > window.innerWidth * 0.55 ? 8 : 0;
@@ -4842,95 +4920,33 @@ function renderInteractiveItemBaseName(config, fileNamingContext, itemNumber, me
   });
 }
 
-async function captureInteractiveOverlayArtifacts(client, config, outputFolder, baseName, itemNumber, overlay) {
-  const artifacts = [];
-  const captureScope = normalizeInteractiveCaptureScope(config?.capture_scope);
+async function captureInteractiveViewportArtifacts(client, outputFolder, baseName, itemNumber, captureMode = "viewport_only", config = {}) {
+  await handleCookieBanner(client, config, "interactive_item");
+  const viewportPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
+  // No clip, layout resizing, scrolling, stitching, or second representation.
+  // Browser viewport pixels include all currently visible overlay and page context.
+  const result = await client.send("Page.captureScreenshot", {
+    format: "png", fromSurface: true, captureBeyondViewport: false,
+  }, 120000);
+  const record = await writeCaptureImage(viewportPath, result.data);
+  return [{
+    kind: "interactive_viewport_png",
+    role: "interactive_viewport",
+    format: "png",
+    item: itemNumber,
+    path: viewportPath,
+    sha256: record.sha256,
+    size_bytes: record.bytes,
+    capture_mode: captureMode,
+  }];
+}
 
-  if (captureScope !== "viewport_only") {
-    const overlayPath = await uniqueOutputPath(outputFolder, `${baseName}_overlay`, ".png");
-    const overlayResult = await client.send("Page.captureScreenshot", {
-      format: "png",
-      fromSurface: true,
-      captureBeyondViewport: true,
-      clip: {
-        x: Math.max(0, Number(overlay.page_x) || 0),
-        y: Math.max(0, Number(overlay.page_y) || 0),
-        width: Math.max(1, Number(overlay.width) || 1),
-        height: Math.max(1, Number(overlay.height) || 1),
-        scale: 1,
-      },
-    }, 120000);
-    const overlayRecord = await writeCaptureImage(overlayPath, overlayResult.data);
-    artifacts.push({
-      kind: "interactive_overlay_png",
-      role: "interactive_overlay",
-      format: "png",
-      item: itemNumber,
-      path: overlayPath,
-      sha256: overlayRecord.sha256,
-      size_bytes: overlayRecord.bytes,
-      x_css_px: overlay.page_x,
-      y_css_px: overlay.page_y,
-      width_css_px: overlay.width,
-      height_css_px: overlay.height,
-      clipped_to_viewport: Boolean(overlay.clipped_to_viewport),
-      capture_mode: "overlay_clip",
-    });
-  }
-
-  if (captureScope !== "overlay_only") {
-    const viewportPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
-    const viewportResult = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true }, 120000);
-    const viewportRecord = await writeCaptureImage(viewportPath, viewportResult.data);
-    artifacts.push({
-      kind: "interactive_viewport_png",
-      role: "interactive_viewport",
-      format: "png",
-      item: itemNumber,
-      path: viewportPath,
-      sha256: viewportRecord.sha256,
-      size_bytes: viewportRecord.bytes,
-      capture_mode: captureScope === "viewport_only" ? "viewport_only" : "overlay_clip_with_viewport",
-    });
-  }
-  return artifacts;
+async function captureInteractiveOverlayArtifacts(client, config, outputFolder, baseName, itemNumber, _overlay) {
+  return await captureInteractiveViewportArtifacts(client, outputFolder, baseName, itemNumber, "viewport_only", config);
 }
 
 async function captureInteractiveRouteArtifacts(client, config, outputFolder, baseName, itemNumber) {
-  const artifacts = [];
-  const captureScope = normalizeInteractiveCaptureScope(config?.capture_scope);
-  const viewportResult = await client.send("Page.captureScreenshot", { format: "png", fromSurface: true }, 120000);
-
-  if (captureScope !== "viewport_only") {
-    const overlayPath = await uniqueOutputPath(outputFolder, `${baseName}_overlay`, ".png");
-    const overlayRecord = await writeCaptureImage(overlayPath, viewportResult.data);
-    artifacts.push({
-      kind: "interactive_overlay_png",
-      role: "interactive_overlay",
-      format: "png",
-      item: itemNumber,
-      path: overlayPath,
-      sha256: overlayRecord.sha256,
-      size_bytes: overlayRecord.bytes,
-      capture_mode: "route_viewport",
-    });
-  }
-
-  if (captureScope !== "overlay_only") {
-    const viewportPath = await uniqueOutputPath(outputFolder, `${baseName}_viewport`, ".png");
-    const viewportRecord = await writeCaptureImage(viewportPath, viewportResult.data);
-    artifacts.push({
-      kind: "interactive_viewport_png",
-      role: "interactive_viewport",
-      format: "png",
-      item: itemNumber,
-      path: viewportPath,
-      sha256: viewportRecord.sha256,
-      size_bytes: viewportRecord.bytes,
-      capture_mode: "route_viewport",
-    });
-  }
-  return artifacts;
+  return await captureInteractiveViewportArtifacts(client, outputFolder, baseName, itemNumber, "route_viewport", config);
 }
 
 async function restoreInteractiveScrollPosition(client, x, y) {
@@ -4943,7 +4959,10 @@ async function restoreInteractiveScrollPosition(client, x, y) {
 
 async function recoverInteractiveNavigation(client, originalUrl, timeoutSeconds = 10) {
   const current = await evaluate(client, "location.href");
-  if (!current || current === originalUrl) return { needed: false, recovered: true, current_url: current || originalUrl, method: "none" };
+  if (!current || current === originalUrl) {
+    const settled = await waitForInteractiveUrl(client, originalUrl, timeoutSeconds);
+    return { needed: false, recovered: settled.matched, current_url: settled.current_url, method: "none" };
+  }
   let sameOrigin = false;
   try { sameOrigin = new URL(current).origin === new URL(originalUrl).origin; } catch { sameOrigin = false; }
   if (!sameOrigin) return { needed: true, recovered: false, current_url: current, reason: "cross_origin_navigation", method: "none" };
@@ -4976,7 +4995,10 @@ async function dismissInteractiveRouteView(client, config, originalUrl, scrollSt
 function buildInteractiveCaptureReport(settings, state) {
   return {
     enabled: true,
-    capture_scope: normalizeInteractiveCaptureScope(settings.capture_scope),
+    cookie_banner_interactions: settings.cookie_banner_events || [],
+    item_navigation_type: itemNavigationType(settings),
+    browsing: interactiveBrowseSettings(settings),
+    maximum_items_enabled: state.maximum_items_enabled,
     maximum_items: state.maximum_items,
     maximum_candidate_attempts: state.maximum_candidate_attempts,
     maximum_consecutive_noncaptures: state.maximum_consecutive_noncaptures,
@@ -4993,6 +5015,8 @@ function buildInteractiveCaptureReport(settings, state) {
     scan_wait_ms: state.scan_wait_ms,
     stopped_reason: state.stopped_reason,
     report_in_progress: Boolean(state.report_in_progress),
+    error: String(state.error || ""),
+    incomplete: Boolean(state.error) && Number(state.captured_items)>0,
     records: state.records,
     warnings: state.warnings,
   };
@@ -5014,6 +5038,261 @@ function isWaviTemporaryPdfDocumentUrl(urlLike) {
   }
 }
 
+function parseInteractivePostedDatetime(raw, observedAt) {
+  const text=String(raw||'').trim();
+  const result={raw:text,value:null,precision:null,timezone:null,approximate:false};
+  const validDate = value => { const d=new Date(value+'T00:00:00Z'); return Number.isFinite(d.getTime()) && d.toISOString().slice(0,10)===value; };
+  if(/^\d{4}-\d{2}-\d{2}$/.test(text) && validDate(text)) return {...result,value:text,precision:'date'};
+  if(/^\d{10}(?:\d{3})?$/.test(text)) {
+    const d=new Date(Number(text)*(text.length===10?1000:1));
+    if(Number.isFinite(d.getTime())) return {...result,value:d.toISOString(),precision:'second',timezone:'UTC'};
+  }
+  const iso=text.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(:\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/i);
+  if(iso && validDate(iso[1])) {
+    const value=iso[1]+'T'+iso[2]+(iso[3]||'');
+    const suffix=iso[4]||'';
+    const d=new Date(value+(suffix||'Z'));
+    if(Number.isFinite(d.getTime()) && Number(iso[2].slice(0,2))<24 && Number(iso[2].slice(3))<60 && (!iso[3]||Number(iso[3].slice(1))<60))
+      return {...result,value:suffix?d.toISOString():value,precision:iso[3]?'second':'minute',timezone:suffix?'UTC':null};
+  }
+  const relative=text.match(/^(\d+(?:\.\d+)?|a|an)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?)\s+ago$/i);
+  if(relative && Number.isFinite(Date.parse(observedAt))) {
+    const amount=/^(a|an)$/i.test(relative[1])?1:Number(relative[1]);
+    const unit=relative[2].toLowerCase();
+    const seconds=unit.startsWith('s')?1:unit.startsWith('m')?60:unit.startsWith('h')?3600:unit.startsWith('d')?86400:604800;
+    const timestamp=Date.parse(observedAt)-amount*seconds*1000;
+    if(Number.isFinite(timestamp) && Number.isFinite(new Date(timestamp).getTime())) return {...result,value:new Date(timestamp).toISOString(),precision:'relative',timezone:'UTC',approximate:true,relative_unit:unit,observed_at:observedAt};
+  }
+  const months=['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const human=text.match(/^([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})$/) || text.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/)?.map((v,i,a)=>i===1?a[2]:i===2?a[1]:v);
+  if(human) {
+    const month=months.findIndex(m=>m===human[1].toLowerCase() || m.slice(0,3)===human[1].toLowerCase());
+    const value=`${human[3]}-${String(month+1).padStart(2,'0')}-${human[2].padStart(2,'0')}`;
+    if(month>=0 && validDate(value)) return {...result,value,precision:'date'};
+  }
+  return result;
+}
+
+function selectInteractivePostedDatetime(candidates, observedAt) {
+  const parsed=candidates.map(candidate=>({...parseInteractivePostedDatetime(candidate.raw,observedAt),source:candidate.source,rank:candidate.rank})).filter(c=>c.value);
+  if(!parsed.length) return {value:null,status:'unavailable',observed_at:observedAt,candidates};
+  // Prefer absolute machine-readable data. Never silently choose between
+  // conflicting dates at the same confidence level (e.g. post and comment).
+  parsed.sort((a,b)=>Number(a.approximate)-Number(b.approximate) || b.rank-a.rank);
+  const best=parsed[0];
+  const peers=parsed.filter(p=>p.approximate===best.approximate && p.rank===best.rank);
+  if(new Set(peers.map(p=>p.value)).size>1) return {value:null,status:'ambiguous',observed_at:observedAt,candidates};
+  return {...best,status:'extracted',observed_at:observedAt};
+}
+
+async function extractInteractivePostedDatetime(client, overlayId = null) {
+  const observedAt=nowIso();
+  try {
+    const candidates=await evaluate(client, `(() => {
+      let root;
+      if(${JSON.stringify(overlayId)}!==null) root=document.querySelector('[data-wavi-interactive-overlay=' + CSS.escape(${JSON.stringify(String(overlayId||''))}) + ']');
+      else {
+        const articles=[...document.querySelectorAll('main article,article')].filter(el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.top<innerHeight;});
+        const unique=[...new Set(articles)];
+        if(unique.length===1) root=unique[0];
+      }
+      if(!root) return [];
+      const values=[];
+      for(const el of root.querySelectorAll('time,[itemprop="datePublished"],[data-testid*="timestamp"],[class*="timestamp"]')) {
+        if(el.closest('[class*="comment"],[data-testid*="comment"],[role="comment"]')) continue;
+        if(el.getAttribute('itemprop')==='dateModified' || /\\b(updated|modified|edited)\\b/i.test([el.getAttribute('title'),el.getAttribute('aria-label')].join(' '))) continue;
+        const r=el.getBoundingClientRect(),style=getComputedStyle(el);
+        if(r.width<=0||r.height<=0||r.bottom<=0||r.top>=innerHeight||style.display==='none'||style.visibility==='hidden'||el.closest('[aria-hidden="true"]')) continue;
+        for(const [attribute,rank] of [['datetime',100],['content',90],['title',70],['aria-label',60]]) {
+          const raw=el.getAttribute(attribute);
+          if(raw) values.push({raw:raw.slice(0,300),source:el.tagName.toLowerCase()+'@'+attribute,rank});
+        }
+        const text=(el.innerText||'').trim();
+        if(text) values.push({raw:text.slice(0,300),source:el.tagName.toLowerCase()+':text',rank:50});
+        if(values.length>=30) break;
+      }
+      return values.slice(0,30);
+    })()`);
+    return {...selectInteractivePostedDatetime(candidates,observedAt),scope:overlayId?'active_overlay':'single_visible_article'};
+  } catch(error) {
+    return {value:null,status:'unavailable',observed_at:observedAt,error:String(error?.message||error)};
+  }
+}
+
+function interactiveBrowseSettings(settings = {}) {
+  return {
+    behaviour: ['Browse overlay items', 'Browse items'].includes(settings.behaviour) ? 'browse' : 'dismiss',
+    method: ['Next control', 'Right Arrow', 'Left Arrow'].includes(settings.advance_method) ? settings.advance_method : 'Right Arrow',
+    end_action: ['Dismiss and continue', 'Return and continue'].includes(settings.end_action) ? 'continue' : 'finish',
+    close_failure: settings.close_failure === 'Finish with warning' ? 'finish' : 'incomplete',
+    wait_ms: Math.max(1000, Math.min(60000, Number(settings.navigation_timeout_seconds || 10) * 1000)),
+  };
+}
+
+async function inspectInteractiveViewer(client, settings, overlay) {
+  const opts = interactiveBrowseSettings(settings);
+  const category = opts.method === 'Left Arrow' ? 'previous' : 'next';
+  const terms = interactiveRulesForCategory(normalizeInteractiveRules(settings.whitelist_rules), category);
+  const blocked = [...interactiveRulesForCategory(normalizeInteractiveRules(settings.blacklist_rules), category), ...IMMUTABLE_INTERACTIVE_BLOCK_TERMS];
+  return await evaluate(client, `(() => {
+    const pageViewer = ${JSON.stringify(overlay?.kind === 'page')};
+    const root = pageViewer ? document.body : document.querySelector('[data-wavi-interactive-overlay=' + CSS.escape(${JSON.stringify(String(overlay?.id || ''))}) + ']');
+    if (!root) return { available: false };
+    const visible = el => { const r=el.getBoundingClientRect(), s=getComputedStyle(el); return r.width>2 && r.height>2 && r.bottom>0 && r.top<innerHeight && r.right>0 && r.left<innerWidth && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0.02 && !el.closest('[aria-hidden="true"]'); };
+    const norm = text => String(text||'').replace(/([a-z0-9])([A-Z])/g,'$1 $2').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+    const matches = (text, term) => (' '+norm(text)+' ').includes(' '+norm(term)+' ');
+    const candidates = [...root.querySelectorAll('img,video')].filter(visible).map(el=>{
+      const r=el.getBoundingClientRect();
+      return { source: el.currentSrc || el.src || el.poster || '', area:r.width*r.height, ready:el.tagName==='IMG' ? el.complete && el.naturalWidth>0 : el.readyState>=2 };
+    }).filter(m=>m.source).sort((a,b)=>b.area-a.area);
+    const media = candidates[0];
+    const controls = [...root.querySelectorAll('button,a,[role="button"],[tabindex]')].filter(visible).filter(el=>!el.closest('form')).map(el=>{
+      const description=[el.getAttribute('aria-label'),el.title,el.id,el.className,el.getAttribute('data-testid'),el.innerText].join(' ');
+      if (${JSON.stringify(blocked)}.some(t=>matches(description,t)) || !${JSON.stringify(terms)}.some(t=>matches(description,t))) return null;
+      const r=el.getBoundingClientRect(), x=Math.max(1,Math.min(innerWidth-1,r.left+r.width/2)), y=Math.max(1,Math.min(innerHeight-1,r.top+r.height/2));
+      const hit=document.elementFromPoint(x,y);
+      const href=el.getAttribute('href');
+      let safeLink=true; try { if(href) safeLink=new URL(href,location.href).origin===location.origin && !/^javascript:/i.test(href); } catch {safeLink=false;}
+      return { description:description.slice(0,400), disabled:el.hasAttribute('disabled') || el.getAttribute('aria-disabled')==='true', x,y, clickable:safeLink && !!hit && (el===hit || el.contains(hit)) };
+    }).filter(Boolean);
+    const control=controls.find(c=>!c.disabled && c.clickable) || controls.find(c=>c.disabled) || null;
+    // Only explicit gallery counters are used, never numbers from general captions.
+    const counters=[...root.querySelectorAll('[aria-posinset][aria-setsize], [aria-roledescription="slide"], [class*="counter"], [data-testid*="counter"]')].filter(visible).map(el=>{
+      let position=Number(el.getAttribute('aria-posinset')), total=Number(el.getAttribute('aria-setsize'));
+      if(!(position>0 && total>=position)) {
+        const m=String(el.getAttribute('aria-label')||el.innerText||'').trim().match(/^(?:image |photo |slide )?(\\d+)\\s*(?:of|\\/)\\s*(\\d+)$/i);
+        if(m){position=Number(m[1]);total=Number(m[2]);}
+      }
+      return position>0 && total>=position ? {position,total} : null;
+    }).filter(Boolean);
+    const counter=counters.length===1 ? counters[0] : null;
+    const fingerprint=media ? JSON.stringify([media.source, counter?.position || null]) : '';
+    const atBoundary=counter && (${JSON.stringify(category)}==='previous' ? counter.position===1 : counter.position===counter.total);
+    const rect=root.getBoundingClientRect(), left=Math.max(0,rect.left), top=Math.max(0,rect.top);
+    const geometry={page_x:scrollX+left,page_y:scrollY+top,width:Math.max(1,Math.min(innerWidth,rect.right)-left),height:Math.max(1,Math.min(innerHeight,rect.bottom)-top),clipped_to_viewport:rect.left<0||rect.top<0||rect.right>innerWidth||rect.bottom>innerHeight};
+    return {available:visible(root), geometry, fingerprint, media_source:media?.source||'', ready:!!media?.ready && (!pageViewer || (document.readyState!=='loading' &&
+      media.area >= innerWidth*innerHeight*0.08 && (!candidates[1] || media.area > candidates[1].area*1.25))), url:location.href, counter, control,
+      confirmed_end: !!(atBoundary || (control?.disabled)), end_reason:atBoundary?'item_counter':control?.disabled?'disabled_navigation':''};
+  })()`);
+}
+
+async function advanceInteractiveViewer(client, settings, overlay, before) {
+  const opts = interactiveBrowseSettings(settings);
+  // Reinspect immediately before dispatch; never click stale coordinates.
+  const current = await inspectInteractiveViewer(client, settings, overlay);
+  if (!current.available || current.fingerprint !== before.fingerprint) return { reason: 'viewer_changed_before_navigation' };
+  if (current.confirmed_end) {
+    await delay(600);
+    const endCheck=await inspectInteractiveViewer(client,settings,overlay);
+    if(endCheck.fingerprint===current.fingerprint && endCheck.confirmed_end) return {reason:endCheck.end_reason,confirmed:true};
+    return {reason:'end_indicator_changed_unconfirmed'};
+  }
+  if (opts.method === 'Next control') {
+    if (!current.control?.clickable || current.control.disabled) return { reason: 'navigation_control_unavailable' };
+    await dispatchMouseClick(client, current.control);
+  } else {
+    const focused = await evaluate(client, `(() => {
+      const root=${JSON.stringify(overlay?.kind === 'page')} ? document.body : document.querySelector('[data-wavi-interactive-overlay=' + CSS.escape(${JSON.stringify(String(overlay.id))}) + ']');
+      if(!root) return false;
+      const active=document.activeElement;
+      if(active?.matches('input,textarea,select,[contenteditable="true"]')) return false;
+      if(!root.hasAttribute('tabindex')) root.setAttribute('tabindex','-1');
+      root.focus({preventScroll:true});
+      return document.activeElement===root;
+    })()`);
+    if (!focused) return { reason: 'viewer_focus_unavailable' };
+    const left = opts.method === 'Left Arrow';
+    for (const type of ['keyDown','keyUp']) await client.send('Input.dispatchKeyEvent', {
+      type, key:left?'ArrowLeft':'ArrowRight', code:left?'ArrowLeft':'ArrowRight', windowsVirtualKeyCode:left?37:39, nativeVirtualKeyCode:left?37:39,
+    },10000);
+  }
+  const deadline = Date.now() + opts.wait_ms;
+  let stable = '', since = 0;
+  while (Date.now() < deadline) {
+    let next;
+    try { next=await inspectInteractiveViewer(client,settings,overlay); }
+    catch { stable='';since=0;await delay(150);continue; }
+    if (!next.available) {
+      stable='';since=0;
+      if(overlay.kind!=='page') return {reason:'viewer_closed_during_navigation'};
+      await delay(150);continue;
+    }
+    if (new URL(next.url).origin !== new URL(before.url).origin) return { reason: 'cross_origin_navigation' };
+    if (next.ready && next.fingerprint && next.fingerprint !== before.fingerprint) {
+      const identity=JSON.stringify([next.url,next.fingerprint,next.geometry]);
+      if (identity !== stable) { stable = identity; since = Date.now(); }
+      if (Date.now() - since >= Math.min(opts.wait_ms/2,Math.max(1000,Number(settings.content_wait_ms)||0))) return { reason: 'changed', snapshot: next };
+    } else { stable = ''; since = 0; }
+    await delay(150);
+  }
+  return { reason: 'navigation_timeout_unconfirmed' };
+}
+
+async function browseInteractiveViewer(client, config, outputFolder, fileNamingContext, trigger, overlay, firstItem, remaining, onRecord) {
+  const settings = config.interactive_capture || {}, opts = interactiveBrowseSettings(settings);
+  const seen = new Set();
+  let lastRecord = null, reason = 'maximum_items_reached', confirmed = false;
+  for (let index=0; index<remaining; index++) {
+    const readiness = await waitForInteractiveMediaReady(client, {scope:overlay.kind==='page'?'page':'overlay',overlayId:overlay.id,
+      minimum_wait_ms:Number(settings.content_wait_ms)||0,timeout_ms:interactiveMediaReadyTimeoutMs(settings.content_wait_ms)});
+    const snapshot = await inspectInteractiveViewer(client, settings, overlay);
+    if (!snapshot.available || !snapshot.ready || !readiness.ready || !snapshot.fingerprint) { reason='viewer_item_not_ready'; break; }
+    if (seen.has(snapshot.fingerprint)) { reason='wraparound_detected'; confirmed=true; break; }
+    overlay={...overlay,...snapshot.geometry,page_url:snapshot.url};
+    const record={item:firstItem+index, trigger, opened:true, captured:false, dismissed:false, interaction_kind:overlay.kind==='page'?'route_navigation':'overlay',route_url:overlay.kind==='page'?snapshot.url:undefined,
+      overlay, media_readiness:readiness, viewer_fingerprint:snapshot.fingerprint, viewer_counter:snapshot.counter, artifacts:[]};
+    let images=[];
+    try {
+      record.filename_metadata=deriveInteractiveFilenameMetadata(index===0?trigger:{},snapshot.url,fileNamingContext.sourceUrl||'');
+      const name=renderInteractiveItemBaseName(config,fileNamingContext,record.item,record.filename_metadata);
+      record.posted_datetime=await extractInteractivePostedDatetime(client,overlay.id);
+      record.capture_started_utc=nowIso();
+      images=overlay.kind==='page'
+        ? await captureInteractiveRouteArtifacts(client,settings,outputFolder,name,record.item)
+        : await captureInteractiveOverlayArtifacts(client,settings,outputFolder,name,record.item,overlay);
+      record.capture_completed_utc=nowIso();
+      record.artifacts=images.map(a=>({kind:a.kind,path:basename(a.path),sha256:a.sha256,size_bytes:a.size_bytes,capture_mode:a.capture_mode}));
+      const after=await inspectInteractiveViewer(client,settings,overlay);
+      if(after.fingerprint!==snapshot.fingerprint || after.url!==snapshot.url) throw new Error('Viewer changed during capture; item association could not be confirmed.');
+      record.captured=true; record.status='captured'; seen.add(snapshot.fingerprint);
+      await onRecord(record,images); lastRecord=record;
+    } catch(error) {
+      record.status='capture_failed'; record.error=String(error?.message||error);
+      await onRecord(record,images); lastRecord=record; reason='viewer_capture_failed'; break;
+    }
+    if(snapshot.confirmed_end){
+      await delay(600);
+      const endCheck=await inspectInteractiveViewer(client,settings,overlay);
+      if(endCheck.fingerprint===snapshot.fingerprint && endCheck.confirmed_end){reason=endCheck.end_reason;confirmed=true;break;}
+    }
+    if(index+1>=remaining) break;
+    const advanced=await advanceInteractiveViewer(client,settings,overlay,snapshot);
+    if(advanced.confirmed){reason=advanced.reason;confirmed=true;break;}
+    if(!advanced.snapshot){reason=advanced.reason;break;}
+    if(seen.has(advanced.snapshot.fingerprint)){reason='wraparound_detected';confirmed=true;break;}
+  }
+  let continueCapture=false, warning='';
+  if(confirmed && opts.end_action==='continue') {
+    const dismissal=overlay.kind==='page'
+      ? await dismissInteractiveRouteView(client,settings,trigger.page_url_before,{x:trigger.scroll_x_before,y:trigger.scroll_y_before})
+      : await dismissInteractiveOverlay(client,settings,overlay);
+    if(lastRecord){lastRecord.dismissal=dismissal;lastRecord.dismissed=!!dismissal.closed;}
+    continueCapture=!!dismissal.closed;
+    if(!continueCapture) {
+      warning='Viewer end was confirmed, but dismissal failed.';
+      if(opts.close_failure==='incomplete'){confirmed=false;reason='viewer_end_dismissal_failed';}
+    }
+  }
+  if(!confirmed && reason!=='maximum_items_reached') warning=warning || `Viewer browsing stopped without a confirmed end: ${reason}.`;
+  if(lastRecord) lastRecord.viewer_completion={confirmed_end:confirmed,reason,continue_capture:continueCapture};
+  return {reason,confirmed,continueCapture,warning};
+}
+
+function interactiveMaximumItems(settings) {
+  return settings.maximum_items_enabled === false
+    ? Infinity : Math.max(1, Math.min(500, Number(settings.maximum_items) || 25));
+}
+
 async function performInteractiveOverlayCapture(client, config, outputFolder, baseName, fileNamingContext = {}) {
   const settings = config?.interactive_capture || {};
   if (!settings.enabled) {
@@ -5024,13 +5303,13 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       warnings: [],
       captured_items: 0,
       processed_candidates: 0,
-      note: "Interactive overlay capture was disabled.",
+      note: "Item Navigation and Capture was disabled.",
     };
   }
 
   const interactiveStartUrl = await evaluate(client, "location.href");
   if (isWaviTemporaryPdfDocumentUrl(interactiveStartUrl)) {
-    const warning = "Interactive overlay capture was skipped because Chromium was on WAVI's temporary Captured PNG PDF document instead of the live source page.";
+    const warning = "Item Navigation and Capture was skipped because Chromium was on WAVI's temporary Captured PNG PDF document instead of the live source page.";
     console.log(warning);
     return {
       enabled: true,
@@ -5046,8 +5325,9 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
     };
   }
 
-  const maximumItems = Math.max(1, Math.min(500, Number(settings.maximum_items) || 25));
-  const maximumCandidateAttempts = Math.max(maximumItems, Math.min(1000, Math.max(40, maximumItems * 8)));
+  const maximumItems = interactiveMaximumItems(settings);
+  const itemLimitEnabled = Number.isFinite(maximumItems);
+  const maximumCandidateAttempts = itemLimitEnabled ? Math.max(maximumItems, Math.min(1000, Math.max(40, maximumItems * 8))) : Infinity;
   const maximumConsecutiveNonCaptures = Math.max(5, Math.min(25, Math.ceil(Math.max(maximumItems, 10) / 2)));
   const contentWaitMs = Math.max(0, Math.min(30000, Number(settings.content_wait_ms) || 0));
   const scanStepPercent = Math.max(25, Math.min(100, Number(settings.scan_step_percent) || 75));
@@ -5063,11 +5343,14 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
   let consecutiveNonCaptures = 0;
   let scanSteps = 0;
   let reachedEnd = false;
+  let idleScanSteps = 0;
   let stoppedReason = "no_more_matching_items";
+  let browsingError = "";
 
   const persist = async (reportInProgress = true) => await persistInteractiveCaptureReport(reportPath, settings, {
-    maximum_items: maximumItems,
-    maximum_candidate_attempts: maximumCandidateAttempts,
+    maximum_items_enabled: itemLimitEnabled,
+    maximum_items: itemLimitEnabled ? maximumItems : null,
+    maximum_candidate_attempts: Number.isFinite(maximumCandidateAttempts) ? maximumCandidateAttempts : null,
     maximum_consecutive_noncaptures: maximumConsecutiveNonCaptures,
     captured_items: capturedItems,
     processed_candidates: processed.size,
@@ -5076,21 +5359,22 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
     scan_steps: scanSteps,
     scan_wait_ms: scanWaitMs,
     stopped_reason: stoppedReason,
+    error: browsingError,
     report_in_progress: reportInProgress,
     records,
     warnings,
   });
 
   console.log(
-    `Interactive overlay capture started: maximum ${maximumItems} capture(s), ` +
-    `${maximumCandidateAttempts} candidate attempt(s), stop after ${maximumConsecutiveNonCaptures} consecutive non-captures.`
+    `Item Navigation and Capture started: ${itemLimitEnabled ? "maximum " + maximumItems + " capture(s)" : "all available items"}, ` +
+    `${itemLimitEnabled ? maximumCandidateAttempts : "unlimited"} candidate attempt(s), stop after ${maximumConsecutiveNonCaptures} consecutive non-captures.`
   );
   await persist(true);
 
   await evaluate(client, "window.scrollTo(0, 0); true");
   await delay(250);
 
-  while (capturedItems < maximumItems && scanSteps <= 250 && attemptedCandidates < maximumCandidateAttempts) {
+  while (capturedItems < maximumItems && (!itemLimitEnabled || scanSteps <= 250) && attemptedCandidates < maximumCandidateAttempts) {
     const trigger = await discoverInteractiveTrigger(client, settings, processed);
     if (!trigger) {
       const scan = await evaluate(client, `(() => {
@@ -5105,8 +5389,15 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       if (scanSteps <= 5 || scanSteps % 10 === 0) {
         console.log(`Interactive scan step ${scanSteps}: no matching trigger in the current view; scrolling for more items.`);
       }
-      if (scan?.at_end && Math.abs(Number(scan.next) - Number(scan.before)) < 2) {
-        reachedEnd = true;
+      const stationary = Math.abs(Number(scan?.next) - Number(scan?.before)) < 2;
+      idleScanSteps = stationary ? idleScanSteps + 1 : 0;
+      if (idleScanSteps >= 3) {
+        if (scan?.at_end) reachedEnd = true;
+        else {
+          stoppedReason = "page_scan_stalled";
+          browsingError = "Page scanning stopped making progress before reaching the end.";
+          warnings.push(browsingError);
+        }
         break;
       }
       if (scanSteps <= 3 || scanSteps % 10 === 0) await persist(true);
@@ -5114,6 +5405,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       continue;
     }
 
+    idleScanSteps = 0;
     attemptedCandidates += 1;
     processed.add(trigger.fingerprint);
     const itemRecord = {
@@ -5145,7 +5437,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       await persist(true);
       if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
         stoppedReason = "maximum_consecutive_noncaptures_reached";
-        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        warnings.push(`Item Navigation and Capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
         break;
       }
       continue;
@@ -5163,7 +5455,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       await persist(true);
       if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
         stoppedReason = "maximum_consecutive_noncaptures_reached";
-        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        warnings.push(`Item Navigation and Capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
         break;
       }
       continue;
@@ -5172,13 +5464,33 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
     const opened = await waitForInteractiveOpenResult(client, settings, baseline, trigger.page_url_before);
     itemRecord.open_wait_ms = opened.elapsed_ms;
 
+    itemRecord.navigation_classification = opened.classification || '';
+    console.log('Item Navigation and Capture: '+opened.kind+' ('+itemNavigationType(settings)+').');
+    if ((opened.kind === "overlay" || opened.kind === "route_navigation") && opened.viewer && interactiveBrowseSettings(settings).behaviour === 'browse') {
+      const result = await browseInteractiveViewer(client, config, outputFolder, fileNamingContext, trigger,
+        opened.viewer, capturedItems + 1, maximumItems - capturedItems, async (record, images) => {
+          record.navigation_classification=opened.classification;
+          record.candidate=records.length+1;
+          records.push(record); artifacts.push(...images);
+          if(record.captured){capturedItems++;consecutiveNonCaptures=0;}
+          await persist(true);
+          console.log(`Interactive viewer item ${record.item}: ${record.status}.`);
+        });
+      if(result.warning) warnings.push(result.warning);
+      if(!result.confirmed && result.reason!=="maximum_items_reached") browsingError=`Interactive viewer incomplete: ${result.reason}`;
+      console.log(`Interactive viewer stopped: ${result.reason}; confirmed end: ${result.confirmed}.`);
+      await persist(true);
+      if(result.continueCapture){await delay(250);continue;}
+      stoppedReason=result.confirmed ? 'viewer_end_confirmed' : result.reason;
+      break;
+    }
+
     if (opened.kind === "overlay" && opened.overlay) {
       itemRecord.opened = true;
       itemRecord.interaction_kind = "overlay";
       itemRecord.overlay = opened.overlay;
       console.log(`Interactive candidate ${itemRecord.candidate}: overlay detected.`);
-      const refreshedOverlay = await findInteractiveOverlay(client, settings, []);
-      const activeOverlay = refreshedOverlay || opened.overlay;
+      const activeOverlay = opened.overlay;
       itemRecord.media_readiness = await waitForInteractiveMediaReady(client, {
         scope: "overlay",
         overlayId: activeOverlay?.id,
@@ -5206,9 +5518,12 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
           itemRecord.item,
           itemRecord.filename_metadata,
         );
+        itemRecord.posted_datetime = await extractInteractivePostedDatetime(client, activeOverlay.id);
+        itemRecord.capture_started_utc = nowIso();
         const itemArtifacts = await captureInteractiveOverlayArtifacts(
           client, settings, outputFolder, interactiveBaseName, itemRecord.item, activeOverlay,
         );
+        itemRecord.capture_completed_utc = nowIso();
         artifacts.push(...itemArtifacts);
         itemRecord.artifacts = itemArtifacts.map((artifact) => ({
           kind: artifact.kind,
@@ -5221,7 +5536,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
         itemRecord.status = "captured";
         capturedItems += 1;
         consecutiveNonCaptures = 0;
-        console.log(`Interactive candidate ${itemRecord.candidate}: overlay captured.`);
+        console.log(`Interactive candidate ${itemRecord.candidate}: interactive viewport captured.`);
       } catch (error) {
         itemRecord.status = "capture_failed";
         itemRecord.error = String(error?.message || error);
@@ -5278,9 +5593,12 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
           itemRecord.item,
           itemRecord.filename_metadata,
         );
+        itemRecord.posted_datetime = await extractInteractivePostedDatetime(client);
+        itemRecord.capture_started_utc = nowIso();
         const itemArtifacts = await captureInteractiveRouteArtifacts(
           client, settings, outputFolder, interactiveBaseName, itemRecord.item,
         );
+        itemRecord.capture_completed_utc = nowIso();
         artifacts.push(...itemArtifacts);
         itemRecord.artifacts = itemArtifacts.map((artifact) => ({
           kind: artifact.kind,
@@ -5314,6 +5632,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
         warnings.push(`Interactive candidate ${itemRecord.candidate} route view could not be dismissed safely; automatic overlay capture stopped.`);
         console.log(`Interactive candidate ${itemRecord.candidate}: route view could not be dismissed safely.`);
         stoppedReason = "route_close_failed";
+        browsingError = "The source page could not be restored after capturing an item.";
         await persist(true);
         break;
       }
@@ -5340,7 +5659,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       await persist(true);
       if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
         stoppedReason = "maximum_consecutive_noncaptures_reached";
-        warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+        warnings.push(`Item Navigation and Capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
         break;
       }
       continue;
@@ -5366,32 +5685,32 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
     await persist(true);
     if (consecutiveNonCaptures >= maximumConsecutiveNonCaptures) {
       stoppedReason = "maximum_consecutive_noncaptures_reached";
-      warnings.push(`Interactive overlay capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
+      warnings.push(`Item Navigation and Capture stopped after ${consecutiveNonCaptures} consecutive non-captures.`);
       break;
     }
   }
 
-  if (capturedItems >= maximumItems) stoppedReason = "maximum_items_reached";
+  if (capturedItems >= maximumItems && stoppedReason !== "viewer_end_confirmed" && !browsingError) stoppedReason = "maximum_items_reached";
   else if (attemptedCandidates >= maximumCandidateAttempts && stoppedReason === "no_more_matching_items") stoppedReason = "maximum_candidate_attempts_reached";
   else if (reachedEnd && stoppedReason === "no_more_matching_items") stoppedReason = "end_of_page_reached";
-  if (scanSteps > 250) stoppedReason = "maximum_scan_steps_reached";
+  if (itemLimitEnabled && scanSteps > 250) stoppedReason = "maximum_scan_steps_reached";
 
   const unsuccessfulCandidates = records.filter((record) => !record.captured).length;
   if (capturedItems === 0) {
-    warnings.push("Interactive overlay capture produced no overlay images; no safely matching item opened a supported overlay or route view.");
+    warnings.push("Item Navigation and Capture produced no overlay images; no safely matching item opened a supported overlay or route view.");
   } else if (unsuccessfulCandidates > 0) {
     warnings.push(
-      `Interactive overlay capture skipped or could not capture ${unsuccessfulCandidates} of ${records.length} processed candidate(s); review the interaction report.`
+      `Item Navigation and Capture skipped or could not capture ${unsuccessfulCandidates} of ${records.length} processed candidate(s); review the interaction report.`
     );
   }
   if (stoppedReason === "maximum_scan_steps_reached") {
-    warnings.push("Interactive overlay capture reached its bounded page-scan limit before confirming the end of the page.");
+    warnings.push("Item Navigation and Capture reached its bounded page-scan limit before confirming the end of the page.");
   }
   if (stoppedReason === "maximum_candidate_attempts_reached") {
-    warnings.push("Interactive overlay capture reached its bounded candidate-attempt limit before reaching the maximum item count.");
+    warnings.push("Item Navigation and Capture reached its bounded candidate-attempt limit before reaching the maximum item count.");
   }
   if (stoppedReason === "maximum_consecutive_noncaptures_reached") {
-    warnings.push("Interactive overlay capture stopped after too many consecutive non-captures.");
+    warnings.push("Item Navigation and Capture stopped after too many consecutive non-captures.");
   }
 
   try {
@@ -5413,13 +5732,14 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
     size_bytes: reportInfo.size,
   });
   console.log(
-    `Interactive overlay capture finished: ${capturedItems} capture(s) from ${records.length} processed candidate(s); ` +
+    `Item Navigation and Capture finished: ${capturedItems} capture(s) from ${records.length} processed candidate(s); ` +
     `stop reason: ${String(stoppedReason || "unknown").replaceAll("_", " ")}.`
   );
   return {
     ...buildInteractiveCaptureReport(settings, {
-      maximum_items: maximumItems,
-      maximum_candidate_attempts: maximumCandidateAttempts,
+      maximum_items_enabled: itemLimitEnabled,
+      maximum_items: itemLimitEnabled ? maximumItems : null,
+      maximum_candidate_attempts: Number.isFinite(maximumCandidateAttempts) ? maximumCandidateAttempts : null,
       maximum_consecutive_noncaptures: maximumConsecutiveNonCaptures,
       captured_items: capturedItems,
       processed_candidates: processed.size,
@@ -5428,6 +5748,7 @@ async function performInteractiveOverlayCapture(client, config, outputFolder, ba
       scan_steps: scanSteps,
       scan_wait_ms: scanWaitMs,
       stopped_reason: stoppedReason,
+      error: browsingError,
       report_in_progress: false,
       records,
       warnings,
@@ -5700,6 +6021,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       `visual ${readinessInfo.visual_stability?.settled ? "stable" : "not stable"}.`
     );
 
+    config.cookie_banner_events = [];
+    await handleCookieBanner(client, config, 'page_loaded');
+    if(config.interactive_capture) {
+      config.interactive_capture.cookie_banner = config.cookie_banner;
+      config.interactive_capture.cookie_banner_events = config.cookie_banner_events;
+    }
     const captureMode = normalizeCaptureMode(config.capture_mode);
     let pageInfo = await evaluate(client, `({
       title: document.title || "",
@@ -5843,6 +6170,13 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
     } finally {
       stabilizationCleanup = await cleanupCaptureStabilization(client);
     }
+    // Freeze the source response before navigation and temporary PDF documents
+    // add their own Document responses to the same diagnostic stream.
+    const mainDocumentEntry = [...networkState.documentResponses].reverse().find(
+      entry => (entry.response?.url || entry.url) === (pageInfo.final_url || url)
+    ) || {};
+    const mainResponse = mainDocumentEntry.response || mainDocumentEntry || {};
+
     // Interactive capture must run while Chromium is still on the live source page.
     // Captured PNG PDF generation may navigate to WAVI's temporary loopback /document page.
     if (config.interactive_capture?.enabled) {
@@ -5857,12 +6191,12 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         }
         if ((interactiveCapture.warnings || []).length) warningReasons.push("interactive_capture_warning");
         console.log(
-          `Interactive overlay capture: ${Number(interactiveCapture.captured_items) || 0} captured from ` +
+          `Item Navigation and Capture: ${Number(interactiveCapture.captured_items) || 0} captured from ` +
           `${Number(interactiveCapture.processed_candidates) || 0} candidate(s); stop reason: ` +
           `${String(interactiveCapture.stopped_reason || "unknown").replaceAll("_", " ")}.`,
         );
       } catch (error) {
-        const message = `Interactive overlay capture failed: ${error.message || error}`;
+        const message = `Item Navigation and Capture failed: ${error.message || error}`;
         interactiveCapture = {
           enabled: true,
           artifacts: [],
@@ -5932,10 +6266,6 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       }
     }
 
-    const mainDocumentEntry = networkState.documentResponses.length
-      ? networkState.documentResponses[networkState.documentResponses.length - 1]
-      : {};
-    const mainResponse = mainDocumentEntry.response || mainDocumentEntry || {};
 
     const supplementalEvidence = await captureSupplementalEvidence(client, config, {
       folder: runContext.webMediaFolder,
@@ -5973,7 +6303,9 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       requestedArtifactErrors.push({ artifact: "pdf", error: pdfError });
     }
     requestedArtifactErrors.push(...supplementalEvidence.errors);
-    if (interactiveCapture.error) {
+    if (interactiveCapture.error && interactiveCapture.incomplete) {
+      partialReasons.push("interactive_viewer_incomplete");
+    } else if (interactiveCapture.error) {
       requestedArtifactErrors.push({ artifact: "interactive_overlay_capture", error: interactiveCapture.error });
     }
     const captureCompleteness = buildCaptureCompleteness(
@@ -6064,6 +6396,7 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       },
       capture_completeness: captureCompleteness,
       readiness: readinessInfo,
+      cookie_banner_interactions: config.cookie_banner_events || [],
       load_timeout_seconds: Number(config.page_load_timeout_seconds) || 45,
       additional_wait_seconds: Number(config.additional_wait_seconds) || 0,
       proxy_used: Boolean(config.proxy_server),
@@ -6079,8 +6412,8 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
       },
       interactive_capture: {
         enabled: Boolean(config.interactive_capture?.enabled),
-        capture_scope: normalizeInteractiveCaptureScope(config.interactive_capture?.capture_scope),
-        maximum_items: Math.max(1, Math.min(500, Number(config.interactive_capture?.maximum_items) || 25)),
+        maximum_items_enabled: config.interactive_capture?.maximum_items_enabled !== false,
+        maximum_items: config.interactive_capture?.maximum_items_enabled === false ? null : interactiveMaximumItems(config.interactive_capture || {}),
         open_timeout_seconds: Math.max(1, Math.min(60, Number(config.interactive_capture?.open_timeout_seconds) || 10)),
         content_wait_ms: Math.max(0, Math.min(30000, Number(config.interactive_capture?.content_wait_ms) || 0)),
         close_timeout_seconds: Math.max(1, Math.min(30, Number(config.interactive_capture?.close_timeout_seconds) || 5)),
@@ -6097,12 +6430,14 @@ async function captureUrl(client, config, url, index, browserVersion, runContext
         record_count: Array.isArray(interactiveCapture.records) ? interactiveCapture.records.length : 0,
         warnings: Array.isArray(interactiveCapture.warnings) ? interactiveCapture.warnings : [],
         error: String(interactiveCapture.error || ""),
+        incomplete: Boolean(interactiveCapture.incomplete),
+        browsing: interactiveBrowseSettings(config.interactive_capture),
         report_created: Array.isArray(interactiveCapture.artifacts) && interactiveCapture.artifacts.some(
           (artifact) => artifact.kind === "interactive_capture_report_json",
         ),
         note: config.interactive_capture?.enabled
           ? "Candidate controls were selected using the packaged editable whitelist and blacklist plus immutable high-risk action exclusions; user-entered CSS selectors were not required."
-          : "Interactive overlay capture was disabled.",
+          : "Item Navigation and Capture was disabled.",
       },
       evidence_outputs: {
         requested: supplementalEvidence.requested,
@@ -6212,6 +6547,7 @@ async function launchBrowser(config) {
     "--no-default-browser-check",
     "--disable-sync",
     "--disable-background-networking",
+    "--disable-background-mode",
     "--disable-component-update",
     "--disable-default-apps",
     "--disable-extensions",
@@ -6246,8 +6582,9 @@ async function launchBrowser(config) {
   });
   diagnostics.statusPromise = statusPromise;
   let client = null;
+  let port = null;
   try {
-    const port = await waitForDevTools(config.profile_root, statusPromise, Number(config.browser_start_timeout_seconds || 20) * 1000);
+    port = await waitForDevTools(config.profile_root, statusPromise, Number(config.browser_start_timeout_seconds || 20) * 1000);
     const pageTarget = await getPageTarget(port);
     client = await connectWebSocket(pageTarget.webSocketDebuggerUrl, 15000);
     client.setBrowserDiagnostics(diagnostics);
@@ -6255,13 +6592,23 @@ async function launchBrowser(config) {
     return { child, statusPromise, port, client, version, diagnostics };
   } catch (error) {
     // main() cannot own this child until launchBrowser returns successfully.
-    await closeBrowser({ child, statusPromise, client, diagnostics });
-    throw error;
+    try { await closeBrowser({ child, statusPromise, client, port, diagnostics }); }
+    catch (cleanupError) { console.log(`WARNING: Browser startup cleanup: ${String(cleanupError?.message || cleanupError)}`); }
+    const stderr = normalizeDiagnosticText(diagnostics.stderr_tail || "", 4000);
+    throw new Error(`${String(error?.message || error)}\nBrowser executable: ${config.browser_path}\nBrowser stderr: ${stderr || '(no diagnostic output received)'}`);
   }
 }
 
 async function closeBrowser(browser) {
   if (!browser) return;
+  if (!browser.client && browser.port) {
+    // If startup reached DevTools but no page connected, close this browser via
+    // its browser endpoint rather than relying on an already-exited launcher.
+    try {
+      const version = await getBrowserVersion(browser.port);
+      if (version.webSocketDebuggerUrl) browser.client = await connectWebSocket(version.webSocketDebuggerUrl, 2000);
+    } catch { /* fall through to child shutdown */ }
+  }
   if (!browser.client) {
     try { browser.child.kill("SIGTERM"); } catch { /* already exited */ }
   }
@@ -6280,6 +6627,17 @@ async function closeBrowser(browser) {
   if (!exited) {
     try { browser.child.kill("SIGTERM"); } catch { /* ignore */ }
     await Promise.race([browser.statusPromise.catch(() => {}), delay(3000)]);
+  }
+  if (browser.port) {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${browser.port}/json/version`, { signal: AbortSignal.timeout(300) });
+        if (!response.ok) break;
+        await response.body?.cancel();
+      } catch { break; }
+      await delay(100);
+    }
   }
   if (browser.diagnostics?.stderrPromise) {
     try { await Promise.race([browser.diagnostics.stderrPromise, delay(1000)]); } catch { /* ignore */ }
@@ -6310,8 +6668,69 @@ async function loadConfig() {
   return config;
 }
 
+// Report mode reuses the isolated browser, CDP navigation and streamed PDF writer.
+async function generateGalleryReport(config) {
+  let browser = null;
+  let server = null;
+  let cancelled = false;
+  let timer = null;
+  let cancellationRunning = false;
+  try {
+    const allowed = new Map([
+      ['/report.html', { path: joinPath(config.report_root, 'report.html'), type: 'text/html; charset=utf-8' }],
+      ...config.report_images.map((name) => {
+        if (!/^image-\d+\.png$/.test(name)) throw new Error('Invalid report image name.');
+        return ['/' + name, { path: joinPath(config.report_root, name), type: 'image/png' }];
+      }),
+    ]);
+    server = Deno.serve({ hostname: '127.0.0.1', port: 0, onListen() {} }, async (request) => {
+      const asset = allowed.get(new URL(request.url).pathname);
+      if (!asset || request.method !== 'GET') return new Response('Not found', { status: 404 });
+      try {
+        const file = await Deno.open(asset.path, { read: true });
+        return new Response(file.readable, { headers: { 'Content-Type': asset.type, 'Cache-Control': 'no-store' } });
+      } catch { return new Response('Not found', { status: 404 }); }
+    });
+    browser = await launchBrowser(config);
+    timer = setInterval(async () => {
+      if (cancellationRunning) return;
+      try { await Deno.stat(config.report_cancel); } catch { return; }
+      cancelled = true;
+      cancellationRunning = true;
+      // Closing our isolated browser interrupts an outstanding print command.
+      await closeBrowser(browser);
+    }, 200);
+    try { await Deno.stat(config.report_cancel); cancelled = true; } catch { /* continue */ }
+    if (cancelled) throw new Error('Report cancelled.');
+    await browser.client.send('Page.enable');
+    await browser.client.send('Emulation.setEmulatedMedia', { media: 'print' });
+    const info = await navigateToPaginatedPdfDocument(browser.client, `http://127.0.0.1:${server.addr.port}/report.html`);
+    if (cancelled) throw new Error('Report cancelled.');
+    if (info.page_count !== (config.report_page_count || config.report_images.length)) throw new Error('Report page count mismatch.');
+    await streamPdfToAtomicFile(browser.client, config.report_output, {
+      landscape: false, printBackground: true, displayHeaderFooter: false,
+      paperWidth: Number(config.report_paper_width) || 8.5, paperHeight: Number(config.report_paper_height) || 11, marginTop: 0, marginBottom: 0,
+      marginLeft: 0, marginRight: 0, preferCSSPageSize: true, scale: 1,
+    });
+    if (cancelled) throw new Error('Report cancelled.');
+    console.log(`REPORT_COMPLETE\t${info.page_count}\t${config.report_output}`);
+    return 0;
+  } finally {
+    if (timer !== null) clearInterval(timer);
+    // Cleanup is secondary to the render result, including cancellation/errors.
+    try { await closeBrowser(browser); }
+    catch (error) { console.log(`WARNING: Report browser shutdown: ${String(error?.message || error)}`); }
+    try { if (server) await server.shutdown(); }
+    catch (error) { console.log(`WARNING: Report server shutdown: ${String(error?.message || error)}`); }
+    if (!await removeProfile(config.profile_root)) {
+      console.log(`WARNING: Report browser profile is still in use; GUI cleanup will retry: ${config.profile_root}`);
+    }
+  }
+}
+
 async function main() {
   const config = await loadConfig();
+  if (config.mode === "gallery_report") return await generateGalleryReport(config);
   const cookieJar = config.use_cookies_file
     ? await loadNetscapeCookieFile(config.cookies_file)
     : emptyCookieJar();
@@ -6409,8 +6828,8 @@ async function main() {
     await log(`Capture retries: ${Math.max(0, Math.min(2, Number(config.capture_retry_count) || 0))}`);
     if (config.interactive_capture?.enabled) {
       await log(
-        `Interactive overlays: enabled (${normalizeInteractiveCaptureScope(config.interactive_capture.capture_scope).replaceAll("_", " ")}; ` +
-        `maximum ${Math.max(1, Math.min(500, Number(config.interactive_capture.maximum_items) || 25))} item(s); ` +
+        `Item Navigation and Capture: enabled (` +
+        `${config.interactive_capture.maximum_items_enabled === false ? "all available items" : "maximum " + interactiveMaximumItems(config.interactive_capture) + " item(s)"}; ` +
         `${normalizeInteractiveRules(config.interactive_capture.whitelist_rules).length} whitelist / ` +
         `${normalizeInteractiveRules(config.interactive_capture.blacklist_rules).length} blacklist rules).`,
       );
@@ -6419,7 +6838,7 @@ async function main() {
         `${String(config.interactive_capture.blacklist_filename || "interactive-blacklist.txt")}.`,
       );
     } else {
-      await log("Interactive overlays: disabled.");
+      await log("Item Navigation and Capture: disabled.");
     }
     const evidenceLabels = [];
     if (config.save_mhtml) evidenceLabels.push("MHTML");
@@ -6451,6 +6870,7 @@ async function main() {
     await log(`Submitted URLs: ${(config.urls || []).length}`);
 
     const urls = Array.isArray(config.urls) ? config.urls : [];
+    let previousAttemptedUrlIndex = null;
     for (let i = 0; i < urls.length; i += 1) {
       const url = String(urls[i] || "").trim();
       const safeClassificationUrl = url.replace(/[\t\r\n]+/g, " ");
@@ -6488,6 +6908,12 @@ async function main() {
         continue;
       }
 
+      const pacingDelayMs = webpagePacingDelayMs(config, previousAttemptedUrlIndex, i);
+      if (pacingDelayMs > 0) {
+        await log(`Webpage pacing: waiting ${(pacingDelayMs / 1000).toFixed(1)}s before URL ${i + 1}/${urls.length}.`);
+        await delay(pacingDelayMs);
+      }
+      previousAttemptedUrlIndex = i;
       await log(`URL ${i + 1}/${urls.length}: ${url}`);
       try {
         const retryLimit = Math.max(0, Math.min(2, Number(config.capture_retry_count) || 0));

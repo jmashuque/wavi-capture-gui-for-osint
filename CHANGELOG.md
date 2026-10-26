@@ -2,6 +2,25 @@
 
 Notable user-facing changes to WAVI Capture GUI for OSINT are listed below.
 
+## [v4.2026.1026](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v4.2026.1026) - Reports, Unified Job Queue, and Capture Controls
+
+- Added PDF reports from case captures, with sorting, selectable metadata, one- or two-image layouts, and optional formatted title pages.
+- Unified direct, queued, and Firefox-extension captures under one job system with shared start, resume, stop, and recovery handling.
+- Added live per-engine concurrency settings, queue ordering, Resume All, and Clear Non-active.
+- Strengthened cross-engine domain and case-folder safeguards, universal-archive locking, and Force Start limits.
+- Added queue pacing and domain-aware URL pacing across all three capture engines.
+- Added engine-specific domain presets, including Webpage Capture.
+- Added separate WAVI and Reports output views and improved multiline warning/error highlighting.
+- Expanded Item Navigation and Capture with overlay/page selection, full-viewport item captures, optional limits, and browsing controls.
+- Added cookie-banner actions with optional fallback; Leave unchanged is the default.
+- Added simple PDF header/footer alignment, optional HTML editing, colour and sizing controls, and page-ratio presets.
+- Corrected Captured PNG PDF pagination, empty footer spacing, and report browser startup/cleanup handling.
+- Added a shared Deno path selector and version check.
+- Improved option-panel layout, conditional controls, dialog placement, and retry-profile value displays.
+- Improved browser shutdown, capture stopping, warning-only completion handling, and thumbnail generation.
+- Updated URL-box persistence filenames and removed saved URL/job files when persistence is disabled.
+- Established fresh v4 configuration formats without older-format migration.
+
 ## [v3.2026.1011](https://github.com/jmashuque/wavi-capture-gui-for-osint/releases/tag/v3.2026.1011) - Evidence Stamping, Capture Pacing, and Review Improvements
 
 - Added a dedicated **Stamping Options** panel for Gallery/Profile Capture.

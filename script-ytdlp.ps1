@@ -26,7 +26,6 @@
     [Parameter(Mandatory = $false)]
     [string]$ImpersonateTarget,
 
-    [switch]$PreferMp4,
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("Best", "PreferMp4", "StrictMp4", "AudioOnly", "LowBandwidth")]
@@ -95,6 +94,9 @@
     [Parameter(Mandatory = $false)]
     [ValidateSet("None", "Fast", "Normal", "Cautious")]
     [string]$RateLimit = "Normal",
+
+    # GUI-generated flags use the same domain policy as queue admission/pacing.
+    [string]$UrlPacingMask = "",
 
     [Parameter(Mandatory = $false)]
     [string]$DownloadSpeedLimit = "Disabled",
@@ -564,18 +566,36 @@ function New-VideoThumbnailsForRecentCaptures {
                 $thumbPath
             )
 
-            & $FFmpegExe @ffmpegArgs 2>&1 |
-                ForEach-Object {
-                    $line = $_.ToString()
-                    if ($line) {
-                        Write-Host (ConvertTo-SafeLogText $line)
-                        Add-RunLogLine $line
+            # Windows PowerShell 5.1 can turn native stderr into a terminating
+            # error under Stop, even when FFmpeg succeeds. Match the yt-dlp
+            # invocation below: retain diagnostics and judge the actual result.
+            $thumbnailErrorActionPreference = $ErrorActionPreference
+            $thumbnailExitCode = $null
+            try {
+                $ErrorActionPreference = "Continue"
+                # Native commands update the global automatic variable. A local
+                # assignment here would hide that result for every thumbnail.
+                $global:LASTEXITCODE = $null
+                & $FFmpegExe @ffmpegArgs 2>&1 |
+                    ForEach-Object {
+                        $line = $_.ToString()
+                        if ($line) {
+                            Write-Host (ConvertTo-SafeLogText $line)
+                            Add-RunLogLine $line
+                        }
                     }
-                }
+                $thumbnailExitCode = $global:LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $thumbnailErrorActionPreference
+            }
 
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $thumbPath -PathType Leaf)) {
+            $thumbnailExists = Test-Path -LiteralPath $thumbPath -PathType Leaf
+            $thumbnailBytes = if ($thumbnailExists) { (Get-Item -LiteralPath $thumbPath).Length } else { 0 }
+            if ($null -eq $thumbnailExitCode -or $thumbnailExitCode -ne 0 -or -not $thumbnailExists -or $thumbnailBytes -eq 0) {
                 $allOk = $false
-                $msg = "FFmpeg could not generate thumbnail for: $($file.FullName)"
+                $thumbnailExitText = if ($null -eq $thumbnailExitCode) { "unavailable" } else { [string]$thumbnailExitCode }
+                $msg = "FFmpeg could not generate thumbnail for: $($file.FullName) (exit code: $thumbnailExitText; output exists: $thumbnailExists; bytes: $thumbnailBytes; output: $thumbPath)"
                 Write-Warning (ConvertTo-SafeLogText $msg)
                 Add-RunLogLine $msg
                 if (Test-Path -LiteralPath $thumbPath -PathType Leaf) {
@@ -1159,7 +1179,6 @@ if (-not [string]::IsNullOrWhiteSpace($FFmpegFolder)) {
 Write-Section "Capture options"
 
 $OptionLines = @(
-    "Prefer MP4:             $PreferMp4",
     "Format strategy:        $FormatStrategy",
     "Metadata only:          $MetadataOnly",
     "Media only:             $MediaOnly",
@@ -1218,6 +1237,10 @@ $Urls = @(
             ($_ -match '^https?://')
         }
 )
+
+if ($UrlPacingMask -and (($UrlPacingMask -notmatch '^[01]+$') -or ($UrlPacingMask.Length -ne $Urls.Count))) {
+    throw "URL pacing plan does not match the submitted URL list."
+}
 
 if (-not $Urls -or $Urls.Count -eq 0) {
     throw "No valid URLs found in input file. Use one http/https URL per line."
@@ -1456,13 +1479,8 @@ else {
     )
 }
 
-$EffectiveFormatStrategy = $FormatStrategy
-if ($PreferMp4 -and $EffectiveFormatStrategy -eq "Best") {
-    $EffectiveFormatStrategy = "PreferMp4"
-}
-
 if (-not $MetadataOnly) {
-    switch ($EffectiveFormatStrategy) {
+    switch ($FormatStrategy) {
         "PreferMp4" {
             if ($MaxResolution -ne "best") {
                 $FormatSelector = "bv*[ext=mp4][height<=$MaxResolution]+ba[ext=m4a]/b[ext=mp4][height<=$MaxResolution]/bv*[height<=$MaxResolution]+ba/b[height<=$MaxResolution]/best[height<=$MaxResolution]/best"
@@ -1654,7 +1672,7 @@ for ($i = 0; $i -lt $Urls.Count; $i++) {
         }
     }
 
-    if ($i -lt ($Urls.Count - 1)) {
+    if (($i -lt ($Urls.Count - 1)) -and ((-not $UrlPacingMask) -or (($i + 1) -lt $UrlPacingMask.Length -and $UrlPacingMask[$i + 1] -eq '1'))) {
         $PauseSeconds = Get-Random -Minimum $SleepBaselineSeconds -Maximum ($SleepMaxSeconds + 1)
         Write-Host "Pausing $PauseSeconds seconds before next URL..."
         Start-Sleep -Seconds $PauseSeconds

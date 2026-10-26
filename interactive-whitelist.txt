@@ -116,6 +116,8 @@ overlay|role dialog
 # Safe close/dismiss controls
 close|close
 close|dismiss
+# Combine either return phrase with any listed destination (optional the/my/your).
+close|(back to|return to)+(gallery|album|main page|home)
 close|exit
 close|close dialog
 close|close modal
@@ -130,7 +132,7 @@ close|x button
 close|times
 close|×
 
-# Carousel navigation terms retained for future and site-specific matching
+# Carousel navigation terms used by overlay browsing
 next|next
 next|next item
 next|next image

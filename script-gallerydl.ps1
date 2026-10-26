@@ -35,6 +35,9 @@
     [ValidateSet("Fast", "Normal", "Cautious")]
     [string]$RateLimit = "Normal",
 
+    # GUI-generated flags use the same domain policy as queue admission/pacing.
+    [string]$UrlPacingMask = "",
+
     [Parameter(Mandatory = $false)]
     [string]$IncludeKeywords,
 
@@ -107,7 +110,7 @@ else {
     $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
 
-$AppTempFolder = Join-Path $ScriptRoot "gui-temp"
+$AppTempFolder = Join-Path $ScriptRoot ".gui-temp"
 
 function ConvertTo-SafeLogText {
     param([AllowNull()][AllowEmptyString()][string]$Message)
@@ -388,7 +391,7 @@ function Test-RelativeOutputTemplate {
         throw "OutputTemplate must be relative to the case media folder, not an absolute path."
     }
 
-    if ($clean -notmatch '\{extension\}' -and $clean -notmatch '%extension%' -and $clean -notmatch '%ext%') {
+    if ($clean -notmatch '\{extension\}' -and $clean -notmatch '%ext%') {
         $clean = "$clean.{extension}"
     }
 
@@ -788,7 +791,7 @@ function Convert-EvidenceTemplateToRows {
     param([Parameter(Mandatory = $true)][string]$Template)
     foreach ($line in ($Template -split '\r\n|\r|\n')) {
         if ($line -notmatch '(?i)</?(Left|Right)\b') {
-            [pscustomobject]@{ left = [string]$line; right = ''; paired = $false; right_only = $false }
+            [pscustomobject]@{ left = [string]$line; right = ''; paired = $false; right_only = $false; centred = $true }
             continue
         }
         $sections = [regex]::Matches($line, '(?i)<(Left|Right)>(.*?)</\1>')
@@ -808,7 +811,7 @@ function Convert-EvidenceTemplateToRows {
         [pscustomobject]@{
             left = [string]$parts['left']; right = [string]$parts['right']
             paired = ($parts.ContainsKey('left') -and $parts.ContainsKey('right'))
-            right_only = (-not $parts.ContainsKey('left'))
+            right_only = (-not $parts.ContainsKey('left')); centred = $false
         }
     }
 }
@@ -834,7 +837,7 @@ function Measure-EvidenceFooterRows {
         }
         [void]$layout.Add([pscustomobject]@{
             left = $leftLines; right = $rightLines; count = $count
-            paired = $row.paired; right_only = $row.right_only; left_width = $leftWidth; right_width = $rightWidth
+            paired = $row.paired; right_only = $row.right_only; centred = $row.centred; left_width = $leftWidth; right_width = $rightWidth
         })
         $lineCount += $count
     }
@@ -936,6 +939,7 @@ function New-EvidenceFooterImage {
                     $format.Alignment = [System.Drawing.StringAlignment]::Far
                     if ($row.paired) { $x += [single]($row.left_width + $gap) }
                 }
+                elseif ($row.centred) { $format.Alignment = [System.Drawing.StringAlignment]::Center }
                 else { $format.Alignment = [System.Drawing.StringAlignment]::Near }
                 $lineY = $y
                 foreach ($line in $row.$side) {
@@ -1324,6 +1328,10 @@ foreach ($line in Get-Content -LiteralPath $InputFile -Encoding UTF8) {
     }
 }
 $Urls = $UrlList.ToArray()
+if ($UrlPacingMask -and (($UrlPacingMask -notmatch '^[01]+$') -or ($UrlPacingMask.Length -ne $Urls.Count))) {
+    throw "URL pacing plan does not match the submitted URL list."
+}
+
 
 if (-not $Urls.Count) {
     throw "No URLs were found in InputFile."
@@ -1485,34 +1493,6 @@ function Write-GuiUrlResult {
     Write-RunLogLineOnly $marker
 }
 
-function Write-Utf8NoBomLines {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$Lines
-    )
-
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines($Path, $Lines, $encoding)
-}
-
-function Read-UrlSetFromFile {
-    param([Parameter(Mandatory = $true)][string]$Path)
-
-    $set = @{}
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        return $set
-    }
-
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue) {
-        $trimmed = $line.Trim()
-        if ($trimmed -and -not $trimmed.StartsWith('#')) {
-            $set[$trimmed] = $true
-        }
-    }
-
-    return $set
-}
-
 $Completed = 0
 $Failed = 0
 $script:CapturedUrlRecords = New-Object System.Collections.Generic.List[string]
@@ -1567,100 +1547,45 @@ function Flush-GuiUrlRecords {
     $script:FailedUrlRecords.Clear()
 }
 
-if ($Urls.Count -gt 1) {
-    Write-Section "Image URL batch"
-    Write-RunLog "Using gallery-dl native input-file mode for $($Urls.Count) URLs."
+$Index = 0
+foreach ($Url in $Urls) {
+    $Index++
+    $PaceThisUrl = ($Index -gt 1) -and ((-not $UrlPacingMask) -or (($Index - 1) -lt $UrlPacingMask.Length -and $UrlPacingMask[$Index - 1] -eq '1'))
+    if ($PaceThisUrl -and $RateLimit -ne "Fast") {
+        $PauseSeconds = if ($RateLimit -eq "Cautious") { Get-Random -Minimum 25 -Maximum 46 } else { Get-Random -Minimum 10 -Maximum 21 }
+        Write-RunLog "Pausing $PauseSeconds seconds before next URL..."
+        Start-Sleep -Seconds $PauseSeconds
+    }
+    Write-Section "Image URL $Index of $($Urls.Count)"
+    Write-RunLog "URL: $Url"
 
-    $BatchInputFile = New-AppTempFile -Prefix "avi-gallerydl-input-" -Suffix ".txt"
-    $BatchErrorFile = Join-Path $LogsFolder "gallery-dl-errors_$RunStamp.txt"
+    $GalleryDlArgs = @($BaseArgs + $Url)
+    Write-RunLog ("Command: " + $GalleryDlPath + " " + ($GalleryDlArgs -join " "))
 
-    Remove-Item -LiteralPath $BatchErrorFile -Force -ErrorAction SilentlyContinue
+    $ExitCode = 1
 
     try {
-        Write-Utf8NoBomLines -Path $BatchInputFile -Lines $Urls
-
-        $GalleryDlArgs = @($BaseArgs + @("--input-file", $BatchInputFile, "--error-file", $BatchErrorFile))
-        Write-RunLog ("Command: " + $GalleryDlPath + " " + ($GalleryDlArgs -join " "))
-        Write-RunLog "Temporary input file: $BatchInputFile"
-        Write-RunLog "gallery-dl error file: $BatchErrorFile"
-
+        # gallery-dl commonly writes normal extractor status messages to stderr, such as API-key/token
+        # discovery notices. Do not use PowerShell native stderr redirection here: in Windows PowerShell
+        # it turns those stderr lines into NativeCommandError records and can make otherwise successful
+        # captures fail at the script layer.
         $ExitCode = Invoke-GalleryDlSafely -FilePath $GalleryDlPath -Arguments $GalleryDlArgs -RunLog $RunLog
-        $FailedUrlSet = Read-UrlSetFromFile -Path $BatchErrorFile
-
-        # gallery-dl writes failed URLs to --error-file. If gallery-dl returns non-zero but does not
-        # provide an error file, treat the batch status as unknown and mark each submitted URL incomplete
-        # instead of assuming success.
-        $TreatAllAsFailed = (($ExitCode -ne 0) -and ($FailedUrlSet.Count -eq 0))
-
-        $Index = 0
-        foreach ($Url in $Urls) {
-            $Index++
-            if ($TreatAllAsFailed -or $FailedUrlSet.ContainsKey($Url)) {
-                $Failed++
-                Write-GuiUrlResult -Status "failed" -Index $Index -Total $Urls.Count -Url $Url -Detail ("gallery-dl batch exit code {0}" -f $ExitCode)
-            }
-            else {
-                $Completed++
-                Write-GuiUrlResult -Status "captured" -Index $Index -Total $Urls.Count -Url $Url -Detail "gallery-dl input-file"
-            }
-        }
-
-        if ($ExitCode -ne 0) {
-            Write-RunLog "gallery-dl batch finished with exit code $ExitCode"
-        }
     }
     catch {
-        $Failed = $Urls.Count
-        $Completed = 0
-        $msg = "ERROR capturing image URL batch:`r`n$($_.Exception.Message)"
+        $ExitCode = 1
+        $msg = "ERROR capturing image URL $Index`: $Url`r`n$($_.Exception.Message)"
         Write-Warning (ConvertTo-SafeLogText $msg)
         Write-RunLogLineOnly $msg
-
-        $Index = 0
-        foreach ($Url in $Urls) {
-            $Index++
-            Write-GuiUrlResult -Status "failed" -Index $Index -Total $Urls.Count -Url $Url -Detail "gallery-dl batch script error"
-        }
     }
-    finally {
-        Remove-Item -LiteralPath $BatchInputFile -Force -ErrorAction SilentlyContinue
+
+    if ($ExitCode -eq 0) {
+        $Completed++
+        Write-GuiUrlResult -Status "captured" -Index $Index -Total $Urls.Count -Url $Url -Detail "gallery-dl"
     }
-}
-else {
-    $Index = 0
-    foreach ($Url in $Urls) {
-        $Index++
-        Write-Section "Image URL $Index of $($Urls.Count)"
-        Write-RunLog "URL: $Url"
-
-        $GalleryDlArgs = @($BaseArgs + $Url)
-        Write-RunLog ("Command: " + $GalleryDlPath + " " + ($GalleryDlArgs -join " "))
-
-        $ExitCode = 1
-
-        try {
-            # gallery-dl commonly writes normal extractor status messages to stderr, such as API-key/token
-            # discovery notices. Do not use PowerShell native stderr redirection here: in Windows PowerShell
-            # it turns those stderr lines into NativeCommandError records and can make otherwise successful
-            # captures fail at the script layer.
-            $ExitCode = Invoke-GalleryDlSafely -FilePath $GalleryDlPath -Arguments $GalleryDlArgs -RunLog $RunLog
-        }
-        catch {
-            $ExitCode = 1
-            $msg = "ERROR capturing image URL $Index`: $Url`r`n$($_.Exception.Message)"
-            Write-Warning (ConvertTo-SafeLogText $msg)
-            Write-RunLogLineOnly $msg
-        }
-
-        if ($ExitCode -eq 0) {
-            $Completed++
-            Write-GuiUrlResult -Status "captured" -Index $Index -Total $Urls.Count -Url $Url -Detail "gallery-dl"
-        }
-        else {
-            $Failed++
-            Write-RunLog "gallery-dl failed for URL $Index of $($Urls.Count) with exit code $ExitCode"
-            Write-GuiUrlResult -Status "failed" -Index $Index -Total $Urls.Count -Url $Url -Detail ("gallery-dl exit code {0}" -f $ExitCode)
-        }
+    else {
+        $Failed++
+        Write-RunLog "gallery-dl failed for URL $Index of $($Urls.Count) with exit code $ExitCode"
+        Write-GuiUrlResult -Status "failed" -Index $Index -Total $Urls.Count -Url $Url -Detail ("gallery-dl exit code {0}" -f $ExitCode)
     }
 }
 
