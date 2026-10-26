@@ -305,7 +305,7 @@ Preview is best-effort. It can be incomplete or slow depending on the site, cook
 4. Select **Generate Report**. Reports use original capture images, not stamped derivatives, and do not enlarge images beyond their original size. Files are saved in the case's `reports` folder using the case name and local generation datetime.
 5. Use **Open Last Report** to open the last successful output, or **View Report Log** for diagnostics. Changing the selected case does not change the last-report target.
 
-The current release reports on one case at a time; per-capture inclusion/exclusion and multi-case reports are future work.
+Each report includes the captures from one selected case.
 
 ### Review a Case
 
@@ -371,7 +371,7 @@ Filename templates also use `%domain%` for the source domain when WAVI can deter
 
 **Datetime may return just a date or both a date and time**, depending on the source metadata. It does not imply that a time or timezone is known. Audio/Video full timestamps use UTC (`YYYY-MM-DD_HHMMSSZ`); date-only values use `YYYY-MM-DD`. Gallery/Profile filename values retain the extractor's formatting and normal filename sanitisation. Evidence stamps preserve available date/time precision and supplied offsets; timestamps without a timezone are not labelled UTC. Numeric Unix timestamps in evidence metadata are represented in UTC. Missing publication metadata never falls back to capture time or filesystem timestamps: filename tags use an unknown placeholder, and stamps show **Item datetime unavailable**.
 
-Use the current **Insert Tag** menus as the supported tag list. This milestone does not import older WAVI settings or retain retired tag aliases. Engine-specific fields remain engine-specific; missing source metadata is not replaced with a fabricated publication timestamp.
+Use **Insert Tag** to choose the tags supported by each field.
 
 ### Audio/Video Capture
 
@@ -467,7 +467,7 @@ Embed choices include metadata, cover art, subtitles, chapters, and info JSON fo
 
 **Only between URLs sharing a domain** restricts the between-URL gap using the same domain grouping as Job Queue. It is off by default. Request and retry sleeps still apply within each submitted URL.
 
-The retry fields display the selected profile's values. Built-in profiles show **Tool default** for socket timeout. Switching back to Custom restores its saved editable values. The preset profiles retain their established yt-dlp behaviour. **Custom** exposes separate main and fragment retry counts, a socket timeout, and the maximum exponential retry-sleep time. Custom accepts 0 to 100 retries, 0 to 100 fragment retries, a socket timeout from 1 to 900 seconds, and a retry-sleep maximum from 1 to 3600 seconds. The socket timeout is passed only for the Custom profile; choosing Light, Normal, or Aggressive does not add a new timeout to those presets.
+The retry fields display the selected profile's values. Built-in profiles show **Tool default** for socket timeout. Switching back to Custom restores its saved editable values. **Custom** exposes separate main and fragment retry counts, a socket timeout, and the maximum exponential retry-sleep time. Custom accepts 0 to 100 retries, 0 to 100 fragment retries, a socket timeout from 1 to 900 seconds, and a retry-sleep maximum from 1 to 3600 seconds. The socket timeout is passed only for the Custom profile; choosing Light, Normal, or Aggressive does not add a new timeout to those presets.
 
 Additional controls:
 
@@ -547,7 +547,7 @@ Sidecar availability and contents depend on the site and its gallery-dl extracto
 
 **Evidence stamping**
 
-Evidence stamping is under **Stamping Options**, between **Capture Options** and **Advanced Options** and is off by default. **Enable evidence stamping for newly captured static images** leaves the downloaded original untouched and creates a separate stamped derivative under `derived\evidence`. Stamped derivatives use **lossless PNG by default**, regardless of the source image format. Enable **Match evidence source format** when the derivative should retain the original image format instead.
+Evidence stamping is available under **Stamping Options** and is off by default. **Enable evidence stamping for newly captured static images** leaves the downloaded original untouched and creates a separate stamped derivative under `derived\evidence`. Stamped derivatives use **lossless PNG by default**, regardless of the source image format. Enable **Match evidence source format** when the derivative should retain the original image format instead.
 
 The **Stamped text template** box controls the text rendered in the black footer beneath each supported image. **Insert Tag** adds WAVI placeholders at the cursor. The default template is:
 
@@ -563,9 +563,9 @@ To align text on the same row, use:
 <Left>%filename%</Left><Right>%case%</Right>
 ```
 
-Paired sections use independently sized columns separated by a gap. Each side wraps independently and the next row starts below both columns. A line with only one section uses the full width with that alignment; plain-text lines remain left-aligned across the full width. Keep each section's opening and closing tags on the same template line. Do not nest sections, repeat a side on one line, or place other text outside aligned sections. **Insert Tag** includes alignment helpers. The percentage is saved with settings, profiles, domain presets and queued jobs; older settings and jobs use 10%.
+Paired sections use independently sized columns separated by a gap. Each side wraps independently and the next row starts below both columns. A line with only one section uses the full width with that alignment; plain-text lines are centred across the full width. Keep each section's opening and closing tags on the same template line. Do not nest sections or repeat a side on one line. **Insert Tag** includes alignment helpers.
 
-The stamp tag menu now uses the same normalized naming style as the other WAVI tag menus and shows only the tag names themselves. Available stamp tags are `%url%`, `%domain%`, `%source_count%`, `%item_datetime%`, `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%case%`, `%engine%`, `%version%`, `%filename%`, `%ext%`, `%original%`, and `%sha256%`. `%url%` resolves separately for each captured file: its item/post page URL where the extractor supplies one, otherwise its direct media URL. `%domain%` follows that resolved URL. Supported metadata fields are `post_url`, `webpage_url`, `permalink`, `canonical_url` and `page_url`; Twitter post and Pixiv artwork links can also be derived from their item IDs. Missing or unverified metadata produces **Item URL unavailable**, never the submitted gallery/profile URL. This applies equally to single-URL and batch captures. Long substituted values are wrapped in the footer rather than silently truncated. `%item_datetime%` uses the completed file's hash-verified metadata, retaining a date alone when no time is supplied. Its value, source field and date/datetime precision are recorded in the evidence sidecar (schema 8). Missing, invalid or unverified publication metadata displays **Item datetime unavailable**. For example, use `<Left>Posted: %item_datetime%</Left><Right>Captured: %utcdatetime%</Right>` to keep publication and capture times distinct.
+Available stamp tags are `%url%`, `%domain%`, `%source_count%`, `%item_datetime%`, `%date%`, `%time%`, `%datetime%`, `%utcdatetime%`, `%case%`, `%engine%`, `%version%`, `%filename%`, `%ext%`, `%original%`, and `%sha256%`. `%url%` resolves separately for each captured file: its item/post page URL where the extractor supplies one, otherwise its direct media URL. `%domain%` follows that resolved URL. Supported metadata fields are `post_url`, `webpage_url`, `permalink`, `canonical_url` and `page_url`; Twitter post and Pixiv artwork links can also be derived from their item IDs. Missing or unverified metadata produces **Item URL unavailable**, never the submitted gallery/profile URL. This applies equally to single-URL and batch captures. Long substituted values are wrapped in the footer rather than silently truncated. `%item_datetime%` uses the completed file's hash-verified metadata, retaining a date alone when no time is supplied. Its value, source field and date/datetime precision are recorded in the evidence sidecar. Missing, invalid or unverified publication metadata displays **Item datetime unavailable**. For example, use `<Left>Posted: %item_datetime%</Left><Right>Captured: %utcdatetime%</Right>` to keep publication and capture times distinct.
 
 - Supported source-image formats are JPEG, PNG, WebP, BMP, and TIFF. Animated GIFs, video, and other media are not modified or converted by this option.
 - By default, all supported stamped image derivatives are written as lossless PNG. This avoids an additional lossy JPEG generation when the captured source is JPEG.
@@ -574,7 +574,7 @@ The stamp tag menu now uses the same normalized naming style as the other WAVI t
 - **Left column width (%)** is a slider from 1–99, default 50. It divides paired `<Left>…</Left><Right>…</Right>` rows after subtracting outer padding and the gap: 25 gives 25% to the left and 75% to the right; 75 reverses that allocation. Text wraps at each boundary rather than being clipped. Plain lines and single-sided rows retain the full width. The setting is saved in profiles and queued jobs. Extreme splits may leave too little room for a character; shorten the text or move the slider towards 50 if a layout cannot fit.
 - **Preferred footer height (% of source image height)** starts each footer at 1–100% of source height (default 10%, rounded up). WAVI chooses the largest fitting whole-pixel font and centres text vertically.
 - **Prioritise stamp readability** is enabled by default. **Minimum font size (px)** defaults to 16 and accepts 8–72. When that font cannot fit, WAVI expands the footer. Narrow images may also receive a wider black canvas, with the source image centred above the footer at its original dimensions. The original file is untouched; the image content is not upscaled.
-- With readability off, the percentage is fixed and the previous 6-pixel minimum applies. If text cannot fit, the derivative fails rather than clipping. Readability expansion is also bounded (32,768-pixel footer height and 100 million combined canvas pixels); shorten the template or reduce the minimum font size if that limit is reached. Settings persist in profiles and queued jobs.
+- With readability off, the percentage is fixed and a 6-pixel minimum applies. If text cannot fit, the derivative fails rather than clipping. Readability expansion is also bounded (32,768-pixel footer height and 100 million combined canvas pixels); shorten the template or reduce the minimum font size if that limit is reached. Settings persist in profiles and queued jobs.
 - Each derivative has an adjacent `.evidence.json` provenance record containing the stamp template, resolved stamp text and rows, footer percentage, preferred and actual footer dimensions, readability/minimum-font settings, source dimensions, centring offset, left/right percentages and chosen font size, source and derivative formats, the selected format policy, the complete original and derivative paths, independent SHA-256 hashes, sizes, capture timestamp, and the submitted source URL list. The source section also identifies the per-item URL, whether it is an item page or direct media URL, the metadata field used, and whether the metadata hash matched.
 - When stamping is enabled, WAVI records each completed file’s full path, source URL metadata and SHA-256 in a run-specific `logs/gallery-dl-evidence-sources_*.jsonl` file, even in media-only mode. The source mapping must match the file’s SHA-256 before being used. The adjacent configuration file and JSONL record are included in the case manifest. This adds one file-hashing pass during capture.
 - WAVI verifies the original SHA-256 again after derivative generation. The derivative and provenance JSON are included in the case manifest independently from the original.
@@ -702,10 +702,10 @@ When a readiness check times out, including the bounded visual-stability check, 
 
 **Scrolling, page growth, and long pages**
 
-- **Scroll through the page before full-page capture** helps trigger lazy-loaded images and content. **Wait**, **Maximum**, and **Stable checks** control the pace and stopping conditions. Stable checks now require the page to be at the bottom with unchanged height, no new DOM mutations during the check, no pending discovered images, and document fonts ready; height alone no longer ends scrolling.
+- **Scroll through the page before full-page capture** helps trigger lazy-loaded images and content. **Wait**, **Maximum**, and **Stable checks** control the pace and stopping conditions. Stable checks require the page to be at the bottom with unchanged height, no new DOM mutations during the check, no pending discovered images, and document fonts ready.
 - **Detect continued document-height growth** identifies pages that keep expanding during scrolling. **Maximum cycles** bounds the work, and **At growth limit** can save a partial result, save with a warning, or fail the URL.
 - **Re-measure before capture** checks the final page dimensions again immediately before the image is produced.
-- **Single-image height** and **Single-image MP** place safety limits on one image. Single-image height is hard-limited to **16,382 px** for Chromium renderer reliability; taller pages are segmented even if a higher value existed in older saved settings. **Segment height** is also capped at **16,382 px** and cannot exceed the configured Single-image height. Pages beyond the active limits can be written as numbered segments using the configured **Segment height**, **Overlap**, and **Maximum segments**.
+- **Single-image height** and **Single-image MP** place safety limits on one image. Single-image height is hard-limited to **16,382 px** for Chromium renderer reliability; taller pages are segmented. **Segment height** is also capped at **16,382 px** and cannot exceed the configured Single-image height. Pages beyond the active limits can be written as numbered segments using the configured **Segment height**, **Overlap**, and **Maximum segments**.
 
 Long-page segmentation is a safety mechanism, not an error by itself. Review the `.webcapture.json` record to determine whether a result was complete, complete with warnings, partial, or failed and whether segmentation or continued growth affected the capture.
 
@@ -903,7 +903,7 @@ Right-click actions apply to the clicked job and include available start/resume/
 
 **Settings > Queue Pacing...** adds an optional cooldown after a job finishes. It is disabled by default. Presets are None (0–5s), Fast (15–30s), Normal (30–60s, default), and Cautious (60–120s). With **Only between jobs sharing a domain** off, it applies within the same engine or across engines with matching domains. With it on, it applies only to matching domains across engines. It is separate from the capture tabs' within-job URL pacing.
 
-**Job Persistence** saves queue state to `gui-jobs.json`. Reopening does not automatically start saved work: Running jobs become Interrupted and Queued jobs become Pending. Turning persistence off removes `gui-jobs.json`, while keeping current jobs in memory. Re-enabling saves current state. Queue pausing is not implemented in this release.
+**Job Persistence** saves queue state to `gui-jobs.json`. Reopening does not automatically start saved work: Running jobs become Interrupted and Queued jobs become Pending. Turning persistence off removes `gui-jobs.json`, while keeping current jobs in memory. Re-enabling saves current state.
 
 Recovery differs by engine:
 
@@ -947,7 +947,7 @@ Double-clicking a file opens it. The file context menu can open the containing f
 
 Case Browser recognizes Audio/Video, Gallery/Profile, and Webpage SHA-256 manifest CSVs. **Verify Case Files** combines all recognized manifests in the selected case. When more than one manifest records the same case file, the newest applicable record supplies the expected current hash.
 
-New manifests use case-relative paths. Case Browser also understands the older absolute-path A/V/Webpage format and the older Image `SHA256`/`RelativePath` column format. When a legacy absolute-path case has been moved as a complete case folder, Case Browser attempts to resolve the recorded path back inside the currently selected case rather than reading files outside that case.
+Manifest paths are relative to the case folder, allowing the complete case folder to be moved without changing those paths.
 
 Verification excludes `.gui-cache` and the `manifests` control folder, which contain display cache and capture-control data outside the evidence-manifest scope. Files elsewhere in the case that are not represented by any recognized manifest are reported as new/untracked. Hash verification confirms byte-level agreement with the recorded SHA-256 values; it does not determine authenticity, context, or evidentiary sufficiency.
 
@@ -992,7 +992,7 @@ WAVI stores its normal portable settings beside the app in `gui-settings.json`. 
 - **Default** is the initial profile and cannot be deleted. Switching profiles saves pending edits to the profile being left before loading the selected profile.
 - **Profile > Save Current Settings to Profile...** creates a named profile from the current capture settings or deliberately overwrites an existing profile after confirmation.
 - **Delete Selected Profile...** removes the selected custom profile from the current settings file, switches back to Default, and does not delete cases, cookies, media, or logs.
-- **Settings > Save Settings As...** writes the complete current settings store, including profiles/app settings/domain presets, to a selected JSON file. It is an exported settings copy; normal autosave continues to use the portable `gui-settings.json` beside WAVI. **Load Settings...** loads a selected settings JSON into the current session; only the current format is accepted, with no conversion of older configurations. Subsequent normal autosaves again use the portable `gui-settings.json`.
+- **Settings > Save Settings As...** writes the complete current settings store, including profiles/app settings/domain presets, to a selected JSON file. It is an exported settings copy; normal autosave continues to use the portable `gui-settings.json` beside WAVI. **Load Settings...** loads a selected settings JSON into the current session; the file must use a supported format. Subsequent normal autosaves again use the portable `gui-settings.json`.
 - **Save Default Portable Settings** explicitly writes the current settings store to the normal `gui-settings.json` beside WAVI.
 
 **App-level settings**
@@ -1010,10 +1010,6 @@ WAVI stores its normal portable settings beside the app in `gui-settings.json`. 
 - **Reset Defaults** resets the current GUI/app settings and overwrites only the **Default** profile with defaults. Custom profiles are preserved.
 - **Delete Settings File...** deletes `gui-settings.json`, removes all profiles stored in that file, and resets the current GUI/app settings to defaults. It does not delete case folders or captured evidence.
 - `python gui.py --fresh` performs a broader app-state cleanup: app settings/state files, Job Queue persistence, URL-box persistence, app-owned temp files, the app debug log, universal archives, and GUI cache folders under known Output Roots are cleared. It does not delete captured case folders, media files, cookies, binaries, scripts, case logs, manifests, or case-specific capture archives.
-
-**v4 configuration baseline:** Older WAVI settings, jobs and presets are not migrated, including pre-release formats that do not match this build. Incompatible standard-name startup files are preserved with a recorded version suffix, or schema suffix when the build version is unknown, before fresh state is created; startup warnings appear under WAVI in Output Log. Old development `-v4` filenames and old URL-box filenames are ignored. The first formal v4 snapshot establishes the baseline for future compatibility.
-
-WAVI-owned temporary files and browser profiles use `.gui-temp` in the app folder. Browser processes should release their temporary files after capture/stop/shutdown; retained files alone do not establish that a process is still running.
 
 Common state files:
 
